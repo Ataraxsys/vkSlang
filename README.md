@@ -73,6 +73,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
 | `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
 | `VKSLANG_LOG` | `debug` | Log level. |
+| `VKSLANG_LOG_FILE` | `~/vkslang.log` | Also write the log to this file (Steam/Proton, where stderr is out of reach). |
 | `VKSLANG_IPC` / `ipc` | `0` | Disables the socket for `vkslang-ui`. |
 | `VKSLANG_BRIGHTNESS_NITS` / `brightness_nits` | `200` | HDR reference white (`BrightnessNits`). |
 | `VKSLANG_EXPAND_GAMUT` / `expand_gamut` | `0`–`3` | HDR colour boost (`ExpandGamut`): Accurate, Expanded, Wide, Super. |
@@ -85,6 +86,13 @@ librashader's `FrameOptions` has no "source resolution" field: the shaders get `
 2. passes that image to `FilterChain::frame` as `Original`, with the viewport set to the 4K region.
 
 As a result, scanlines, masks and curvature line up with the 240 original lines rather than the 2160 output lines. With `gamescope -w 320 -h 240 -S integer -F nearest`, the nearest downsample recovers the original pixels exactly.
+
+### Steam and Proton
+
+- Install **system-wide** (`PREFIX=/usr sudo -E ./scripts/install.sh`): the Steam container (pressure-vessel) imports the layers it finds in `/usr`.
+- Inside the container, `/usr` is the container's own, so **a preset in `/usr/share/libretro` is not visible**. Either keep your presets in your home directory (shared with the container), or let vkSlang find them: a path that does not exist is retried under `/run/host`, where the host filesystem is mounted.
+- To see the log of a Steam game, use `VKSLANG_LOG_FILE=$HOME/vkslang.log`.
+- Games rendering with OpenGL (some ports, even under Proton) are out of reach: the layer only sees Vulkan, including DXVK/VKD3D.
 
 ### Gamescope
 

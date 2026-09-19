@@ -1,6 +1,7 @@
 //! Minimal stderr logger controlled by `VKSLANG_LOG=error|warn|info|debug`.
 
-use std::sync::OnceLock;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -20,11 +21,38 @@ pub fn max_level() -> Level {
     })
 }
 
+/// Optional log file (`VKSLANG_LOG_FILE`), for games whose stderr is hard to
+/// reach (Steam, Proton).
+pub fn file() -> Option<&'static Mutex<std::fs::File>> {
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var_os("VKSLANG_LOG_FILE")?;
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => Some(Mutex::new(f)),
+            Err(e) => {
+                eprintln!("vkSlang error: cannot open {}: {e}", path.to_string_lossy());
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Writes one already formatted line to stderr and to the log file.
+pub fn emit(line: &str) {
+    eprintln!("{line}");
+    if let Some(file) = file() {
+        if let Ok(mut file) = file.lock() {
+            let _ = writeln!(file, "[{}] {line}", std::process::id());
+        }
+    }
+}
+
 #[macro_export]
 macro_rules! log_at {
     ($lvl:expr, $tag:literal, $($arg:tt)*) => {
         if $lvl <= $crate::log::max_level() {
-            eprintln!(concat!("vkSlang ", $tag, ": {}"), format_args!($($arg)*));
+            $crate::log::emit(&format!(concat!("vkSlang ", $tag, ": {}"), format_args!($($arg)*)));
         }
     };
 }
