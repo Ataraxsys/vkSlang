@@ -15,6 +15,20 @@ pub enum SourceRect {
     Explicit(vk::Rect2D),
 }
 
+/// Whether the layer may turn the application's swapchain into an HDR10 one
+/// so that an HDR-aware preset (Sony Megatron...) can output real HDR from an
+/// SDR game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HdrOutput {
+    /// Never touch the swapchain's format.
+    Off,
+    /// Promote when the preset writes HDR and the surface supports HDR10.
+    #[default]
+    Auto,
+    /// Promote whenever the surface supports HDR10, whatever the preset.
+    Force,
+}
+
 /// How the swapchain image is turned into the chain's `Original` input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -44,6 +58,8 @@ pub struct Config {
     pub ipc: bool,
     /// HDR uniforms for HDR-aware presets.
     pub hdr: vkslang_ipc::HdrSettings,
+    /// Whether the swapchain may be promoted to HDR10.
+    pub hdr_output: HdrOutput,
 }
 
 pub fn get() -> &'static Config {
@@ -182,6 +198,11 @@ impl Config {
             params,
             ipc: kv.get("ipc").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false")),
             hdr: parse_hdr(&kv),
+            hdr_output: match kv.get("hdr_output").map(|v| v.to_ascii_lowercase()).as_deref() {
+                Some("off") | Some("0") | Some("false") => HdrOutput::Off,
+                Some("force") | Some("1") | Some("true") => HdrOutput::Force,
+                _ => HdrOutput::Auto,
+            },
         }
     }
 

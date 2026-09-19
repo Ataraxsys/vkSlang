@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -64,6 +64,16 @@ impl ColorSpace {
 /// adapt their encoding to `HDRMode`. What does not work yet is converting
 /// between SDR and HDR, on the input or the output side.
 pub fn color_space_mismatch(preset: ColorSpace, output: ColorSpace) -> Option<&'static str> {
+    color_space_warning(preset, output, false)
+}
+
+/// Same, for an output the layer promoted to HDR: the application still
+/// renders SDR, so an HDR preset is exactly what is wanted there.
+pub fn color_space_warning(preset: ColorSpace, output: ColorSpace, promoted: bool) -> Option<&'static str> {
+    if promoted {
+        return (!preset.is_hdr())
+            .then_some("the output was promoted to HDR but the preset writes SDR: pick an HDR preset (Sony Megatron) or set hdr_output = off");
+    }
     match (preset.is_hdr(), output.is_hdr()) {
         (true, false) => Some("HDR preset on an SDR output: colors and brightness will be wrong"),
         (false, true) => Some(
@@ -100,6 +110,9 @@ pub struct Output {
     /// Vulkan format name, e.g. `A2B10G10R10_UNORM_PACK32`.
     pub format: String,
     pub color_space: ColorSpace,
+    /// The layer turned the application's SDR swapchain into an HDR one, so
+    /// the picture reaching the preset is SDR even though the output is HDR.
+    pub promoted: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]

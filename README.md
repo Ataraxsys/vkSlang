@@ -77,6 +77,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_IPC` / `ipc` | `0` | Disables the socket for `vkslang-ui`. |
 | `VKSLANG_BRIGHTNESS_NITS` / `brightness_nits` | `200` | HDR reference white (`BrightnessNits`). |
 | `VKSLANG_EXPAND_GAMUT` / `expand_gamut` | `0`–`3` | HDR colour boost (`ExpandGamut`): Accurate, Expanded, Wide, Super. |
+| `VKSLANG_HDR_OUTPUT` / `hdr_output` | `auto` \| `force` \| `off` | Promote the swapchain to HDR10 (see the HDR section). |
 
 ### Logical resolution (`VKSLANG_SOURCE_RES`)
 
@@ -101,21 +102,29 @@ As a result, scanlines, masks and curvature line up with the 240 original lines 
 - vkSlang only hooks **Vulkan swapchains**. Gamescope's nested Wayland backend presents through Wayland subsurfaces, not through a `VkSwapchainKHR`, so use `--backend sdl`, or process the game (`VKSLANG_PROCESS=<game>`) and let gamescope do the scaling.
 - If gamescope pillarboxes a 4:3 game on a 16:9 output, set `VKSLANG_SOURCE_RECT=4:3`.
 
-## HDR (experimental)
+## HDR
 
-**Recommended today, for SDR games on an HDR screen:** apply vkSlang to the **game** (SDR swapchain, any CRT preset) and let gamescope produce the HDR output with its own SDR→HDR inverse tone mapping:
+vkSlang can give an **SDR game real HDR output**, the way RetroArch does: the layer creates the swapchain in HDR10 while the game keeps rendering 8-bit SDR into it (through a view in its own format), then an HDR-aware preset such as `hdr/crt-sony-megatron-v2-default.slangp` reads those SDR pixels and writes PQ.
 
 ```sh
-ENABLE_VKSLANG=1 VKSLANG_PROCESS=<game executable> VKSLANG_PRESET=/…/crt-royale.slangp \
-  gamescope --hdr-enabled --hdr-itm-enabled -- %command%
+ENABLE_VKSLANG=1 VKSLANG_PRESET=/…/hdr/crt-sony-megatron-v2-default.slangp VKSLANG_SOURCE_RES=640x480 gamescope -W 3840 -H 2160 -f --hdr-enabled -- %command%
 ```
 
-What vkSlang does on an HDR swapchain (HDR10/PQ or scRGB): it passes the color space to librashader, which binds `HDRMode`, `BrightnessNits` and `ExpandGamut` for **HDR-aware presets** such as `hdr/crt-sony-megatron-v2-default.slangp`. These presets adapt their encoding (PQ or scRGB) to the output. Brightness and gamut can be set in the config or live in `vkslang-ui`, which also shows the color space of the output and the preset.
+`hdr_output` (or `VKSLANG_HDR_OUTPUT`) controls this:
 
-Current limitations (warned about in the log and the UI):
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Promote to HDR10 when the preset writes HDR and the surface supports it. |
+| `force` | Promote whenever the surface supports HDR10. |
+| `off` | Never touch the swapchain's format. |
 
-- **SDR preset on an HDR output**: looks wrong (no inverse tonemapping of the preset's output).
-- **Input on an HDR output**: the application's picture is already HDR encoded (PQ), while every preset, Megatron included, expects an SDR picture. Colors may be off until an input conversion (PQ → SDR with `brightness_nits` as paper white) is implemented.
+The layer enables `VK_EXT_swapchain_colorspace` by itself, so HDR10 formats are visible even when the game never asks for them. `BrightnessNits` (paper white) and `ExpandGamut` are set in the config or live in `vkslang-ui`, which shows the output's and the preset's color spaces.
+
+Remaining limitations:
+
+- **A game that outputs HDR itself** (`DXVK_HDR=1` plus in-game support): its picture reaches the layer already PQ-encoded, while presets expect SDR, so colors will be off. Input conversion is not implemented.
+- **An SDR preset on a promoted output** looks wrong: either pick an HDR preset or set `hdr_output = off`. Switching presets live does not un-promote the swapchain, which only happens when the game restarts.
+- Without an HDR preset, gamescope's own conversion remains a good option: `--hdr-enabled --hdr-itm-enabled` with any CRT preset in SDR.
 
 ## Live control: `vkslang-ui`
 
