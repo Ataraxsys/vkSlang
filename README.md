@@ -10,8 +10,7 @@ I couldn't find any way to use RetroArch's Slang shaders in PC games on Linux, s
 Vulkan layer for Linux that runs **libretro `.slangp` multi-pass presets** (CRT, scanlines, masks, NTSC…) on any Vulkan swapchain through [librashader](https://github.com/SnowflakePowered/librashader). It follows the approach of [vkBasalt](https://github.com/DadSchoorse/vkBasalt), but runs librashader directly instead of ReShade `.fx`.
 
 ```sh
-ENABLE_VKSLANG=1 VKSLANG_PRESET=~/shaders/crt/crt-royale.slangp VKSLANG_SOURCE_RES=320x240 \
-  gamescope -W 3840 -H 2160 -w 320 -h 240 -S integer -F nearest -- %command%
+ENABLE_VKSLANG=1 VKSLANG_PRESET=~/shaders/crt/crt-royale.slangp VKSLANG_SOURCE_RES=320x240 gamescope -W 3840 -H 2160 -w 320 -h 240 -S integer -F nearest -- %command%
 ```
 
 ## 1. Rust (`ash` + `librashader`) or C++ (Vulkan SDK + `librashader-capi`)
