@@ -193,31 +193,64 @@ fn uid() -> u32 {
     std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0)
 }
 
-/// Directory holding one socket per process running the layer.
+/// Directory this process must create its socket in.
+///
+/// `$XDG_RUNTIME_DIR/vkslang` normally. Inside a Steam/Proton container
+/// (pressure-vessel) the runtime directory is private to the container, so a
+/// socket created there is invisible to `vkslang-ui` running on the host:
+/// `$HOME/.local/state/vkslang` is used instead, since the home directory is
+/// shared. `VKSLANG_SOCKET_DIR` overrides both.
 pub fn socket_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("VKSLANG_SOCKET_DIR") {
+        return PathBuf::from(dir);
+    }
+    let in_container = Path::new("/run/host/usr").is_dir();
+    if let (true, Some(home)) = (in_container, std::env::var_os("HOME")) {
+        return PathBuf::from(home).join(".local/state/vkslang");
+    }
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) => PathBuf::from(dir).join("vkslang"),
         None => std::env::temp_dir().join(format!("vkslang-{}", uid())),
     }
 }
 
+/// Every directory sockets may live in, for a client looking for processes.
+pub fn socket_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![socket_dir()];
+    for dir in [
+        std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("vkslang")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state/vkslang")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
 pub fn socket_path(pid: u32) -> PathBuf {
     socket_dir().join(format!("{pid}.sock"))
 }
 
-/// Sockets currently present, as `(pid, path)`. Some may be stale (process
-/// gone); [`Client::connect`] fails on those and removes them.
+/// Sockets currently present, as `(pid, path)`, across every candidate
+/// directory. Some may be stale (process gone); [`Client::connect`] fails on
+/// those and removes them.
 pub fn list_sockets() -> Vec<(u32, PathBuf)> {
-    let mut out: Vec<_> = std::fs::read_dir(socket_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            let pid = path.file_stem()?.to_str()?.parse().ok()?;
-            (path.extension()? == "sock").then_some((pid, path))
-        })
-        .collect();
+    let mut out: Vec<(u32, PathBuf)> = Vec::new();
+    for dir in socket_dirs() {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Some(pid) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok()) else {
+                continue;
+            };
+            if path.extension().is_some_and(|e| e == "sock") && !out.iter().any(|(p, _)| *p == pid) {
+                out.push((pid, path));
+            }
+        }
+    }
     out.sort();
     out
 }

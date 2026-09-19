@@ -92,6 +92,7 @@ As a result, scanlines, masks and curvature line up with the 240 original lines 
 - Install **system-wide** (`PREFIX=/usr sudo -E ./scripts/install.sh`): the Steam container (pressure-vessel) imports the layers it finds in `/usr`.
 - Inside the container, `/usr` is the container's own, so **a preset in `/usr/share/libretro` is not visible**. Either keep your presets in your home directory (shared with the container), or let vkSlang find them: a path that does not exist is retried under `/run/host`, where the host filesystem is mounted.
 - To see the log of a Steam game, use `VKSLANG_LOG_FILE=$HOME/vkslang.log`.
+- The container has its own `$XDG_RUNTIME_DIR`, so the control socket goes to `~/.local/state/vkslang` there, and `vkslang-ui` looks in both directories. `VKSLANG_SOCKET_DIR` overrides the location.
 - Games rendering with OpenGL (some ports, even under Proton) are out of reach: the layer only sees Vulkan, including DXVK/VKD3D.
 
 ### Gamescope
@@ -133,7 +134,7 @@ The external app (egui, OpenGL, so it never loads the layer itself) connects to 
 
 ### Protocol
 
-One Unix socket per process: `$XDG_RUNTIME_DIR/vkslang/<pid>.sock`, one JSON object per line, one response per request (`crates/vkslang-ipc`). Easy to script:
+One Unix socket per process: `$XDG_RUNTIME_DIR/vkslang/<pid>.sock` (or `~/.local/state/vkslang/` inside a Steam container), one JSON object per line, one response per request (`crates/vkslang-ipc`). Easy to script:
 
 ```sh
 echo '{"cmd":"set_param","name":"MASK_STRENGTH","value":0.5}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/vkslang/<pid>.sock
