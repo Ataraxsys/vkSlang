@@ -19,6 +19,10 @@ struct Target {
     pid: u32,
     path: PathBuf,
     label: String,
+    /// The process is actually processing a swapchain. Gamescope, for
+    /// instance, loads the layer but presents through Wayland, so there is
+    /// nothing to control there.
+    active: bool,
 }
 
 /// Editable copy of the source settings (not overwritten by polling while
@@ -54,6 +58,8 @@ struct App {
     message: Option<(String, bool)>,
     /// Processes that answered with something we cannot use (old protocol).
     incompatible: HashSet<u32>,
+    /// Also list processes with no swapchain.
+    show_all: bool,
     last_poll: Instant,
     last_scan: Instant,
 
@@ -162,6 +168,7 @@ impl App {
             state: None,
             message: None,
             incompatible: HashSet::new(),
+            show_all: false,
             last_poll: Instant::now() - POLL,
             last_scan: Instant::now() - SCAN,
             shader_root: default_shader_root(),
@@ -184,6 +191,8 @@ impl App {
     }
 
     fn scan_targets(&mut self) {
+        let connected = self.selected;
+        let active_now = self.state.as_ref().is_some_and(|s| !s.outputs.is_empty());
         self.targets = vkslang_ipc::list_sockets()
             .into_iter()
             .filter_map(|(pid, path)| {
@@ -192,16 +201,31 @@ impl App {
                     let _ = std::fs::remove_file(&path);
                     return None;
                 };
-                Some(Target { pid, path, label: format!("{name} ({pid})") })
+                // Ask the others whether they have a swapchain; the connected
+                // one is already known from its state.
+                let active = if Some(pid) == connected {
+                    active_now
+                } else {
+                    Client::connect(&path)
+                        .ok()
+                        .and_then(|mut c| c.request(&Request::GetState).ok())
+                        .is_some_and(|r| matches!(r, Response::State(s) if !s.outputs.is_empty()))
+                };
+                Some(Target { pid, path, label: format!("{name} ({pid})"), active })
             })
             .collect();
         if self.selected.is_some_and(|pid| !self.targets.iter().any(|t| t.pid == pid)) {
             self.disconnect();
         }
         if self.selected.is_none() {
-            // Skip processes running an incompatible layer.
-            let candidates: Vec<u32> =
-                self.targets.iter().map(|t| t.pid).filter(|pid| !self.incompatible.contains(pid)).collect();
+            // Skip processes running an incompatible layer or with nothing to
+            // control.
+            let candidates: Vec<u32> = self
+                .targets
+                .iter()
+                .filter(|t| t.active && !self.incompatible.contains(&t.pid))
+                .map(|t| t.pid)
+                .collect();
             for pid in candidates {
                 self.select(pid);
                 if self.client.is_some() {
@@ -284,11 +308,19 @@ impl App {
                 .and_then(|pid| self.targets.iter().find(|t| t.pid == pid))
                 .map_or("no process".to_string(), |t| t.label.clone());
             let mut choice = self.selected;
+            let hidden = self.targets.iter().filter(|t| !t.active).count();
+            let show_all = self.show_all;
             egui::ComboBox::from_id_salt("target").selected_text(current).width(220.0).show_ui(ui, |ui| {
-                for t in &self.targets {
-                    ui.selectable_value(&mut choice, Some(t.pid), t.label.as_str());
+                for t in self.targets.iter().filter(|t| t.active || show_all) {
+                    let label =
+                        if t.active { t.label.clone() } else { format!("{} (no swapchain)", t.label) };
+                    ui.selectable_value(&mut choice, Some(t.pid), label);
                 }
             });
+            if hidden > 0 {
+                ui.checkbox(&mut self.show_all, format!("+{hidden} idle"))
+                    .on_hover_text("Also list processes that load the layer but present no swapchain (gamescope…)");
+            }
             if choice != self.selected {
                 if let Some(pid) = choice {
                     self.select(pid);
