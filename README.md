@@ -1,4 +1,10 @@
+I couldn't find any way to use RetroArch's Slang shaders in PC games on Linux, so I built my own with Claude. It works much like vkBasalt (no longer actively developed), but runs .slangp presets directly instead of ReShade shaders, and everything can be tweaked in real time from a GUI (shown below), then saved.
+
 # vkSlang
+
+<img width="3840" height="2160" alt="Capture d&#39;écran_20260919_233503" src="https://github.com/user-attachments/assets/216e1a0a-d980-46d0-aea7-8fc04681205d" />
+
+---
 
 Vulkan layer for Linux that runs **libretro `.slangp` multi-pass presets** (CRT, scanlines, masks, NTSC…) on any Vulkan swapchain through [librashader](https://github.com/SnowflakePowered/librashader). It follows the approach of [vkBasalt](https://github.com/DadSchoorse/vkBasalt), but runs librashader directly instead of ReShade `.fx`.
 
