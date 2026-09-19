@@ -3,9 +3,9 @@
 //! Each hook calls the next layer through pointers captured at create time
 //! (never through the loader), mirroring vkBasalt's `vkBasalt_*` functions.
 
-use crate::config;
+use crate::config::{self, HdrOutput};
 use crate::loader::{self, LayerDeviceLink, LayerFunction, LayerInstanceLink, PfnSetDeviceLoaderData};
-use crate::render::{srgb_to_unorm, Runtime, SwapchainState};
+use crate::render::{srgb_to_unorm, Runtime, SwapchainPlan, SwapchainState};
 use crate::state::{self, load_pfn, DeviceData, InstanceData, DEVICES, INSTANCES};
 use crate::{log_debug, log_error, log_info, log_warn};
 use ash::vk::{self, Handle};
@@ -44,7 +44,33 @@ pub unsafe extern "system" fn create_instance(
     else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
-    let result = next_create(p_create_info, p_allocator, p_instance);
+
+    // Enable VK_EXT_swapchain_colorspace even when the application does not:
+    // without it the surface never reports the HDR10/scRGB formats the layer
+    // needs to promote the swapchain to HDR. Availability is not queried (a
+    // layer below us may not answer instance-level queries before the
+    // instance exists), the call is simply retried without it on failure.
+    let ci = &*p_create_info;
+    let colorspace_ext = ash::ext::swapchain_colorspace::NAME;
+    let already_enabled = slice(ci.pp_enabled_extension_names, ci.enabled_extension_count)
+        .iter()
+        .any(|&e| CStr::from_ptr(e) == colorspace_ext);
+    let add_colorspace = config::get().hdr_output != HdrOutput::Off && !already_enabled;
+
+    let mut extensions: Vec<*const c_char> =
+        slice(ci.pp_enabled_extension_names, ci.enabled_extension_count).to_vec();
+    let mut modified = *ci;
+    if add_colorspace {
+        extensions.push(colorspace_ext.as_ptr());
+        modified.enabled_extension_count = extensions.len() as u32;
+        modified.pp_enabled_extension_names = extensions.as_ptr();
+    }
+
+    let mut result = next_create(&modified, p_allocator, p_instance);
+    if result != vk::Result::SUCCESS && add_colorspace {
+        log_debug!("{} unavailable ({result}), creating the instance as asked", colorspace_ext.to_string_lossy());
+        result = next_create(p_create_info, p_allocator, p_instance);
+    }
     if result != vk::Result::SUCCESS {
         return result;
     }
@@ -237,6 +263,77 @@ pub unsafe extern "system" fn get_device_queue2(
 
 // --------------------------------------------------------------- swapchain
 
+/// The other (sRGB/UNORM) spelling of a 32-bit format, so the application's
+/// own image views stay legal on a promoted swapchain.
+fn format_sibling(format: vk::Format) -> Option<vk::Format> {
+    Some(match format {
+        vk::Format::B8G8R8A8_UNORM => vk::Format::B8G8R8A8_SRGB,
+        vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
+        vk::Format::R8G8B8A8_UNORM => vk::Format::R8G8B8A8_SRGB,
+        vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
+        vk::Format::A8B8G8R8_UNORM_PACK32 => vk::Format::A8B8G8R8_SRGB_PACK32,
+        vk::Format::A8B8G8R8_SRGB_PACK32 => vk::Format::A8B8G8R8_UNORM_PACK32,
+        _ => return None,
+    })
+}
+
+/// Formats an application renders into that can share an image with the
+/// HDR10 view: the same format (only the color space changes, no copy
+/// needed), or another 32-bit format of the same Vulkan compatibility class.
+fn is_promotable(format: vk::Format) -> bool {
+    format == HDR10_FORMAT || format_sibling(format).is_some()
+}
+
+const HDR10_FORMAT: vk::Format = vk::Format::A2B10G10R10_UNORM_PACK32;
+
+unsafe fn surface_formats(dev: &DeviceData, surface: vk::SurfaceKHR) -> Vec<vk::SurfaceFormatKHR> {
+    let f = dev.instance.surface_fn.get_physical_device_surface_formats_khr;
+    let mut count = 0;
+    if f(dev.physical_device, surface, &mut count, std::ptr::null_mut()) != vk::Result::SUCCESS {
+        return Vec::new();
+    }
+    let mut formats = vec![vk::SurfaceFormatKHR::default(); count as usize];
+    if f(dev.physical_device, surface, &mut count, formats.as_mut_ptr()) != vk::Result::SUCCESS {
+        return Vec::new();
+    }
+    formats.truncate(count as usize);
+    formats
+}
+
+/// Whether to hand the application an HDR10 swapchain it never asked for.
+///
+/// The application keeps rendering 8-bit SDR through a view in its own
+/// format; the filter chain reads those pixels and writes PQ through the
+/// HDR10 view of the same images. This is what lets an HDR preset produce
+/// real HDR out of an SDR game, the way RetroArch does.
+unsafe fn promote_to_hdr10(dev: &DeviceData, ci: &vk::SwapchainCreateInfoKHR) -> bool {
+    let cfg = config::get();
+    if cfg.hdr_output == HdrOutput::Off || !dev.mutable_format || !is_promotable(ci.image_format) {
+        return false;
+    }
+    if cfg.hdr_output == HdrOutput::Auto {
+        // Only when the preset actually writes HDR.
+        let preset_is_hdr = crate::control::control().preset_color_space.is_some_and(|cs| cs.is_hdr());
+        if !preset_is_hdr {
+            return false;
+        }
+    }
+    if ci.image_color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT {
+        return false; // already HDR10
+    }
+    let formats = surface_formats(dev, ci.surface);
+    for f in &formats {
+        log_debug!("surface offers {:?} / {:?}", f.format, f.color_space);
+    }
+    let supported = formats
+        .iter()
+        .any(|f| f.format == HDR10_FORMAT && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT);
+    if !supported {
+        log_warn!("the surface does not offer HDR10, keeping the SDR swapchain");
+    }
+    supported
+}
+
 /// Decides whether a swapchain can be processed. Returns the format
 /// librashader renders to and whether the swapchain must be made mutable.
 unsafe fn plan_swapchain(dev: &DeviceData, ci: &vk::SwapchainCreateInfoKHR) -> Option<(vk::Format, bool)> {
@@ -306,16 +403,53 @@ pub unsafe extern "system" fn create_swapchain(
     };
     let next = dev.swapchain_fn.create_swapchain_khr;
     let ci = &*p_create_info;
-    let plan = if dev.active { plan_swapchain(&dev, ci) } else { None };
-    let Some((output_format, mutable)) = plan else {
+    if !dev.active {
+        return next(device, p_create_info, p_allocator, p_swapchain);
+    }
+
+    // The preset is loaded first: whether it writes HDR decides whether the
+    // swapchain is promoted to HDR10 below.
+    let mut guard = dev.runtime.lock().unwrap();
+    if guard.is_none() {
+        match Runtime::new(&dev) {
+            Ok(rt) => *guard = Some(rt),
+            Err(e) => {
+                log_error!("cannot create layer runtime: {e}");
+                drop(guard);
+                return next(device, p_create_info, p_allocator, p_swapchain);
+            }
+        }
+    }
+    guard.as_mut().unwrap().ensure_chain(&dev);
+
+    let Some((mut output_format, mutable)) = plan_swapchain(&dev, ci) else {
+        drop(guard);
         return next(device, p_create_info, p_allocator, p_swapchain);
     };
 
     let mut modified = *ci;
     modified.image_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC;
-    let view_formats = [ci.image_format, output_format];
+
+    // Application format kept for the raw-bit copy of what the game renders.
+    let app_format = ci.image_format;
+    let promoted = promote_to_hdr10(&dev, ci);
+    // Same format on both sides: only the color space changes, the pixels the
+    // application writes are read back directly.
+    let needs_staging = promoted && app_format != HDR10_FORMAT;
+    if promoted {
+        modified.image_format = HDR10_FORMAT;
+        modified.image_color_space = vk::ColorSpaceKHR::HDR10_ST2084_EXT;
+        output_format = HDR10_FORMAT;
+    }
+
+    let view_formats: Vec<vk::Format> = if needs_staging {
+        // The application keeps rendering through its own format.
+        [Some(HDR10_FORMAT), Some(app_format), format_sibling(app_format)].into_iter().flatten().collect()
+    } else {
+        vec![ci.image_format, output_format]
+    };
     let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
-    if mutable {
+    if needs_staging || mutable {
         modified.flags |= vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT;
         format_list.p_next = modified.p_next;
         modified.p_next = &format_list as *const _ as *const c_void;
@@ -323,6 +457,12 @@ pub unsafe extern "system" fn create_swapchain(
 
     let result = next(device, &modified, p_allocator, p_swapchain);
     if result != vk::Result::SUCCESS {
+        if promoted {
+            log_error!("HDR10 swapchain refused ({result}), retrying as the application asked");
+            drop(guard);
+            return next(device, p_create_info, p_allocator, p_swapchain);
+        }
+        drop(guard);
         return result;
     }
     let swapchain = *p_swapchain;
@@ -337,25 +477,26 @@ pub unsafe extern "system" fn create_swapchain(
         (r == vk::Result::SUCCESS).then_some(images)
     };
 
-    let mut guard = dev.runtime.lock().unwrap();
-    if guard.is_none() {
-        match Runtime::new(&dev) {
-            Ok(rt) => *guard = Some(rt),
-            Err(e) => {
-                log_error!("cannot create layer runtime: {e}");
-                return result;
-            }
-        }
-    }
+    let plan = SwapchainPlan {
+        extent: ci.image_extent,
+        format: modified.image_format,
+        app_format,
+        output_format,
+        color_space: modified.image_color_space,
+        promoted: needs_staging,
+        hdr_promoted: promoted,
+    };
     let rt = guard.as_mut().unwrap();
-    rt.ensure_chain(&dev);
     // Tracked even if the preset failed to load: another one can be loaded
     // live from vkslang-ui.
-    match images.map(|imgs| SwapchainState::new(&dev, ci, imgs, output_format)) {
+    match images.map(|imgs| SwapchainState::new(&dev, &plan, imgs)) {
         Some(Ok(state)) => {
             log_info!(
-                "processing swapchain {}x{} {:?}",
-                ci.image_extent.width, ci.image_extent.height, ci.image_format
+                "processing swapchain {}x{} {:?}{}",
+                ci.image_extent.width,
+                ci.image_extent.height,
+                modified.image_format,
+                if promoted { " (promoted to HDR10)" } else { "" }
             );
             rt.track_swapchain(swapchain, state);
         }

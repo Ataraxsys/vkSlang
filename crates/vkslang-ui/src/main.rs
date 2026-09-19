@@ -10,7 +10,7 @@ use eframe::egui;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use vkslang_ipc::{color_space_mismatch, Client, Filter, Request, Response, SourceSettings, State, GAMUT_NAMES};
+use vkslang_ipc::{color_space_warning, Client, Filter, Request, Response, SourceSettings, State, GAMUT_NAMES};
 
 const POLL: Duration = Duration::from_millis(400);
 const SCAN: Duration = Duration::from_secs(2);
@@ -375,14 +375,16 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label("HDR");
             for o in &state.outputs {
-                ui.weak(format!("output {} ({})", o.color_space.label(), o.format));
+                let promoted = if o.promoted { ", promoted by vkSlang" } else { "" };
+                ui.weak(format!("output {} ({}{})", o.color_space.label(), o.format, promoted));
             }
             if let Some(p) = preset {
                 ui.weak(format!("· preset {}", p.label()));
             }
         });
+        let promoted = state.outputs.first().is_some_and(|o| o.promoted);
         if let (Some(p), Some(o)) = (preset, output) {
-            if let Some(why) = color_space_mismatch(p, o) {
+            if let Some(why) = color_space_warning(p, o, promoted) {
                 ui.colored_label(egui::Color32::from_rgb(255, 170, 60), format!("⚠ {why}"));
             }
         }
