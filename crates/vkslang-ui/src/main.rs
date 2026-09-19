@@ -376,10 +376,10 @@ impl App {
                         continue;
                     }
                     ui.horizontal(|ui| {
+                        let before = p.value;
                         let slider = egui::Slider::new(&mut p.value, p.minimum..=p.maximum)
                             .step_by(p.step.max(0.0001) as f64)
                             .text(p.description.trim());
-                        let before = p.value;
                         let slider = ui.add(slider).on_hover_text(p.name.as_str());
                         if slider.changed() {
                             if (p.value - before).abs() > p.epsilon() {
