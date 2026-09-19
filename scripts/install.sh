@@ -6,10 +6,12 @@ set -eu
 PREFIX="${PREFIX:-$HOME/.local}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIB="$ROOT/target/release/libvkslang.so"
+UI="$ROOT/target/release/vkslang-ui"
 
-[ -f "$LIB" ] || (cd "$ROOT" && cargo build --release)
+{ [ -f "$LIB" ] && [ -f "$UI" ]; } || (cd "$ROOT" && cargo build --release --workspace)
 
 install -Dm755 "$LIB" "$PREFIX/lib/vkslang/libvkslang.so"
+install -Dm755 "$UI" "$PREFIX/bin/vkslang-ui"
 mkdir -p "$PREFIX/share/vulkan/implicit_layer.d"
 # The manifest points at the absolute library path so no LD_LIBRARY_PATH is needed.
 sed "s|\"library_path\": \"libvkslang.so\"|\"library_path\": \"$PREFIX/lib/vkslang/libvkslang.so\"|" \
@@ -20,4 +22,4 @@ if [ ! -f "$CONF_DIR/vkSlang.conf" ]; then
     install -Dm644 "$ROOT/config/vkSlang.conf" "$CONF_DIR/vkSlang.conf"
 fi
 
-echo "Installed. Try: ENABLE_VKSLANG=1 VKSLANG_PRESET=/path/to/preset.slangp vkcube"
+echo "Installed. Try: ENABLE_VKSLANG=1 VKSLANG_PRESET=/path/to/preset.slangp vkcube & vkslang-ui"

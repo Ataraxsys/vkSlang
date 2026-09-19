@@ -176,6 +176,9 @@ pub unsafe extern "system" fn create_device(
     if wanted && !active {
         log_warn!("no graphics queue requested by the application, layer inactive on this device");
     }
+    if active {
+        crate::ipc::start();
+    }
     log_debug!("device created (active={active}, mutable_format={mutable_format})");
 
     let data = DeviceData {
@@ -345,10 +348,9 @@ pub unsafe extern "system" fn create_swapchain(
         }
     }
     let rt = guard.as_mut().unwrap();
-    rt.ensure_chain(&dev, config::get());
-    if !rt.is_rendering() {
-        return result;
-    }
+    rt.ensure_chain(&dev);
+    // Tracked even if the preset failed to load: another one can be loaded
+    // live from vkslang-ui.
     match images.map(|imgs| SwapchainState::new(&dev, ci, imgs, output_format)) {
         Some(Ok(state)) => {
             log_info!(
@@ -392,10 +394,16 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
     let submit_queue = if same_family { queue } else { dev.queue };
 
     let mut guard = dev.runtime.lock().unwrap();
-    let Some(rt) = guard.as_mut().filter(|rt| rt.is_rendering()) else {
+    let Some(rt) = guard.as_mut() else {
         drop(guard);
         return next(queue, p_present_info);
     };
+    // Apply what vkslang-ui changed since the last frame.
+    rt.sync(&dev);
+    if !rt.is_rendering() {
+        drop(guard);
+        return next(queue, p_present_info);
+    }
 
     let swapchains = slice(pi.p_swapchains, pi.swapchain_count);
     let indices = slice(pi.p_image_indices, pi.swapchain_count);
