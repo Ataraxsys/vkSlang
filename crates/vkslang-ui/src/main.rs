@@ -7,6 +7,7 @@
 mod save;
 
 use eframe::egui;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use vkslang_ipc::{color_space_mismatch, Client, Filter, Request, Response, SourceSettings, State, GAMUT_NAMES};
@@ -51,6 +52,8 @@ struct App {
     client: Option<Client>,
     state: Option<State>,
     message: Option<(String, bool)>,
+    /// Processes that answered with something we cannot use (old protocol).
+    incompatible: HashSet<u32>,
     last_poll: Instant,
     last_scan: Instant,
 
@@ -108,6 +111,7 @@ impl App {
             client: None,
             state: None,
             message: None,
+            incompatible: HashSet::new(),
             last_poll: Instant::now() - POLL,
             last_scan: Instant::now() - SCAN,
             shader_root: default_shader_root(),
@@ -144,8 +148,14 @@ impl App {
             self.disconnect();
         }
         if self.selected.is_none() {
-            if let Some(pid) = self.targets.first().map(|t| t.pid) {
+            // Skip processes running an incompatible layer.
+            let candidates: Vec<u32> =
+                self.targets.iter().map(|t| t.pid).filter(|pid| !self.incompatible.contains(pid)).collect();
+            for pid in candidates {
                 self.select(pid);
+                if self.client.is_some() {
+                    break;
+                }
             }
         }
     }
@@ -184,7 +194,14 @@ impl App {
             }
             Ok(Response::Error { message }) => self.error(message),
             Err(e) => {
-                self.error(format!("connection lost: {e}"));
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    if let Some(pid) = self.selected {
+                        self.incompatible.insert(pid);
+                    }
+                    self.error(format!("{e}"));
+                } else {
+                    self.error(format!("connection lost: {e}"));
+                }
                 self.disconnect();
                 self.last_scan = Instant::now() - SCAN;
             }

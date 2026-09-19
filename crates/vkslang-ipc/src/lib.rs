@@ -248,7 +248,25 @@ impl Client {
         if self.reader.read_line(&mut answer)? == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        Ok(serde_json::from_str(&answer)?)
+        serde_json::from_str(&answer).map_err(|e| {
+            // Most likely a layer speaking an older protocol: say so instead
+            // of reporting a JSON error.
+            #[derive(Deserialize)]
+            struct Version {
+                protocol: u32,
+            }
+            match serde_json::from_str::<Version>(&answer) {
+                Ok(v) if v.protocol != PROTOCOL_VERSION => io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "layer speaks protocol v{}, this build expects v{PROTOCOL_VERSION} \
+                         (restart the application with the updated layer)",
+                        v.protocol
+                    ),
+                ),
+                _ => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+            }
+        })
     }
 }
 
