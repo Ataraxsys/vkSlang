@@ -152,6 +152,7 @@ unsafe fn allocate_cmd(dev: &DeviceData, pool: vk::CommandPool) -> Result<vk::Co
 /// private command pool are used, so this may run on any thread.
 unsafe fn load_chain(dev: &DeviceData, path: &Path) -> Result<Loaded, String> {
     let started = Instant::now();
+    let path = &crate::config::resolve_path(path);
     let preset = ShaderPreset::try_parse(path, ShaderFeatures::NONE).map_err(|e| e.to_string())?;
     let params = preset_params(&preset)?;
     let color_space = preset.color_space().unwrap_or_else(|e| {

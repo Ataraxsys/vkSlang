@@ -2,7 +2,7 @@
 
 use ash::vk;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -120,6 +120,7 @@ fn parse_hdr(kv: &HashMap<String, String>) -> vkslang_ipc::HdrSettings {
 impl Config {
     fn load() -> Config {
         let mut kv = config_path()
+            .map(|p| resolve_path(&p))
             .and_then(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t)))
             .map(|(p, t)| {
                 crate::log_debug!("using config {}", p.display());
@@ -191,6 +192,23 @@ impl Config {
         }
         self.process.contains(&exe_name())
     }
+}
+
+/// Resolves a configured path, falling back to the same path under
+/// `/run/host` for Steam/Proton: inside pressure-vessel the container has its
+/// own `/usr`, and the host filesystem is mounted at `/run/host`.
+pub fn resolve_path(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    if let Ok(rest) = path.strip_prefix("/") {
+        let host = Path::new("/run/host").join(rest);
+        if host.exists() {
+            crate::log_info!("{} not found, using {}", path.display(), host.display());
+            return host;
+        }
+    }
+    path.to_path_buf()
 }
 
 pub fn exe_name() -> String {
