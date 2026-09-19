@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -27,6 +27,79 @@ pub enum Request {
     /// Bypass the filter chain without unloading it.
     SetEnabled { enabled: bool },
     SetSource { source: SourceSettings },
+    /// HDR uniforms (`BrightnessNits`, `ExpandGamut`) for HDR-aware presets.
+    SetHdr { hdr: HdrSettings },
+}
+
+/// Color space of a swapchain or of a preset's final pass.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorSpace {
+    #[default]
+    Sdr,
+    Hdr10,
+    ScRgb,
+    PqScRgb,
+}
+
+impl ColorSpace {
+    pub fn is_hdr(self) -> bool {
+        self != ColorSpace::Sdr
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorSpace::Sdr => "SDR",
+            ColorSpace::Hdr10 => "HDR10",
+            ColorSpace::ScRgb => "scRGB",
+            ColorSpace::PqScRgb => "PQ scRGB",
+        }
+    }
+}
+
+/// Caveat about running a preset of color space `preset` on a swapchain of
+/// color space `output`, if any.
+///
+/// HDR10 vs scRGB is not a problem: HDR-aware presets (e.g. Sony Megatron v2)
+/// adapt their encoding to `HDRMode`. What does not work yet is converting
+/// between SDR and HDR, on the input or the output side.
+pub fn color_space_mismatch(preset: ColorSpace, output: ColorSpace) -> Option<&'static str> {
+    match (preset.is_hdr(), output.is_hdr()) {
+        (true, false) => Some("HDR preset on an SDR output: colors and brightness will be wrong"),
+        (false, true) => Some(
+            "SDR preset on an HDR output: the picture will look wrong (no SDR/HDR conversion yet). \
+             For SDR games, apply vkSlang to the game and let gamescope --hdr-enabled --hdr-itm-enabled do the HDR",
+        ),
+        (true, true) => Some(
+            "HDR output: the application's picture is already HDR encoded, while presets expect an SDR \
+             picture as input, so colors may be off (input conversion not implemented yet)",
+        ),
+        (false, false) => None,
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct HdrSettings {
+    /// Paper white / SDR reference in nits (`BrightnessNits`).
+    pub brightness_nits: f32,
+    /// 0 Accurate, 1 Expanded, 2 Wide, 3 Super (`ExpandGamut`).
+    pub expand_gamut: u32,
+}
+
+impl Default for HdrSettings {
+    fn default() -> Self {
+        HdrSettings { brightness_nits: 200.0, expand_gamut: 0 }
+    }
+}
+
+pub const GAMUT_NAMES: [&str; 4] = ["Accurate", "Expanded", "Wide", "Super"];
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct Output {
+    pub size: [u32; 2],
+    /// Vulkan format name, e.g. `A2B10G10R10_UNORM_PACK32`.
+    pub format: String,
+    pub color_space: ColorSpace,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -65,9 +138,13 @@ pub struct Param {
 }
 
 impl Param {
-    /// RetroArch presets use `min == max` parameters as section headers.
+    /// Presets use unadjustable parameters as section headers: either
+    /// `min == max`, or a range no larger than one (tiny) step, as Sony
+    /// Megatron does with `0.0 0.0 0.0001 0.0001`. On/off parameters
+    /// (`0 1 1`) have a range of 1 and stay real sliders.
     pub fn is_header(&self) -> bool {
-        self.minimum == self.maximum
+        let range = self.maximum - self.minimum;
+        range <= 0.0 || (range <= self.step.abs() && range < 0.01)
     }
 
     /// Smallest change that counts as a user edit (ignores float noise from
@@ -95,8 +172,11 @@ pub struct State {
     /// Last load error, if any.
     pub error: Option<String>,
     pub source: SourceSettings,
-    /// Sizes of the swapchains being processed.
-    pub outputs: Vec<[u32; 2]>,
+    /// Swapchains being processed.
+    pub outputs: Vec<Output>,
+    /// Color space written by the running preset's final pass.
+    pub preset_color_space: Option<ColorSpace>,
+    pub hdr: HdrSettings,
     /// Parameters in declaration order.
     pub params: Vec<Param>,
 }
@@ -172,7 +252,25 @@ impl Client {
         if self.reader.read_line(&mut answer)? == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        Ok(serde_json::from_str(&answer)?)
+        serde_json::from_str(&answer).map_err(|e| {
+            // Most likely a layer speaking an older protocol: say so instead
+            // of reporting a JSON error.
+            #[derive(Deserialize)]
+            struct Version {
+                protocol: u32,
+            }
+            match serde_json::from_str::<Version>(&answer) {
+                Ok(v) if v.protocol != PROTOCOL_VERSION => io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "layer speaks protocol v{}, this build expects v{PROTOCOL_VERSION} \
+                         (restart the application with the updated layer)",
+                        v.protocol
+                    ),
+                ),
+                _ => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+            }
+        })
     }
 }
 
@@ -190,9 +288,42 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"get_state"}"#).unwrap(),
             Request::GetState
         );
+        assert_eq!(
+            serde_json::to_string(&Request::SetHdr { hdr: HdrSettings::default() }).unwrap(),
+            r#"{"cmd":"set_hdr","hdr":{"brightness_nits":200.0,"expand_gamut":0}}"#
+        );
         let resp = Response::Error { message: "x".into() };
         let s = serde_json::to_string(&resp).unwrap();
         assert_eq!(s, r#"{"type":"error","message":"x"}"#);
+    }
+
+    #[test]
+    fn headers() {
+        let p = |initial, min, max, step| Param {
+            name: "p".into(),
+            description: "d".into(),
+            initial,
+            minimum: min,
+            maximum: max,
+            step,
+            value: initial,
+        };
+        assert!(p(0.0, 0.0, 0.0, 0.0).is_header());
+        // Sony Megatron section title
+        assert!(p(0.0, 0.0, 0.0001, 0.0001).is_header());
+        // On/off toggle and ordinary sliders stay adjustable
+        assert!(!p(1.0, 0.0, 1.0, 1.0).is_header());
+        assert!(!p(2.2, 1.0, 3.0, 0.05).is_header());
+    }
+
+    #[test]
+    fn mismatch() {
+        use ColorSpace::*;
+        assert!(color_space_mismatch(Sdr, Sdr).is_none());
+        assert!(color_space_mismatch(Hdr10, Sdr).is_some());
+        assert!(color_space_mismatch(Sdr, Hdr10).is_some());
+        // HDR10 vs scRGB is fine, only the input caveat remains.
+        assert_eq!(color_space_mismatch(ScRgb, Hdr10), color_space_mismatch(Hdr10, Hdr10));
     }
 
     #[test]
