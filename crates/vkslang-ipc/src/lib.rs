@@ -138,9 +138,13 @@ pub struct Param {
 }
 
 impl Param {
-    /// RetroArch presets use `min == max` parameters as section headers.
+    /// Presets use unadjustable parameters as section headers: either
+    /// `min == max`, or a range no larger than one (tiny) step, as Sony
+    /// Megatron does with `0.0 0.0 0.0001 0.0001`. On/off parameters
+    /// (`0 1 1`) have a range of 1 and stay real sliders.
     pub fn is_header(&self) -> bool {
-        self.minimum == self.maximum
+        let range = self.maximum - self.minimum;
+        range <= 0.0 || (range <= self.step.abs() && range < 0.01)
     }
 
     /// Smallest change that counts as a user edit (ignores float noise from
@@ -291,6 +295,25 @@ mod tests {
         let resp = Response::Error { message: "x".into() };
         let s = serde_json::to_string(&resp).unwrap();
         assert_eq!(s, r#"{"type":"error","message":"x"}"#);
+    }
+
+    #[test]
+    fn headers() {
+        let p = |initial, min, max, step| Param {
+            name: "p".into(),
+            description: "d".into(),
+            initial,
+            minimum: min,
+            maximum: max,
+            step,
+            value: initial,
+        };
+        assert!(p(0.0, 0.0, 0.0, 0.0).is_header());
+        // Sony Megatron section title
+        assert!(p(0.0, 0.0, 0.0001, 0.0001).is_header());
+        // On/off toggle and ordinary sliders stay adjustable
+        assert!(!p(1.0, 0.0, 1.0, 1.0).is_header());
+        assert!(!p(2.2, 1.0, 3.0, 0.05).is_header());
     }
 
     #[test]
