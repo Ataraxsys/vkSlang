@@ -33,7 +33,7 @@ fn changed_params(state: &State) -> impl Iterator<Item = (&str, f32)> {
     state
         .params
         .iter()
-        .filter(|p| !p.is_header() && p.value != p.initial)
+        .filter(|p| !p.is_header() && p.is_modified())
         .map(|p| (p.name.as_str(), p.value))
 }
 

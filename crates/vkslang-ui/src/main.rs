@@ -379,10 +379,17 @@ impl App {
                         let slider = egui::Slider::new(&mut p.value, p.minimum..=p.maximum)
                             .step_by(p.step.max(0.0001) as f64)
                             .text(p.description.trim());
-                        if ui.add(slider).on_hover_text(p.name.as_str()).changed() {
-                            requests.push(Request::SetParam { name: p.name.clone(), value: p.value });
+                        let before = p.value;
+                        let slider = ui.add(slider).on_hover_text(p.name.as_str());
+                        if slider.changed() {
+                            if (p.value - before).abs() > p.epsilon() {
+                                requests.push(Request::SetParam { name: p.name.clone(), value: p.value });
+                            } else {
+                                // Only step snapping, not a user edit.
+                                p.value = before;
+                            }
                         }
-                        if p.value != p.initial && ui.small_button("↺").on_hover_text("Preset value").clicked() {
+                        if p.is_modified() && ui.small_button("↺").on_hover_text("Preset value").clicked() {
                             p.value = p.initial;
                             requests.push(Request::SetParam { name: p.name.clone(), value: p.initial });
                         }

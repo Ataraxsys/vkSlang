@@ -69,6 +69,17 @@ impl Param {
     pub fn is_header(&self) -> bool {
         self.minimum == self.maximum
     }
+
+    /// Smallest change that counts as a user edit (ignores float noise from
+    /// sliders snapping to `step`).
+    pub fn epsilon(&self) -> f32 {
+        self.step.abs().max(1e-6) * 1e-3
+    }
+
+    /// Whether the value differs from the preset's.
+    pub fn is_modified(&self) -> bool {
+        (self.value - self.initial).abs() > self.epsilon()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
