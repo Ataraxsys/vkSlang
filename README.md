@@ -49,15 +49,21 @@ vkSlang/
 ## 3. Build and install
 
 ```sh
-cargo build --release --workspace   # -> target/release/libvkslang.so + vkslang-ui
-./scripts/install.sh                # ~/.local/{lib/vkslang,bin,share/vulkan/implicit_layer.d}
-PREFIX=/usr sudo -E ./scripts/install.sh   # system-wide (needed for Steam/Proton:
-                                          # the container imports /usr layers)
+cargo build --release --workspace          # -> target/release/libvkslang.so + vkslang-ui
+./scripts/install.sh                       # ~/.local/{lib/vkslang,bin,share/vulkan/implicit_layer.d}
 ```
 
-Without a Rust toolchain, take `libvkslang.so` and `vkslang-ui` from the CI artifact, put them in `target/release/`, and install them with `VKSLANG_NO_BUILD=1 ./scripts/install.sh`. The script otherwise always rebuilds, so a stale binary is never installed under a fresh manifest.
+For Steam/Proton, install **system-wide** as well, because the container imports the layers it finds in `/usr`. Build as your user first, then install without rebuilding, so root never writes into `target/`:
 
-Requirements: Rust ≥ 1.80, a C/C++ compiler (librashader builds SPIRV-Cross and glslang), and the Vulkan loader.
+```sh
+sudo VKSLANG_NO_BUILD=1 PREFIX=/usr ./scripts/install.sh
+```
+
+> A layer installed in `~/.local` takes **priority** over the one in `/usr`. Keeping both means updating both, otherwise a game silently runs the older one. Installing only in `/usr` covers every case.
+
+Without a Rust toolchain, take `libvkslang.so` and `vkslang-ui` from the CI artifact, put them in `target/release/`, and install with `VKSLANG_NO_BUILD=1 ./scripts/install.sh`. The script otherwise always rebuilds, so a stale binary is never installed under a fresh manifest.
+
+Requirements: Rust ≥ 1.95 (for `vkslang-ui`; the layer alone builds with 1.80), a C/C++ compiler (librashader builds SPIRV-Cross and glslang), and the Vulkan loader.
 
 ## 4. Configuration
 
