@@ -20,7 +20,7 @@ use crate::control::{control, Control};
 use crate::state::DeviceData;
 use crate::{log_debug, log_error, log_info, log_warn};
 use ash::vk;
-use librashader::presets::{get_parameter_meta, ShaderFeatures, ShaderPreset};
+use librashader::presets::{get_parameter_meta, PresetColorSpace, ShaderFeatures, ShaderPreset};
 use librashader::runtime::vk::{FilterChain, FilterChainOptions, FrameOptions, VulkanImage};
 use librashader::runtime::{ColorSpace, FilterChainParameters, Size, Viewport};
 use std::collections::{HashMap, HashSet};
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
-use vkslang_ipc::Param;
+use vkslang_ipc::{HdrSettings, Output, Param};
 
 /// Number of frames the layer keeps in flight (command buffer + fence each).
 const RING: usize = 3;
@@ -41,6 +41,21 @@ pub fn srgb_to_unorm(format: vk::Format) -> Option<vk::Format> {
         vk::Format::A8B8G8R8_SRGB_PACK32 => vk::Format::A8B8G8R8_UNORM_PACK32,
         _ => return None,
     })
+}
+
+fn to_ipc(cs: ColorSpace) -> vkslang_ipc::ColorSpace {
+    match cs {
+        ColorSpace::Sdr => vkslang_ipc::ColorSpace::Sdr,
+        ColorSpace::Hdr10 => vkslang_ipc::ColorSpace::Hdr10,
+        ColorSpace::ScRgb => vkslang_ipc::ColorSpace::ScRgb,
+        ColorSpace::PqScRgb => vkslang_ipc::ColorSpace::PqScRgb,
+    }
+}
+
+fn warn_mismatch(preset: ColorSpace, output: ColorSpace) {
+    if let Some(why) = vkslang_ipc::color_space_mismatch(to_ipc(preset), to_ipc(output)) {
+        log_warn!("{why}");
+    }
 }
 
 fn color_space(cs: vk::ColorSpaceKHR) -> ColorSpace {
@@ -110,6 +125,8 @@ pub struct Loaded {
     path: PathBuf,
     chain: FilterChain,
     params: Vec<Param>,
+    /// Color space the final pass writes.
+    color_space: ColorSpace,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
 }
@@ -137,6 +154,10 @@ unsafe fn load_chain(dev: &DeviceData, path: &Path) -> Result<Loaded, String> {
     let started = Instant::now();
     let preset = ShaderPreset::try_parse(path, ShaderFeatures::NONE).map_err(|e| e.to_string())?;
     let params = preset_params(&preset)?;
+    let color_space = preset.color_space().unwrap_or_else(|e| {
+        log_warn!("cannot determine the preset's output color space: {e}");
+        ColorSpace::Sdr
+    });
 
     let d = &dev.fns;
     let pool = d
@@ -172,7 +193,7 @@ unsafe fn load_chain(dev: &DeviceData, path: &Path) -> Result<Loaded, String> {
         .map_err(|e| fail(e.to_string()))?;
     d.end_command_buffer(cmd).map_err(|e| fail(e.to_string()))?;
     log_info!("compiled {} in {:.2?}", path.display(), started.elapsed());
-    Ok(Loaded { path: path.to_path_buf(), chain, params, pool, cmd })
+    Ok(Loaded { path: path.to_path_buf(), chain, params, color_space, pool, cmd })
 }
 
 // ---------------------------------------------------------------- swapchain
@@ -350,6 +371,7 @@ struct FrameSlot {
 
 struct ActiveChain {
     chain: FilterChain,
+    color_space: ColorSpace,
     /// Metadata; `initial` is the preset's own value.
     params: Vec<Param>,
 }
@@ -366,6 +388,7 @@ pub struct Runtime {
     /// is installed.
     failed: bool,
     enabled: bool,
+    hdr: HdrSettings,
     applied_preset_gen: Option<u64>,
     applied_params_gen: Option<u64>,
     applied_source_gen: u64,
@@ -383,6 +406,12 @@ impl Runtime {
                 .queue_family_index(dev.queue_family),
             None,
         )?;
+        // One lock at a time: guards created inside the struct literal below
+        // would all live until the end of the statement (self-deadlock).
+        let (hdr, source_gen) = {
+            let ctl = control();
+            (ctl.hdr, ctl.source_gen)
+        };
         let mut rt = Runtime {
             pool,
             slots: Vec::with_capacity(RING),
@@ -392,9 +421,10 @@ impl Runtime {
             loader: None,
             failed: false,
             enabled: true,
+            hdr,
             applied_preset_gen: None,
             applied_params_gen: None,
-            applied_source_gen: control().source_gen,
+            applied_source_gen: source_gen,
             swapchains: HashMap::new(),
             frame_count: 0,
             last_frame: None,
@@ -465,8 +495,16 @@ impl Runtime {
             .map(|p| Param { value: ctl.param_value(&p.name, p.initial), ..p.clone() })
             .collect();
         ctl.running_preset = Some(loaded.path.clone());
+        ctl.preset_color_space = Some(to_ipc(loaded.color_space));
         ctl.error = None;
-        self.chain = Some(ActiveChain { chain: loaded.chain, params: loaded.params });
+        for state in self.swapchains.values() {
+            warn_mismatch(loaded.color_space, state.color_space);
+        }
+        self.chain = Some(ActiveChain {
+            chain: loaded.chain,
+            color_space: loaded.color_space,
+            params: loaded.params,
+        });
         self.pending_init = Some((loaded.pool, loaded.cmd));
         self.failed = false;
         self.applied_params_gen = None;
@@ -484,6 +522,7 @@ impl Runtime {
 
         let mut ctl = control();
         self.enabled = ctl.enabled;
+        self.hdr = ctl.hdr;
 
         // New preset requested (one load at a time; a newer request made
         // meanwhile starts as soon as the current one is installed).
@@ -536,10 +575,21 @@ impl Runtime {
     }
 
     fn publish_outputs(&self) {
-        control().outputs = self.swapchains.values().map(|s| [s.extent.width, s.extent.height]).collect();
+        control().outputs = self
+            .swapchains
+            .values()
+            .map(|s| Output {
+                size: [s.extent.width, s.extent.height],
+                format: format!("{:?}", s.format),
+                color_space: to_ipc(s.color_space),
+            })
+            .collect();
     }
 
     pub fn track_swapchain(&mut self, swapchain: vk::SwapchainKHR, state: SwapchainState) {
+        if let Some(active) = &self.chain {
+            warn_mismatch(active.color_space, state.color_space);
+        }
         self.swapchains.insert(swapchain, state);
         self.publish_outputs();
     }
@@ -604,8 +654,9 @@ impl Runtime {
         if !self.is_rendering() {
             return Ok(None);
         }
-        let Runtime { slots, next_slot, chain, failed, pending_init, swapchains, frame_count, last_frame, .. } =
-            self;
+        let Runtime {
+            slots, next_slot, chain, failed, hdr, pending_init, swapchains, frame_count, last_frame, ..
+        } = self;
         let (Some(state), Some(active)) = (swapchains.get(&swapchain), chain.as_mut()) else {
             return Ok(None);
         };
@@ -749,7 +800,10 @@ impl Runtime {
         let now = Instant::now();
         let options = FrameOptions {
             frametime_delta: last_frame.map_or(0, |t| now.duration_since(t).as_millis() as u32),
+            // Binds HDRMode / BrightnessNits / ExpandGamut for HDR presets.
             color_space: state.color_space,
+            brightness_nits: hdr.brightness_nits,
+            expand_gamut: hdr.expand_gamut,
             ..Default::default()
         };
         *last_frame = Some(now);

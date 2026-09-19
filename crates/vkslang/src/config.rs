@@ -42,6 +42,8 @@ pub struct Config {
     pub params: Vec<(String, f32)>,
     /// Control socket for vkslang-ui (`VKSLANG_IPC=0` disables it).
     pub ipc: bool,
+    /// HDR uniforms for HDR-aware presets.
+    pub hdr: vkslang_ipc::HdrSettings,
 }
 
 pub fn get() -> &'static Config {
@@ -94,6 +96,25 @@ pub fn parse_rect(s: &str) -> Option<SourceRect> {
         None => s.parse().ok()?,
     };
     (ratio.is_finite() && ratio > 0.0).then_some(SourceRect::Aspect(ratio))
+}
+
+/// Clamps HDR settings to the ranges the shaders accept.
+pub fn sanitize_hdr(hdr: vkslang_ipc::HdrSettings) -> vkslang_ipc::HdrSettings {
+    vkslang_ipc::HdrSettings {
+        brightness_nits: if hdr.brightness_nits.is_finite() { hdr.brightness_nits.clamp(0.0, 10000.0) } else { 200.0 },
+        expand_gamut: hdr.expand_gamut.min(3),
+    }
+}
+
+fn parse_hdr(kv: &HashMap<String, String>) -> vkslang_ipc::HdrSettings {
+    let default = vkslang_ipc::HdrSettings::default();
+    sanitize_hdr(vkslang_ipc::HdrSettings {
+        brightness_nits: kv
+            .get("brightness_nits")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.brightness_nits),
+        expand_gamut: kv.get("expand_gamut").and_then(|v| v.parse().ok()).unwrap_or(default.expand_gamut),
+    })
 }
 
 impl Config {
@@ -159,6 +180,7 @@ impl Config {
             process,
             params,
             ipc: kv.get("ipc").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false")),
+            hdr: parse_hdr(&kv),
         }
     }
 
@@ -257,6 +279,15 @@ mod tests {
         let src = Source { rect: SourceRect::Aspect(4.0 / 3.0), ..Default::default() };
         let r = src.picture_rect(vk::Extent2D { width: 3840, height: 2160 });
         assert_eq!((r.offset.x, r.offset.y, r.extent.width, r.extent.height), (480, 0, 2880, 2160));
+    }
+
+    #[test]
+    fn hdr() {
+        let kv = parse_file("brightness_nits = 400\nexpand_gamut = 9\n");
+        let hdr = parse_hdr(&kv);
+        assert_eq!((hdr.brightness_nits, hdr.expand_gamut), (400.0, 3));
+        let hdr = parse_hdr(&HashMap::new());
+        assert_eq!((hdr.brightness_nits, hdr.expand_gamut), (200.0, 0));
     }
 
     #[test]

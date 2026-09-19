@@ -65,6 +65,8 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
 | `VKSLANG_LOG` | `debug` | Log level. |
 | `VKSLANG_IPC` / `ipc` | `0` | Disables the socket for `vkslang-ui`. |
+| `VKSLANG_BRIGHTNESS_NITS` / `brightness_nits` | `200` | HDR reference white (`BrightnessNits`). |
+| `VKSLANG_EXPAND_GAMUT` / `expand_gamut` | `0`–`3` | HDR colour boost (`ExpandGamut`): Accurate, Expanded, Wide, Super. |
 
 ### Logical resolution (`VKSLANG_SOURCE_RES`)
 
@@ -80,6 +82,22 @@ As a result, scanlines, masks and curvature line up with the 240 original lines 
 - `ENABLE_VKSLANG=1` placed before `gamescope` is **inherited by the game**. Set `VKSLANG_PROCESS=gamescope` so only gamescope's output is processed, or leave the variable off to process the game itself.
 - vkSlang only hooks **Vulkan swapchains**. Gamescope's nested Wayland backend presents through Wayland subsurfaces, not through a `VkSwapchainKHR`, so use `--backend sdl`, or process the game (`VKSLANG_PROCESS=<game>`) and let gamescope do the scaling.
 - If gamescope pillarboxes a 4:3 game on a 16:9 output, set `VKSLANG_SOURCE_RECT=4:3`.
+
+## HDR (experimental)
+
+**Recommended today, for SDR games on an HDR screen:** apply vkSlang to the **game** (SDR swapchain, any CRT preset) and let gamescope produce the HDR output with its own SDR→HDR inverse tone mapping:
+
+```sh
+ENABLE_VKSLANG=1 VKSLANG_PROCESS=<game executable> VKSLANG_PRESET=/…/crt-royale.slangp \
+  gamescope --hdr-enabled --hdr-itm-enabled -- %command%
+```
+
+What vkSlang does on an HDR swapchain (HDR10/PQ or scRGB): it passes the color space to librashader, which binds `HDRMode`, `BrightnessNits` and `ExpandGamut` for **HDR-aware presets** such as `hdr/crt-sony-megatron-v2-default.slangp`. These presets adapt their encoding (PQ or scRGB) to the output. Brightness and gamut can be set in the config or live in `vkslang-ui`, which also shows the color space of the output and the preset.
+
+Current limitations (warned about in the log and the UI):
+
+- **SDR preset on an HDR output**: looks wrong (no inverse tonemapping of the preset's output).
+- **Input on an HDR output**: the application's picture is already HDR encoded (PQ), while every preset, Megatron included, expects an SDR picture. Colors may be off until an input conversion (PQ → SDR with `brightness_nits` as paper white) is implemented.
 
 ## Live control: `vkslang-ui`
 
@@ -104,7 +122,7 @@ One Unix socket per process: `$XDG_RUNTIME_DIR/vkslang/<pid>.sock`, one JSON obj
 echo '{"cmd":"set_param","name":"MASK_STRENGTH","value":0.5}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/vkslang/<pid>.sock
 ```
 
-Commands: `get_state`, `set_param`, `reset_params`, `load_preset`, `set_enabled`, `set_source`. `VKSLANG_IPC=0` (or `ipc = 0`) disables the socket.
+Commands: `get_state`, `set_param`, `reset_params`, `load_preset`, `set_enabled`, `set_source`, `set_hdr`. `VKSLANG_IPC=0` (or `ipc = 0`) disables the socket.
 
 Inside the layer, the IPC thread only writes a desired state (with generation counters). Changes are applied by `vkQueuePresentKHR` on the presenting thread: parameters are uniforms (cost: nothing), source settings rebuild the low-resolution image, and a new preset is compiled on a separate thread with its own command pool.
 

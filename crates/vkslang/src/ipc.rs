@@ -109,6 +109,7 @@ pub fn handle(request: Request) -> Response {
             }
             Err(message) => return Response::Error { message },
         },
+        Request::SetHdr { hdr } => ctl.hdr = config::sanitize_hdr(hdr),
     }
     Response::State(ctl.snapshot())
 }

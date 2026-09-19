@@ -30,7 +30,7 @@ macro_rules! pfn {
 /// for applications resolving device functions through the instance.
 unsafe fn device_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
     match name.to_bytes() {
-        b"vkGetDeviceProcAddr" => pfn!(vkGetDeviceProcAddr),
+        b"vkGetDeviceProcAddr" => pfn!(get_device_proc_addr),
         b"vkDestroyDevice" => pfn!(hooks::destroy_device),
         b"vkGetDeviceQueue" => pfn!(hooks::get_device_queue),
         b"vkGetDeviceQueue2" => pfn!(hooks::get_device_queue2),
@@ -43,7 +43,7 @@ unsafe fn device_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
 
 unsafe fn instance_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
     match name.to_bytes() {
-        b"vkGetInstanceProcAddr" => pfn!(vkGetInstanceProcAddr),
+        b"vkGetInstanceProcAddr" => pfn!(get_instance_proc_addr),
         b"vkCreateInstance" => pfn!(hooks::create_instance),
         b"vkDestroyInstance" => pfn!(hooks::destroy_instance),
         b"vkCreateDevice" => pfn!(hooks::create_device),
@@ -51,8 +51,27 @@ unsafe fn instance_hook(name: &CStr) -> vk::PFN_vkVoidFunction {
     }
 }
 
+// Exported entry points only forward to private functions, and every pointer
+// handed to the loader targets a private function. Pointers to the exported
+// symbols themselves could be interposed by the dynamic linker with
+// libvulkan's functions of the same name when the application links libvulkan
+// directly (the loader then fails with "Failed to find 'vkCreateInstance'").
+// The library is additionally linked with -Bsymbolic (build.rs).
+
 #[no_mangle]
 pub unsafe extern "system" fn vkGetInstanceProcAddr(
+    instance: vk::Instance,
+    p_name: *const c_char,
+) -> vk::PFN_vkVoidFunction {
+    get_instance_proc_addr(instance, p_name)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn vkGetDeviceProcAddr(device: vk::Device, p_name: *const c_char) -> vk::PFN_vkVoidFunction {
+    get_device_proc_addr(device, p_name)
+}
+
+unsafe extern "system" fn get_instance_proc_addr(
     instance: vk::Instance,
     p_name: *const c_char,
 ) -> vk::PFN_vkVoidFunction {
@@ -67,8 +86,7 @@ pub unsafe extern "system" fn vkGetInstanceProcAddr(
     (data.next_gipa)(instance, p_name)
 }
 
-#[no_mangle]
-pub unsafe extern "system" fn vkGetDeviceProcAddr(
+unsafe extern "system" fn get_device_proc_addr(
     device: vk::Device,
     p_name: *const c_char,
 ) -> vk::PFN_vkVoidFunction {
@@ -94,8 +112,8 @@ pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     v.loader_layer_interface_version = v.loader_layer_interface_version.min(CURRENT_LOADER_LAYER_INTERFACE_VERSION);
-    v.pfn_get_instance_proc_addr = Some(vkGetInstanceProcAddr);
-    v.pfn_get_device_proc_addr = Some(vkGetDeviceProcAddr);
+    v.pfn_get_instance_proc_addr = Some(get_instance_proc_addr);
+    v.pfn_get_device_proc_addr = Some(get_device_proc_addr);
     v.pfn_get_physical_device_proc_addr = None;
     vk::Result::SUCCESS
 }
