@@ -85,9 +85,19 @@ As a result, scanlines, masks and curvature line up with the 240 original lines 
 
 ## HDR (experimental)
 
-On an HDR swapchain (HDR10/PQ or scRGB), vkSlang passes the color space to librashader, which binds `HDRMode`, `BrightnessNits` and `ExpandGamut` for **HDR-aware presets** such as `hdr/crt-sony-megatron-v2-default.slangp`. Brightness and gamut can be set in the config or live in `vkslang-ui`, which also shows the color space of the output and the preset and warns when they don't match.
+**Recommended today, for SDR games on an HDR screen:** apply vkSlang to the **game** (SDR swapchain, any CRT preset) and let gamescope produce the HDR output with its own SDR→HDR inverse tone mapping:
 
-Limitation: a regular **SDR preset on an HDR output** will look wrong, because there is no inverse tonemapping yet (librashader leaves that to the host).
+```sh
+ENABLE_VKSLANG=1 VKSLANG_PROCESS=<game executable> VKSLANG_PRESET=/…/crt-royale.slangp \
+  gamescope --hdr-enabled --hdr-itm-enabled -- %command%
+```
+
+What vkSlang does on an HDR swapchain (HDR10/PQ or scRGB): it passes the color space to librashader, which binds `HDRMode`, `BrightnessNits` and `ExpandGamut` for **HDR-aware presets** such as `hdr/crt-sony-megatron-v2-default.slangp`. These presets adapt their encoding (PQ or scRGB) to the output. Brightness and gamut can be set in the config or live in `vkslang-ui`, which also shows the color space of the output and the preset.
+
+Current limitations (warned about in the log and the UI):
+
+- **SDR preset on an HDR output**: looks wrong (no inverse tonemapping of the preset's output).
+- **Input on an HDR output**: the application's picture is already HDR encoded (PQ), while every preset, Megatron included, expects an SDR picture. Colors may be off until an input conversion (PQ → SDR with `brightness_nits` as paper white) is implemented.
 
 ## Live control: `vkslang-ui`
 

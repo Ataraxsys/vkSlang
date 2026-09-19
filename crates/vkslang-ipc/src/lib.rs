@@ -57,18 +57,24 @@ impl ColorSpace {
     }
 }
 
-/// Why a preset and an output do not fit together, if they don't.
+/// Caveat about running a preset of color space `preset` on a swapchain of
+/// color space `output`, if any.
+///
+/// HDR10 vs scRGB is not a problem: HDR-aware presets (e.g. Sony Megatron v2)
+/// adapt their encoding to `HDRMode`. What does not work yet is converting
+/// between SDR and HDR, on the input or the output side.
 pub fn color_space_mismatch(preset: ColorSpace, output: ColorSpace) -> Option<&'static str> {
     match (preset.is_hdr(), output.is_hdr()) {
         (true, false) => Some("HDR preset on an SDR output: colors and brightness will be wrong"),
         (false, true) => Some(
-            "SDR preset on an HDR output: the image will look wrong (no inverse tonemapping yet); \
-             use an HDR preset such as hdr/crt-sony-megatron-v2-default.slangp",
+            "SDR preset on an HDR output: the picture will look wrong (no SDR/HDR conversion yet). \
+             For SDR games, apply vkSlang to the game and let gamescope --hdr-enabled --hdr-itm-enabled do the HDR",
         ),
-        _ if preset != output && !(preset == ColorSpace::ScRgb && output == ColorSpace::PqScRgb) => {
-            Some("the preset's HDR format differs from the output's (HDR10 vs scRGB)")
-        }
-        _ => None,
+        (true, true) => Some(
+            "HDR output: the application's picture is already HDR encoded, while presets expect an SDR \
+             picture as input, so colors may be off (input conversion not implemented yet)",
+        ),
+        (false, false) => None,
     }
 }
 
@@ -273,11 +279,10 @@ mod tests {
     fn mismatch() {
         use ColorSpace::*;
         assert!(color_space_mismatch(Sdr, Sdr).is_none());
-        assert!(color_space_mismatch(Hdr10, Hdr10).is_none());
-        assert!(color_space_mismatch(ScRgb, PqScRgb).is_none());
         assert!(color_space_mismatch(Hdr10, Sdr).is_some());
         assert!(color_space_mismatch(Sdr, Hdr10).is_some());
-        assert!(color_space_mismatch(Hdr10, ScRgb).is_some());
+        // HDR10 vs scRGB is fine, only the input caveat remains.
+        assert_eq!(color_space_mismatch(ScRgb, Hdr10), color_space_mismatch(Hdr10, Hdr10));
     }
 
     #[test]
