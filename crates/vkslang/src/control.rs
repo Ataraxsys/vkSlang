@@ -12,7 +12,7 @@ use crate::config::{self, Source};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, MutexGuard};
-use vkslang_ipc::{Param, State, PROTOCOL_VERSION};
+use vkslang_ipc::{ColorSpace, HdrSettings, Output, Param, State, PROTOCOL_VERSION};
 
 pub struct Control {
     // ---- desired (written by IPC) ----
@@ -24,13 +24,16 @@ pub struct Control {
     pub params_gen: u64,
     pub source: Source,
     pub source_gen: u64,
+    /// Read every frame, no generation needed.
+    pub hdr: HdrSettings,
 
     // ---- published (written by the runtime) ----
     pub running_preset: Option<PathBuf>,
     pub loading: bool,
     pub error: Option<String>,
     pub params: Vec<Param>,
-    pub outputs: Vec<[u32; 2]>,
+    pub preset_color_space: Option<ColorSpace>,
+    pub outputs: Vec<Output>,
 }
 
 static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
@@ -43,10 +46,12 @@ static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
         params_gen: 0,
         source: cfg.source.clone(),
         source_gen: 0,
+        hdr: cfg.hdr,
         running_preset: None,
         loading: false,
         error: None,
         params: Vec::new(),
+        preset_color_space: None,
         outputs: Vec::new(),
     })
 });
@@ -67,6 +72,8 @@ impl Control {
             error: self.error.clone(),
             source: self.source.to_ipc(),
             outputs: self.outputs.clone(),
+            preset_color_space: self.preset_color_space,
+            hdr: self.hdr,
             params: self.params.clone(),
         }
     }

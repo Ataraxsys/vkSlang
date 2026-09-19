@@ -9,7 +9,7 @@ mod save;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use vkslang_ipc::{Client, Filter, Request, Response, SourceSettings, State};
+use vkslang_ipc::{color_space_mismatch, Client, Filter, Request, Response, SourceSettings, State, GAMUT_NAMES};
 
 const POLL: Duration = Duration::from_millis(400);
 const SCAN: Duration = Duration::from_secs(2);
@@ -239,7 +239,11 @@ impl App {
                     ui.spinner();
                     ui.label("compiling…");
                 }
-                let outputs: Vec<String> = state.outputs.iter().map(|[w, h]| format!("{w}×{h}")).collect();
+                let outputs: Vec<String> = state
+                    .outputs
+                    .iter()
+                    .map(|o| format!("{}×{} {}", o.size[0], o.size[1], o.color_space.label()))
+                    .collect();
                 if !outputs.is_empty() {
                     ui.weak(format!("output {}", outputs.join(", ")));
                 }
@@ -344,6 +348,53 @@ impl App {
         }
     }
 
+    fn hdr_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(state) = self.state.as_ref() else { return };
+        let output = state.outputs.first().map(|o| o.color_space);
+        let preset = state.preset_color_space;
+        let mut hdr = state.hdr;
+        let mut changed = false;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("HDR");
+            for o in &state.outputs {
+                ui.weak(format!("output {} ({})", o.color_space.label(), o.format));
+            }
+            if let Some(p) = preset {
+                ui.weak(format!("· preset {}", p.label()));
+            }
+        });
+        if let (Some(p), Some(o)) = (preset, output) {
+            if let Some(why) = color_space_mismatch(p, o) {
+                ui.colored_label(egui::Color32::from_rgb(255, 170, 60), format!("⚠ {why}"));
+            }
+        }
+        // Only meaningful for HDR-aware presets (HDRMode != 0).
+        let hdr_active = preset.is_some_and(|p| p.is_hdr()) || output.is_some_and(|o| o.is_hdr());
+        ui.add_enabled_ui(hdr_active, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut hdr.brightness_nits, 80.0..=2000.0)
+                            .logarithmic(true)
+                            .step_by(10.0)
+                            .suffix(" nits")
+                            .text("Paper white"),
+                    )
+                    .on_hover_text("BrightnessNits: SDR reference white")
+                    .changed();
+                ui.separator();
+                ui.label("Gamut");
+                for (i, name) in GAMUT_NAMES.iter().enumerate() {
+                    changed |= ui.selectable_value(&mut hdr.expand_gamut, i as u32, *name).changed();
+                }
+            });
+        });
+        if changed {
+            self.send(Request::SetHdr { hdr });
+        }
+    }
+
     fn params_panel(&mut self, ui: &mut egui::Ui) {
         let Some(state) = self.state.as_mut() else { return };
         ui.horizontal(|ui| {
@@ -441,6 +492,8 @@ impl eframe::App for App {
                 ui.label(egui::RichText::new(preset).monospace());
             }
             self.source_panel(ui);
+            ui.separator();
+            self.hdr_panel(ui);
             ui.separator();
             self.params_panel(ui);
             self.save_panel(ui);

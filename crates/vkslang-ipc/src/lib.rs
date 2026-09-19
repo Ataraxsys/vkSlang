@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -27,6 +27,73 @@ pub enum Request {
     /// Bypass the filter chain without unloading it.
     SetEnabled { enabled: bool },
     SetSource { source: SourceSettings },
+    /// HDR uniforms (`BrightnessNits`, `ExpandGamut`) for HDR-aware presets.
+    SetHdr { hdr: HdrSettings },
+}
+
+/// Color space of a swapchain or of a preset's final pass.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorSpace {
+    #[default]
+    Sdr,
+    Hdr10,
+    ScRgb,
+    PqScRgb,
+}
+
+impl ColorSpace {
+    pub fn is_hdr(self) -> bool {
+        self != ColorSpace::Sdr
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorSpace::Sdr => "SDR",
+            ColorSpace::Hdr10 => "HDR10",
+            ColorSpace::ScRgb => "scRGB",
+            ColorSpace::PqScRgb => "PQ scRGB",
+        }
+    }
+}
+
+/// Why a preset and an output do not fit together, if they don't.
+pub fn color_space_mismatch(preset: ColorSpace, output: ColorSpace) -> Option<&'static str> {
+    match (preset.is_hdr(), output.is_hdr()) {
+        (true, false) => Some("HDR preset on an SDR output: colors and brightness will be wrong"),
+        (false, true) => Some(
+            "SDR preset on an HDR output: the image will look wrong (no inverse tonemapping yet); \
+             use an HDR preset such as hdr/crt-sony-megatron-v2-default.slangp",
+        ),
+        _ if preset != output && !(preset == ColorSpace::ScRgb && output == ColorSpace::PqScRgb) => {
+            Some("the preset's HDR format differs from the output's (HDR10 vs scRGB)")
+        }
+        _ => None,
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct HdrSettings {
+    /// Paper white / SDR reference in nits (`BrightnessNits`).
+    pub brightness_nits: f32,
+    /// 0 Accurate, 1 Expanded, 2 Wide, 3 Super (`ExpandGamut`).
+    pub expand_gamut: u32,
+}
+
+impl Default for HdrSettings {
+    fn default() -> Self {
+        HdrSettings { brightness_nits: 200.0, expand_gamut: 0 }
+    }
+}
+
+pub const GAMUT_NAMES: [&str; 4] = ["Accurate", "Expanded", "Wide", "Super"];
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct Output {
+    pub size: [u32; 2],
+    /// Vulkan format name, e.g. `A2B10G10R10_UNORM_PACK32`.
+    pub format: String,
+    pub color_space: ColorSpace,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -95,8 +162,11 @@ pub struct State {
     /// Last load error, if any.
     pub error: Option<String>,
     pub source: SourceSettings,
-    /// Sizes of the swapchains being processed.
-    pub outputs: Vec<[u32; 2]>,
+    /// Swapchains being processed.
+    pub outputs: Vec<Output>,
+    /// Color space written by the running preset's final pass.
+    pub preset_color_space: Option<ColorSpace>,
+    pub hdr: HdrSettings,
     /// Parameters in declaration order.
     pub params: Vec<Param>,
 }
@@ -190,9 +260,24 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"get_state"}"#).unwrap(),
             Request::GetState
         );
+        assert_eq!(
+            serde_json::to_string(&Request::SetHdr { hdr: HdrSettings::default() }).unwrap(),
+            r#"{"cmd":"set_hdr","hdr":{"brightness_nits":200.0,"expand_gamut":0}}"#
+        );
         let resp = Response::Error { message: "x".into() };
         let s = serde_json::to_string(&resp).unwrap();
         assert_eq!(s, r#"{"type":"error","message":"x"}"#);
+    }
+
+    #[test]
+    fn mismatch() {
+        use ColorSpace::*;
+        assert!(color_space_mismatch(Sdr, Sdr).is_none());
+        assert!(color_space_mismatch(Hdr10, Hdr10).is_none());
+        assert!(color_space_mismatch(ScRgb, PqScRgb).is_none());
+        assert!(color_space_mismatch(Hdr10, Sdr).is_some());
+        assert!(color_space_mismatch(Sdr, Hdr10).is_some());
+        assert!(color_space_mismatch(Hdr10, ScRgb).is_some());
     }
 
     #[test]
