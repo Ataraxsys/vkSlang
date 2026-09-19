@@ -406,6 +406,12 @@ impl Runtime {
                 .queue_family_index(dev.queue_family),
             None,
         )?;
+        // One lock at a time: guards created inside the struct literal below
+        // would all live until the end of the statement (self-deadlock).
+        let (hdr, source_gen) = {
+            let ctl = control();
+            (ctl.hdr, ctl.source_gen)
+        };
         let mut rt = Runtime {
             pool,
             slots: Vec::with_capacity(RING),
@@ -415,10 +421,10 @@ impl Runtime {
             loader: None,
             failed: false,
             enabled: true,
-            hdr: control().hdr,
+            hdr,
             applied_preset_gen: None,
             applied_params_gen: None,
-            applied_source_gen: control().source_gen,
+            applied_source_gen: source_gen,
             swapchains: HashMap::new(),
             frame_count: 0,
             last_frame: None,
