@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev, "feature/**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked || cargo build --release
+      - name: Test
+        run: cargo test --release
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+        continue-on-error: true
+      - name: Check exported symbols
+        run: |
+          nm -D --defined-only target/release/libvkslang.so | grep -E ' vk(NegotiateLoaderLayerInterfaceVersion|GetInstanceProcAddr|GetDeviceProcAddr)$'
+      - name: Validate manifest
+        run: python3 -m json.tool layer/vkslang.json > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libvkslang-x86_64
+          path: |
+            target/release/libvkslang.so
+            layer/vkslang.json
