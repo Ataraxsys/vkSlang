@@ -1,0 +1,32 @@
+[package]
+name = "vkslang"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Vulkan layer running libretro .slangp shader presets (via librashader) on any swapchain"
+license = "MPL-2.0"
+repository = "https://github.com/Ataraxsys/vkSlang"
+publish = false
+
+[lib]
+# Produces libvkslang.so, loaded by the Vulkan loader through layer/vkslang.json
+name = "vkslang"
+crate-type = ["cdylib"]
+
+[dependencies]
+# ash 0.38 is the version librashader-runtime-vk is built against: the
+# ash::Instance / ash::Device we hand to librashader must be the same type.
+ash = { version = "0.38", default-features = false, features = ["debug"] }
+librashader = { version = "0.12", default-features = false, features = ["runtime-vk"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+# A panic must never unwind across the extern "system" boundary into the
+# application; hooks use catch_unwind, abort is the last-resort guard.
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev]
+panic = "abort"
