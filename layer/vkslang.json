@@ -1,0 +1,22 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_VKSLANG_post_processing",
+        "type": "GLOBAL",
+        "library_path": "libvkslang.so",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "vkSlang: libretro .slangp shader presets on any Vulkan swapchain (librashader)",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
+            "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "vkGetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "ENABLE_VKSLANG": "1"
+        },
+        "disable_environment": {
+            "DISABLE_VKSLANG": "1"
+        }
+    }
+}
