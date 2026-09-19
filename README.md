@@ -3,6 +3,7 @@ I couldn't find any way to use RetroArch's Slang shaders in PC games on Linux, s
 # vkSlang
 
 <img width="3840" height="2160" alt="Capture d&#39;écran_20260919_233503" src="https://github.com/user-attachments/assets/216e1a0a-d980-46d0-aea7-8fc04681205d" />
+<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/56e15952-8087-4dd2-9562-243777d97bdd" />
 
 ---
 
