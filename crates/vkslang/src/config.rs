@@ -15,17 +15,33 @@ pub enum SourceRect {
     Explicit(vk::Rect2D),
 }
 
+/// How the swapchain image is turned into the chain's `Original` input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Source {
+    /// Logical (retro) resolution fed to the filter chain as `Original`.
+    pub res: Option<vk::Extent2D>,
+    pub filter: vk::Filter,
+    pub rect: SourceRect,
+    /// `rect` as written by the user (`4:3` stays `4:3`).
+    pub rect_spec: String,
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Source { res: None, filter: vk::Filter::NEAREST, rect: SourceRect::Full, rect_spec: "full".into() }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub preset: Option<PathBuf>,
-    /// Logical (retro) resolution fed to the filter chain as `Original`.
-    pub source_res: Option<vk::Extent2D>,
-    pub source_filter: vk::Filter,
-    pub source_rect: SourceRect,
+    pub source: Source,
     /// Executable names the layer is active for; empty = all.
     pub process: Vec<String>,
     /// Preset parameter overrides (`param.NAME = value`).
     pub params: Vec<(String, f32)>,
+    /// Control socket for vkslang-ui (`VKSLANG_IPC=0` disables it).
+    pub ipc: bool,
 }
 
 pub fn get() -> &'static Config {
@@ -94,6 +110,7 @@ impl Config {
         for (k, v) in std::env::vars() {
             if let Some(key) = k.strip_prefix("VKSLANG_") {
                 if !matches!(key, "CONFIG" | "LOG") {
+                    // VKSLANG_SOURCE_RES -> source_res
                     kv.insert(key.to_ascii_lowercase(), v);
                 }
             }
@@ -110,20 +127,21 @@ impl Config {
                 e
             });
 
-        let source_filter = match kv.get("source_filter").map(|s| s.to_ascii_lowercase()).as_deref() {
+        let filter = match kv.get("source_filter").map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("linear") => vk::Filter::LINEAR,
             _ => vk::Filter::NEAREST,
         };
 
-        let source_rect = kv
-            .get("source_rect")
-            .map(|s| {
-                parse_rect(s).unwrap_or_else(|| {
-                    crate::log_warn!("invalid source_rect '{s}', using full");
-                    SourceRect::Full
-                })
-            })
-            .unwrap_or(SourceRect::Full);
+        let (rect, rect_spec) = match kv.get("source_rect") {
+            Some(spec) => match parse_rect(spec) {
+                Some(rect) => (rect, spec.clone()),
+                None => {
+                    crate::log_warn!("invalid source_rect '{spec}', using full");
+                    (SourceRect::Full, "full".into())
+                }
+            },
+            None => (SourceRect::Full, "full".into()),
+        };
 
         let process = kv
             .get("process")
@@ -137,11 +155,10 @@ impl Config {
 
         Config {
             preset: kv.get("preset").filter(|p| !p.is_empty()).map(PathBuf::from),
-            source_res,
-            source_filter,
-            source_rect,
+            source: Source { res: source_res, filter, rect, rect_spec },
             process,
             params,
+            ipc: kv.get("ipc").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false")),
         }
     }
 
@@ -150,17 +167,48 @@ impl Config {
         if self.process.is_empty() {
             return true;
         }
-        let exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_default();
-        self.process.contains(&exe)
+        self.process.contains(&exe_name())
+    }
+}
+
+pub fn exe_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+impl Source {
+    pub fn from_ipc(s: &vkslang_ipc::SourceSettings) -> Result<Source, String> {
+        let rect = parse_rect(&s.rect).ok_or_else(|| format!("invalid source rect '{}'", s.rect))?;
+        let res = match s.res {
+            Some([0, _]) | Some([_, 0]) => return Err("source resolution must be non-zero".into()),
+            Some([width, height]) => Some(vk::Extent2D { width, height }),
+            None => None,
+        };
+        let filter = match s.filter {
+            vkslang_ipc::Filter::Nearest => vk::Filter::NEAREST,
+            vkslang_ipc::Filter::Linear => vk::Filter::LINEAR,
+        };
+        Ok(Source { res, filter, rect, rect_spec: s.rect.trim().to_string() })
+    }
+
+    pub fn to_ipc(&self) -> vkslang_ipc::SourceSettings {
+        vkslang_ipc::SourceSettings {
+            res: self.res.map(|e| [e.width, e.height]),
+            filter: if self.filter == vk::Filter::LINEAR {
+                vkslang_ipc::Filter::Linear
+            } else {
+                vkslang_ipc::Filter::Nearest
+            },
+            rect: self.rect_spec.clone(),
+        }
     }
 
     /// Area of a `extent`-sized swapchain image that holds the picture.
-    pub fn source_rect_for(&self, extent: vk::Extent2D) -> vk::Rect2D {
+    pub fn picture_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
         let full = vk::Rect2D { offset: vk::Offset2D::default(), extent };
-        match self.source_rect {
+        match self.rect {
             SourceRect::Full => full,
             SourceRect::Aspect(ratio) => {
                 let (w, h) = (extent.width as f32, extent.height as f32);
@@ -206,15 +254,8 @@ mod tests {
     fn rect() {
         assert_eq!(parse_rect("full"), Some(SourceRect::Full));
         assert_eq!(parse_rect("4:3"), Some(SourceRect::Aspect(4.0 / 3.0)));
-        let cfg = Config {
-            preset: None,
-            source_res: None,
-            source_filter: vk::Filter::NEAREST,
-            source_rect: SourceRect::Aspect(4.0 / 3.0),
-            process: vec![],
-            params: vec![],
-        };
-        let r = cfg.source_rect_for(vk::Extent2D { width: 3840, height: 2160 });
+        let src = Source { rect: SourceRect::Aspect(4.0 / 3.0), ..Default::default() };
+        let r = src.picture_rect(vk::Extent2D { width: 3840, height: 2160 });
         assert_eq!((r.offset.x, r.offset.y, r.extent.width, r.extent.height), (480, 0, 2880, 2160));
     }
 
