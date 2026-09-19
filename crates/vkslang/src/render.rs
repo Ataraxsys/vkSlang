@@ -52,9 +52,11 @@ fn to_ipc(cs: ColorSpace) -> vkslang_ipc::ColorSpace {
     }
 }
 
-fn warn_mismatch(preset: ColorSpace, output: ColorSpace) {
-    if let Some(why) = vkslang_ipc::color_space_mismatch(to_ipc(preset), to_ipc(output)) {
-        log_warn!("{why}");
+fn warn_mismatch(preset: ColorSpace, state: &SwapchainState) {
+    match vkslang_ipc::color_space_warning(to_ipc(preset), to_ipc(state.color_space), state.promoted) {
+        Some(why) => log_warn!("{why}"),
+        None if state.promoted => log_info!("HDR10 output: the game renders SDR, the preset writes HDR"),
+        None => {}
     }
 }
 
@@ -199,6 +201,60 @@ unsafe fn load_chain(dev: &DeviceData, path: &Path) -> Result<Loaded, String> {
 
 // ---------------------------------------------------------------- swapchain
 
+/// Creates a device-local image and binds memory for it.
+unsafe fn create_image(
+    dev: &DeviceData,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    flags: vk::ImageCreateFlags,
+    usage: vk::ImageUsageFlags,
+) -> Result<(vk::Image, vk::DeviceMemory), vk::Result> {
+    let d = &dev.fns;
+    let image = d.create_image(
+        &vk::ImageCreateInfo::default()
+            .flags(flags)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED),
+        None,
+    )?;
+    let reqs = d.get_image_memory_requirements(image);
+    let props = dev.instance.fns.get_physical_device_memory_properties(dev.physical_device);
+    let type_index = (0..props.memory_type_count).find(|&i| {
+        reqs.memory_type_bits & (1 << i) != 0
+            && props.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    });
+    let Some(type_index) = type_index else {
+        d.destroy_image(image, None);
+        return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+    };
+    let memory = match d.allocate_memory(
+        &vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index),
+        None,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            d.destroy_image(image, None);
+            return Err(e);
+        }
+    };
+    if let Err(e) = d.bind_image_memory(image, memory, 0) {
+        d.destroy_image(image, None);
+        d.free_memory(memory, None);
+        return Err(e);
+    }
+    Ok((image, memory))
+}
+
 struct SourceImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -218,7 +274,6 @@ impl SourceImage {
         swapchain_extent: vk::Extent2D,
         source: &Source,
     ) -> Result<SourceImage, vk::Result> {
-        let d = &dev.fns;
         let rect = source.picture_rect(swapchain_extent);
         let extent = source.res.unwrap_or(rect.extent);
         let view_format = srgb_to_unorm(format).unwrap_or(format);
@@ -229,66 +284,38 @@ impl SourceImage {
             // them through a UNORM view, like RetroArch does.
             flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
         }
-        let image = d.create_image(
-            &vk::ImageCreateInfo::default()
-                .flags(flags)
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(format)
-                .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                // TRANSFER_SRC: librashader copies Original into its history.
-                .usage(
-                    vk::ImageUsageFlags::TRANSFER_DST
-                        | vk::ImageUsageFlags::TRANSFER_SRC
-                        | vk::ImageUsageFlags::SAMPLED,
-                )
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::UNDEFINED),
-            None,
-        )?;
-
-        let reqs = d.get_image_memory_requirements(image);
-        let props = dev.instance.fns.get_physical_device_memory_properties(dev.physical_device);
-        let Some(type_index) = (0..props.memory_type_count).find(|&i| {
-            reqs.memory_type_bits & (1 << i) != 0
-                && props.memory_types[i as usize]
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        }) else {
-            d.destroy_image(image, None);
-            return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
-        };
-        let memory = match d.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(reqs.size)
-                .memory_type_index(type_index),
-            None,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                d.destroy_image(image, None);
-                return Err(e);
-            }
-        };
-        let source = SourceImage { image, memory, extent, view_format, rect, filter: source.filter };
-        if let Err(e) = d.bind_image_memory(image, memory, 0) {
-            source.destroy(dev);
-            return Err(e);
-        }
+        // TRANSFER_SRC: librashader copies Original into its history.
+        let usage = vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::SAMPLED;
+        let (image, memory) = create_image(dev, format, extent, flags, usage)?;
         log_debug!(
-            "source {}x{} from picture {:?} of {}x{}",
-            extent.width, extent.height, rect, swapchain_extent.width, swapchain_extent.height
+            "source {}x{} {:?} from picture {:?} of {}x{}",
+            extent.width, extent.height, format, rect, swapchain_extent.width, swapchain_extent.height
         );
-        Ok(source)
+        Ok(SourceImage { image, memory, extent, view_format, rect, filter: source.filter })
     }
 
     unsafe fn destroy(self, dev: &DeviceData) {
         dev.fns.destroy_image(self.image, None);
         dev.fns.free_memory(self.memory, None);
     }
+}
+
+pub struct SwapchainPlan {
+    pub extent: vk::Extent2D,
+    /// Format the swapchain images were actually created with.
+    pub format: vk::Format,
+    /// Format the application renders through (differs once promoted).
+    pub app_format: vk::Format,
+    /// Format librashader renders through.
+    pub output_format: vk::Format,
+    pub color_space: vk::ColorSpaceKHR,
+    /// The layer turned an SDR swapchain into an HDR10 one and the pixels
+    /// must be copied through the application's format (staging image).
+    pub promoted: bool,
+    /// The layer promoted the swapchain to HDR10 (with or without staging).
+    pub hdr_promoted: bool,
 }
 
 pub struct SwapchainState {
@@ -298,6 +325,9 @@ pub struct SwapchainState {
     /// consumed the semaphore.
     semaphores: Vec<vk::Semaphore>,
     format: vk::Format,
+    /// Format of the pixels the chain reads (the application's format on a
+    /// promoted swapchain).
+    source_format: vk::Format,
     extent: vk::Extent2D,
     /// Format librashader renders to (UNORM view of an sRGB swapchain when the
     /// device allows mutable swapchain formats).
@@ -306,28 +336,74 @@ pub struct SwapchainState {
     /// Low-resolution copy fed to the chain as `Original`. `None` if it could
     /// not be created with the current settings (frames pass through).
     source: Option<SourceImage>,
+    /// The layer promoted this swapchain to HDR10.
+    promoted: bool,
+    /// On a promoted (HDR10) swapchain, a full-size image in the
+    /// application's own format: the swapchain images hold 8-bit SDR pixels
+    /// written through the application's view, so they are copied raw here
+    /// before being scaled and read as SDR by the filter chain.
+    staging: Option<StagingImage>,
+}
+
+struct StagingImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+}
+
+impl StagingImage {
+    unsafe fn new(
+        dev: &DeviceData,
+        format: vk::Format,
+        extent: vk::Extent2D,
+    ) -> Result<StagingImage, vk::Result> {
+        let (image, memory) = create_image(
+            dev,
+            format,
+            extent,
+            vk::ImageCreateFlags::empty(),
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+        Ok(StagingImage { image, memory })
+    }
+
+    unsafe fn destroy(self, dev: &DeviceData) {
+        dev.fns.destroy_image(self.image, None);
+        dev.fns.free_memory(self.memory, None);
+    }
 }
 
 impl SwapchainState {
     /// `images` are the swapchain images returned by the next layer.
     pub unsafe fn new(
         dev: &DeviceData,
-        info: &vk::SwapchainCreateInfoKHR,
+        plan: &SwapchainPlan,
         images: Vec<vk::Image>,
-        output_format: vk::Format,
     ) -> Result<SwapchainState, vk::Result> {
         let mut state = SwapchainState {
             semaphores: Vec::with_capacity(images.len()),
             images,
-            format: info.image_format,
-            extent: info.image_extent,
-            output_format,
-            color_space: color_space(info.image_color_space),
+            format: plan.format,
+            // Pixels read by the chain are the ones the application wrote.
+            source_format: if plan.promoted { plan.app_format } else { plan.format },
+            extent: plan.extent,
+            output_format: plan.output_format,
+            color_space: color_space(plan.color_space),
+            promoted: plan.promoted || plan.hdr_promoted,
             source: None,
+            staging: None,
         };
         for _ in 0..state.images.len() {
             match dev.fns.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) {
                 Ok(s) => state.semaphores.push(s),
+                Err(e) => {
+                    state.destroy(dev);
+                    return Err(e);
+                }
+            }
+        }
+        if plan.promoted {
+            match StagingImage::new(dev, state.source_format, state.extent) {
+                Ok(staging) => state.staging = Some(staging),
                 Err(e) => {
                     state.destroy(dev);
                     return Err(e);
@@ -344,7 +420,7 @@ impl SwapchainState {
         if let Some(old) = self.source.take() {
             old.destroy(dev);
         }
-        match SourceImage::new(dev, self.format, self.extent, source) {
+        match SourceImage::new(dev, self.source_format, self.extent, source) {
             Ok(s) => self.source = Some(s),
             Err(e) => log_error!("cannot create source image: {e}"),
         }
@@ -356,6 +432,9 @@ impl SwapchainState {
         }
         if let Some(source) = self.source.take() {
             source.destroy(dev);
+        }
+        if let Some(staging) = self.staging.take() {
+            staging.destroy(dev);
         }
     }
 }
@@ -499,7 +578,7 @@ impl Runtime {
         ctl.preset_color_space = Some(to_ipc(loaded.color_space));
         ctl.error = None;
         for state in self.swapchains.values() {
-            warn_mismatch(loaded.color_space, state.color_space);
+            warn_mismatch(loaded.color_space, state);
         }
         self.chain = Some(ActiveChain {
             chain: loaded.chain,
@@ -583,13 +662,14 @@ impl Runtime {
                 size: [s.extent.width, s.extent.height],
                 format: format!("{:?}", s.format),
                 color_space: to_ipc(s.color_space),
+                promoted: s.promoted,
             })
             .collect();
     }
 
     pub fn track_swapchain(&mut self, swapchain: vk::SwapchainKHR, state: SwapchainState) {
         if let Some(active) = &self.chain {
-            warn_mismatch(active.color_space, state.color_space);
+            warn_mismatch(active.color_space, &state);
         }
         self.swapchains.insert(swapchain, state);
         self.publish_outputs();
@@ -697,6 +777,31 @@ impl Runtime {
 
         // 1. swapchain -> TRANSFER_SRC, source -> TRANSFER_DST (previous
         //    contents discarded; the chain keeps its own history copies).
+        let mut first = vec![
+            barrier(
+                image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+            ),
+            barrier(
+                source.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            ),
+        ];
+        if let Some(staging) = &state.staging {
+            first.push(barrier(
+                staging.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            ));
+        }
         d.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::ALL_COMMANDS,
@@ -704,33 +809,59 @@ impl Runtime {
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &[
-                barrier(
-                    image,
-                    vk::ImageLayout::PRESENT_SRC_KHR,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::MEMORY_WRITE,
-                    vk::AccessFlags::TRANSFER_READ,
-                ),
-                barrier(
-                    source.image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::TRANSFER_WRITE,
-                ),
-            ],
+            &first,
         );
 
-        // 2. Downsample the picture region to the logical source resolution.
-        let r = source.rect;
         let layers = vk::ImageSubresourceLayers::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .layer_count(1);
+
+        // 2. On a promoted (HDR10) swapchain, the application's pixels are
+        //    8-bit SDR written through its own view: copy them raw (format
+        //    classes are compatible) so they can be read as SDR.
+        let picture = match &state.staging {
+            Some(staging) => {
+                d.cmd_copy_image(
+                    cmd,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageCopy::default()
+                        .src_subresource(layers)
+                        .dst_subresource(layers)
+                        .extent(vk::Extent3D {
+                            width: state.extent.width,
+                            height: state.extent.height,
+                            depth: 1,
+                        })],
+                );
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        staging.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                    )],
+                );
+                staging.image
+            }
+            None => image,
+        };
+
+        // 2b. Downsample the picture region to the logical source resolution.
+        let r = source.rect;
         if r.extent == source.extent {
             d.cmd_copy_image(
                 cmd,
-                image,
+                picture,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 source.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -741,10 +872,10 @@ impl Runtime {
                     .extent(vk::Extent3D { width: r.extent.width, height: r.extent.height, depth: 1 })],
             );
         } else {
-            let s = source.extent;
+            let sz = source.extent;
             d.cmd_blit_image(
                 cmd,
-                image,
+                picture,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 source.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -761,7 +892,7 @@ impl Runtime {
                     .dst_subresource(layers)
                     .dst_offsets([
                         vk::Offset3D::default(),
-                        vk::Offset3D { x: s.width as i32, y: s.height as i32, z: 1 },
+                        vk::Offset3D { x: sz.width as i32, y: sz.height as i32, z: 1 },
                     ])],
                 source.filter,
             );
