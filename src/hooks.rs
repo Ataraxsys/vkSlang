@@ -8,7 +8,7 @@ use crate::loader::{self, LayerDeviceLink, LayerFunction, LayerInstanceLink, Pfn
 use crate::render::{srgb_to_unorm, Runtime, SwapchainState};
 use crate::state::{self, load_pfn, DeviceData, InstanceData, DEVICES, INSTANCES};
 use crate::{log_debug, log_error, log_info, log_warn};
-use ash::vk;
+use ash::vk::{self, Handle};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::{Arc, Mutex};

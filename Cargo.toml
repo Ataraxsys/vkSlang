@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 # ash 0.38 is the version librashader-runtime-vk is built against: the
 # ash::Instance / ash::Device we hand to librashader must be the same type.
 ash = { version = "0.38", default-features = false, features = ["debug"] }
-librashader = { version = "0.12", default-features = false, features = ["runtime-vk"] }
+librashader = { version = "0.12", default-features = false, features = ["runtime-vk", "presets"] }
 
 [profile.release]
 lto = "thin"
