@@ -24,30 +24,27 @@ ENABLE_VKSLANG=1 VKSLANG_PRESET=~/shaders/crt/crt-royale.slangp VKSLANG_SOURCE_R
 
 ```
 vkSlang/
-├── Cargo.toml                  # cdylib -> libvkslang.so (ash 0.38 + librashader 0.12, runtime-vk)
+├── Cargo.toml                  # workspace
+├── crates/
+│   ├── vkslang/                # cdylib -> libvkslang.so (ash 0.38 + librashader 0.12, runtime-vk)
+│   │   └── src/                # lib.rs, loader.rs, state.rs, hooks.rs, render.rs, config.rs,
+│   │                           # control.rs (live state), ipc.rs (socket), log.rs
+│   ├── vkslang-ipc/            # JSON protocol + client, shared by the layer and the UI
+│   └── vkslang-ui/             # egui control panel (main.rs, save.rs)
 ├── layer/
 │   └── vkslang.json            # implicit layer manifest (ENABLE_VKSLANG=1 / DISABLE_VKSLANG=1)
 ├── config/
 │   └── vkSlang.conf            # sample configuration
 ├── scripts/
 │   └── install.sh              # installs .so + manifest into ~/.local (or PREFIX)
-├── src/
-│   ├── lib.rs                  # vkNegotiateLoaderLayerInterfaceVersion, vkGet{Instance,Device}ProcAddr
-│   ├── loader.rs               # vk_layer.h mirror: VkLayer{Instance,Device}CreateInfo, links, negotiation
-│   ├── state.rs                # dispatch key maps (instance/device), DeviceData, InstanceData
-│   ├── hooks.rs                # vkCreate/DestroyInstance, vkCreate/DestroyDevice, vkGetDeviceQueue(2),
-│   │                           # vkCreate/DestroySwapchainKHR, vkQueuePresentKHR
-│   ├── render.rs               # librashader FilterChain, frame ring, source image, barriers
-│   ├── config.rs               # vkSlang.conf + VKSLANG_* env parsing (+ unit tests)
-│   └── log.rs                  # VKSLANG_LOG-controlled stderr logging
 └── .github/workflows/ci.yml    # build, test, clippy, exported symbol check
 ```
 
 ## 3. Build and install
 
 ```sh
-cargo build --release            # -> target/release/libvkslang.so
-./scripts/install.sh             # ~/.local/lib/vkslang + ~/.local/share/vulkan/implicit_layer.d/vkslang.json
+cargo build --release --workspace   # -> target/release/libvkslang.so + vkslang-ui
+./scripts/install.sh                # ~/.local/{lib/vkslang,bin,share/vulkan/implicit_layer.d}
 PREFIX=/usr sudo -E ./scripts/install.sh   # system-wide
 ```
 
@@ -67,6 +64,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
 | `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
 | `VKSLANG_LOG` | `debug` | Log level. |
+| `VKSLANG_IPC` / `ipc` | `0` | Disables the socket for `vkslang-ui`. |
 
 ### Logical resolution (`VKSLANG_SOURCE_RES`)
 
@@ -82,6 +80,33 @@ As a result, scanlines, masks and curvature line up with the 240 original lines 
 - `ENABLE_VKSLANG=1` placed before `gamescope` is **inherited by the game**. Set `VKSLANG_PROCESS=gamescope` so only gamescope's output is processed, or leave the variable off to process the game itself.
 - vkSlang only hooks **Vulkan swapchains**. Gamescope's nested Wayland backend presents through Wayland subsurfaces, not through a `VkSwapchainKHR`, so use `--backend sdl`, or process the game (`VKSLANG_PROCESS=<game>`) and let gamescope do the scaling.
 - If gamescope pillarboxes a 4:3 game on a 16:9 output, set `VKSLANG_SOURCE_RECT=4:3`.
+
+## Live control: `vkslang-ui`
+
+```sh
+ENABLE_VKSLANG=1 VKSLANG_PRESET=/…/crt-easymode.slangp %command%   # the game
+vkslang-ui                                                           # in a separate window
+```
+
+The external app (egui, OpenGL, so it never loads the layer itself) connects to the running process and lets you:
+
+- **switch presets** from a searchable browser of the `shaders_slang` folder (compiled in the background, then swapped in with no stutter);
+- **adjust parameters** with sliders (min/max/step from `#pragma parameter`, declaration order, section headers, ↺ to restore the preset value);
+- change the **source resolution**, the **filter** and the **picture area** live;
+- turn the shader **on/off** (bypass);
+- **save**: a RetroArch-compatible `.slangp` (`#reference` + modified parameters) or **as default** in `vkSlang.conf`, leaving your other lines untouched.
+
+### Protocol
+
+One Unix socket per process: `$XDG_RUNTIME_DIR/vkslang/<pid>.sock`, one JSON object per line, one response per request (`crates/vkslang-ipc`). Easy to script:
+
+```sh
+echo '{"cmd":"set_param","name":"MASK_STRENGTH","value":0.5}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/vkslang/<pid>.sock
+```
+
+Commands: `get_state`, `set_param`, `reset_params`, `load_preset`, `set_enabled`, `set_source`. `VKSLANG_IPC=0` (or `ipc = 0`) disables the socket.
+
+Inside the layer, the IPC thread only writes a desired state (with generation counters). Changes are applied by `vkQueuePresentKHR` on the presenting thread: parameters are uniforms (cost: nothing), source settings rebuild the low-resolution image, and a new preset is compiled on a separate thread with its own command pool.
 
 ## 5. How it works
 

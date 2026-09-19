@@ -7,7 +7,9 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod config;
+mod control;
 mod hooks;
+mod ipc;
 mod loader;
 mod log;
 mod render;

@@ -18,11 +18,11 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --workspace
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --workspace
       - name: Clippy
-        run: cargo clippy --release -- -D warnings
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
       - name: Check exported symbols
         run: |
           nm -D --defined-only target/release/libvkslang.so | grep -E ' vk(NegotiateLoaderLayerInterfaceVersion|GetInstanceProcAddr|GetDeviceProcAddr)$'
@@ -33,4 +33,5 @@ jobs:
           name: libvkslang-x86_64
           path: |
             target/release/libvkslang.so
+            target/release/vkslang-ui
             layer/vkslang.json
