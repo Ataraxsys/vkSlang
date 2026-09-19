@@ -7,7 +7,7 @@
 mod save;
 
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use vkslang_ipc::{color_space_warning, Client, Filter, Request, Response, SourceSettings, State, GAMUT_NAMES};
@@ -59,6 +59,7 @@ struct App {
 
     shader_root: String,
     presets: Vec<PathBuf>,
+    tree: Tree,
     scanned_root: Option<String>,
     preset_filter: String,
 
@@ -77,6 +78,55 @@ fn default_shader_root() -> String {
     .into_iter()
     .find(|p| Path::new(p).is_dir())
     .unwrap_or_else(|| "/usr/share/libretro/shaders/shaders_slang".into())
+}
+
+/// Presets arranged as folders, the way they sit on disk.
+#[derive(Default)]
+struct Tree {
+    /// Sub-folders, sorted by name.
+    folders: BTreeMap<String, Tree>,
+    /// `(file name, path relative to the root)`.
+    presets: Vec<(String, PathBuf)>,
+}
+
+impl Tree {
+    fn build(paths: &[PathBuf]) -> Tree {
+        let mut root = Tree::default();
+        for path in paths {
+            let mut node = &mut root;
+            let parts: Vec<_> = path.iter().collect();
+            for dir in &parts[..parts.len().saturating_sub(1)] {
+                node = node.folders.entry(dir.to_string_lossy().into_owned()).or_default();
+            }
+            if let Some(name) = parts.last() {
+                node.presets.push((name.to_string_lossy().into_owned(), path.clone()));
+            }
+        }
+        root.sort();
+        root
+    }
+
+    fn sort(&mut self) {
+        self.presets.sort();
+        for folder in self.folders.values_mut() {
+            folder.sort();
+        }
+    }
+
+    /// Presets whose path contains every word, and the folders leading to
+    /// them. `words` empty keeps everything.
+    fn matches(&self, words: &[String]) -> bool {
+        words.is_empty()
+            || self.presets.iter().any(|(_, path)| {
+                let s = path.to_string_lossy().to_lowercase();
+                words.iter().all(|w| s.contains(w.as_str()))
+            })
+            || self.folders.values().any(|f| f.matches(words))
+    }
+
+    fn count(&self) -> usize {
+        self.presets.len() + self.folders.values().map(Tree::count).sum::<usize>()
+    }
 }
 
 fn scan_presets(root: &Path) -> Vec<PathBuf> {
@@ -116,6 +166,7 @@ impl App {
             last_scan: Instant::now() - SCAN,
             shader_root: default_shader_root(),
             presets: Vec::new(),
+            tree: Tree::default(),
             scanned_root: None,
             preset_filter: String::new(),
             param_filter: String::new(),
@@ -219,6 +270,7 @@ impl App {
         }
         if self.scanned_root.as_deref() != Some(self.shader_root.as_str()) {
             self.presets = scan_presets(Path::new(&self.shader_root));
+            self.tree = Tree::build(&self.presets);
             self.scanned_root = Some(self.shader_root.clone());
         }
     }
@@ -295,28 +347,15 @@ impl App {
                 .desired_width(f32::INFINITY),
         );
         let words: Vec<String> = self.preset_filter.to_lowercase().split_whitespace().map(String::from).collect();
-        let shown: Vec<&PathBuf> = self
-            .presets
-            .iter()
-            .filter(|p| {
-                let s = p.to_string_lossy().to_lowercase();
-                words.iter().all(|w| s.contains(w.as_str()))
-            })
-            .collect();
-        ui.weak(format!("{} / {} presets", shown.len(), self.presets.len()));
+        ui.weak(format!("{} presets", self.tree.count()));
+
         let running = self.state.as_ref().and_then(|s| s.preset.clone());
         let root = PathBuf::from(&self.shader_root);
         let mut clicked = None;
-        let row_height = ui.text_style_height(&egui::TextStyle::Body);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_height, shown.len(), |ui, range| {
-            for rel in &shown[range] {
-                let abs = root.join(rel);
-                let is_running = running.as_deref() == Some(abs.to_string_lossy().as_ref());
-                if ui.selectable_label(is_running, rel.to_string_lossy().into_owned()).clicked() {
-                    clicked = Some(abs);
-                }
-            }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            draw_tree(ui, &self.tree, &words, &root, running.as_deref(), &mut clicked);
         });
+
         if let Some(path) = clicked {
             if self.client.is_some() {
                 self.send(Request::LoadPreset { path: path.display().to_string() });
@@ -493,6 +532,42 @@ impl App {
                 }
             }
         });
+    }
+}
+
+/// Draws one level of the tree; folders are collapsed unless a search is
+/// running, in which case only matching branches are shown, opened.
+fn draw_tree(
+    ui: &mut egui::Ui,
+    tree: &Tree,
+    words: &[String],
+    root: &Path,
+    running: Option<&str>,
+    clicked: &mut Option<PathBuf>,
+) {
+    let searching = !words.is_empty();
+    for (name, folder) in &tree.folders {
+        if !folder.matches(words) {
+            continue;
+        }
+        egui::CollapsingHeader::new(name)
+            .id_salt(name)
+            .default_open(searching)
+            .open(searching.then_some(true))
+            .show(ui, |ui| draw_tree(ui, folder, words, root, running, clicked));
+    }
+    for (name, rel) in &tree.presets {
+        if searching {
+            let haystack = rel.to_string_lossy().to_lowercase();
+            if !words.iter().all(|w| haystack.contains(w.as_str())) {
+                continue;
+            }
+        }
+        let abs = root.join(rel);
+        let is_running = running == Some(abs.to_string_lossy().as_ref());
+        if ui.selectable_label(is_running, name.as_str()).clicked() {
+            *clicked = Some(abs);
+        }
     }
 }
 
