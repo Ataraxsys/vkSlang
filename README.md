@@ -51,8 +51,11 @@ vkSlang/
 ```sh
 cargo build --release --workspace   # -> target/release/libvkslang.so + vkslang-ui
 ./scripts/install.sh                # ~/.local/{lib/vkslang,bin,share/vulkan/implicit_layer.d}
-PREFIX=/usr sudo -E ./scripts/install.sh   # system-wide
+PREFIX=/usr sudo -E ./scripts/install.sh   # system-wide (needed for Steam/Proton:
+                                          # the container imports /usr layers)
 ```
+
+Without a Rust toolchain, take `libvkslang.so` and `vkslang-ui` from the CI artifact, put them in `target/release/`, and install them with `VKSLANG_NO_BUILD=1 ./scripts/install.sh`. The script otherwise always rebuilds, so a stale binary is never installed under a fresh manifest.
 
 Requirements: Rust ≥ 1.80, a C/C++ compiler (librashader builds SPIRV-Cross and glslang), and the Vulkan loader.
 

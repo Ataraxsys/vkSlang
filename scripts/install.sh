@@ -8,7 +8,20 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIB="$ROOT/target/release/libvkslang.so"
 UI="$ROOT/target/release/vkslang-ui"
 
-{ [ -f "$LIB" ] && [ -f "$UI" ]; } || (cd "$ROOT" && cargo build --release --workspace)
+# Always rebuild: installing a stale target/ binary with an up-to-date manifest
+# is very hard to notice afterwards. Set VKSLANG_NO_BUILD=1 to install exactly
+# what is in target/release (e.g. binaries downloaded from CI).
+if [ "${VKSLANG_NO_BUILD:-0}" = "1" ]; then
+    for f in "$LIB" "$UI"; do
+        [ -f "$f" ] || { echo "missing $f (VKSLANG_NO_BUILD=1 skips the build)" >&2; exit 1; }
+    done
+elif command -v cargo > /dev/null; then
+    (cd "$ROOT" && cargo build --release --workspace)
+else
+    echo "cargo not found: install Rust, or drop libvkslang.so and vkslang-ui into" >&2
+    echo "$ROOT/target/release and re-run with VKSLANG_NO_BUILD=1" >&2
+    exit 1
+fi
 
 install -Dm755 "$LIB" "$PREFIX/lib/vkslang/libvkslang.so"
 install -Dm755 "$UI" "$PREFIX/bin/vkslang-ui"
