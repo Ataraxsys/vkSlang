@@ -164,7 +164,10 @@ pub unsafe extern "system" fn create_device(
     let queue = match graphics_family {
         Some(family) => {
             let q = fns.get_device_queue(family, 0);
-            set_loader_data(handle, vk::Handle::as_raw(q) as usize as *mut c_void);
+            let r = set_loader_data(handle, q.as_raw() as usize as *mut c_void);
+            if r != vk::Result::SUCCESS {
+                log_warn!("vkSetDeviceLoaderData on the layer queue failed: {r}");
+            }
             q
         }
         None => vk::Queue::null(),

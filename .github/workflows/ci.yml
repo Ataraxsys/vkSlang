@@ -23,7 +23,6 @@ jobs:
         run: cargo test --release
       - name: Clippy
         run: cargo clippy --release -- -D warnings
-        continue-on-error: true
       - name: Check exported symbols
         run: |
           nm -D --defined-only target/release/libvkslang.so | grep -E ' vk(NegotiateLoaderLayerInterfaceVersion|GetInstanceProcAddr|GetDeviceProcAddr)$'
