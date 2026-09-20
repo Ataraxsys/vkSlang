@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -45,8 +45,10 @@ pub struct Capture {
     pub path: String,
     /// Size of the captured image (downscaled to the requested width).
     pub size: [u32; 2],
-    /// Size of the picture area it was taken from, in output pixels.
-    pub picture: [u32; 2],
+    /// Size of the whole swapchain image it was taken from.
+    pub base: [u32; 2],
+    /// Picture area at the time of the capture: x, y, width, height.
+    pub area: [i32; 4],
     /// Increments with every capture, so a client can tell them apart.
     pub id: u64,
 }
