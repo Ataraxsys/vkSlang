@@ -736,6 +736,8 @@ impl Runtime {
             for state in self.swapchains.values_mut() {
                 state.rebuild_source(dev, &source);
             }
+            // The input size changed, so the published sizes must follow.
+            self.publish_outputs();
         }
     }
 
