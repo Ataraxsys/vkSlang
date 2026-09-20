@@ -28,7 +28,7 @@ pub struct Control {
     pub hdr: HdrSettings,
     pub subframes: u32,
     pub subframe_black: bool,
-    /// Room reserved in the swapchain at creation time.
+    /// Kept for the protocol; the layer no longer reserves images.
     pub subframes_max: u32,
 
     // ---- published (written by the runtime) ----
@@ -53,7 +53,7 @@ static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
         hdr: cfg.hdr,
         subframes: cfg.subframes,
         subframe_black: cfg.subframe_black,
-        subframes_max: cfg.subframes,
+        subframes_max: 8,
         running_preset: None,
         loading: false,
         error: None,

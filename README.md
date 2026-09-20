@@ -104,9 +104,9 @@ CRT presets that simulate interlacing alternate fields on every frame, which at 
 VKSLANG_SUBFRAMES=3   # 60 Hz game on a 240 Hz display -> 180 presentations per second
 ```
 
-Each subframe advances `FrameCount` and binds `CurrentSubFrame`/`TotalSubFrames`, so presets that alternate fields on `FrameCount` (guest-advanced and friends) interlace at the presentation rate. `subframe_mode = black` inserts black frames instead of running the preset, which costs almost nothing. Both are adjustable live from `vkslang-ui` ("Presentations per frame"). Raising the count past what the swapchain holds makes the layer report `VK_ERROR_OUT_OF_DATE_KHR` once, so the application rebuilds its swapchain exactly as it would after a resize; if it ignores that, the count falls back to what the swapchain can do.
+Each subframe advances `FrameCount` and binds `CurrentSubFrame`/`TotalSubFrames`, so presets that alternate fields on `FrameCount` (guest-advanced and friends) interlace at the presentation rate. `subframe_mode = black` inserts black frames instead of running the preset, which costs almost nothing. Both are adjustable live from `vkslang-ui` ("Presentations per frame").
 
-The layer acquires images of its own for this, so the swapchain is created with extras, and anything unexpected (no image within 50 ms, a resize) just ends the extra presentations for that frame. In FIFO the application is naturally limited to `refresh / subframes`, which is why 3 subframes suit a 60 Hz game on a 240 Hz display. Note that a compositor that recomposites (gamescope on its Wayland backend) collapses the subframes; with `gamescope --backend sdl` the layer drives gamescope's own swapchain and they survive.
+The layer acquires images of its own for this, one at a time, and never asks the swapchain for extras: raising the image count crashes applications that size their swapchain arrays statically (Qt's QVulkanWindow does). If no image is free within 50 ms, the remaining subframes of that frame are simply skipped. In FIFO the application is naturally limited to `refresh / subframes`, which is why 3 subframes suit a 60 Hz game on a 240 Hz display. Note that a compositor that recomposites (gamescope on its Wayland backend) collapses the subframes; with `gamescope --backend sdl` the layer drives gamescope's own swapchain and they survive.
 
 ### Steam and Proton
 

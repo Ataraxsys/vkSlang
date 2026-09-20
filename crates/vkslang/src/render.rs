@@ -539,9 +539,6 @@ pub struct Runtime {
     last_frame: Option<Instant>,
     /// Smoothed application frame rate, bound as the `FPS` uniform.
     fps: f32,
-    /// Frames spent waiting for the application to rebuild its swapchain
-    /// after we asked for more images (for subframes).
-    recreate_waited: u32,
 }
 
 impl Runtime {
@@ -576,7 +573,6 @@ impl Runtime {
             frame_count: 0,
             last_frame: None,
             fps: 60.0,
-            recreate_waited: 0,
         };
         for _ in 0..RING {
             let slot = allocate_cmd(dev, pool).and_then(|cmd| {
@@ -792,38 +788,6 @@ impl Runtime {
         control().outputs.clear();
     }
 
-    /// Whether the presentation should report `VK_ERROR_OUT_OF_DATE_KHR` so
-    /// the application rebuilds its swapchain with room for more subframes.
-    ///
-    /// Applications must handle that error (a window resize produces it), and
-    /// our vkCreateSwapchainKHR hook then asks for the extra images. If the
-    /// application ignores it, the request is dropped after a few frames and
-    /// the count falls back to what the swapchain can do.
-    pub fn wants_recreation(&mut self) -> bool {
-        let mut ctl = control();
-        if ctl.subframes <= ctl.subframes_max {
-            self.recreate_waited = 0;
-            return false;
-        }
-        self.recreate_waited += 1;
-        match self.recreate_waited {
-            1 => {
-                log_info!("asking for a new swapchain: {} subframes requested", ctl.subframes);
-                true
-            }
-            2..=30 => false, // give the application time to react
-            _ => {
-                log_warn!(
-                    "the application kept its swapchain, staying at {} subframes",
-                    ctl.subframes_max
-                );
-                ctl.subframes = ctl.subframes_max;
-                self.recreate_waited = 0;
-                false
-            }
-        }
-    }
-
     /// Presents the same application frame `total - 1` more times, so
     /// presets can alternate fields (interlacing) or insert black frames
     /// faster than the application's frame rate.
@@ -861,7 +825,9 @@ impl Runtime {
                 &mut index,
             );
             if r != vk::Result::SUCCESS && r != vk::Result::SUBOPTIMAL_KHR {
-                log_debug!("no image for subframe {current}/{total} ({r})");
+                // Every image is busy: skip the rest of this frame's
+                // subframes rather than delay the application.
+                log_debug!("no free image for subframe {current}/{total} ({r})");
                 return;
             }
 
