@@ -31,6 +31,27 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 use vkslang_ipc::{HdrSettings, Output, Param};
 
+/// The parts of a `total`-sized image left outside `picture`.
+fn bar_rects(picture: vk::Rect2D, total: vk::Extent2D) -> Vec<vk::Rect2D> {
+    let rect = |x: i32, y: i32, w: u32, h: u32| vk::Rect2D {
+        offset: vk::Offset2D { x, y },
+        extent: vk::Extent2D { width: w, height: h },
+    };
+    let (px, py) = (picture.offset.x.max(0), picture.offset.y.max(0));
+    let (pw, ph) = (picture.extent.width, picture.extent.height);
+    let right = (px + pw as i32).clamp(0, total.width as i32);
+    let bottom = (py + ph as i32).clamp(0, total.height as i32);
+    [
+        rect(0, 0, px as u32, total.height),
+        rect(right, 0, total.width.saturating_sub(right as u32), total.height),
+        rect(px, 0, pw, py as u32),
+        rect(px, bottom, pw, total.height.saturating_sub(bottom as u32)),
+    ]
+    .into_iter()
+    .filter(|r| r.extent.width > 0 && r.extent.height > 0)
+    .collect()
+}
+
 /// Number of frames the layer keeps in flight (command buffer + fence each).
 const RING: usize = 3;
 
@@ -338,11 +359,41 @@ pub struct SwapchainState {
     source: Option<SourceImage>,
     /// The layer promoted this swapchain to HDR10.
     promoted: bool,
+    /// Opaque black, for the bars around a smaller picture area.
+    black: Option<BlackImage>,
     /// On a promoted (HDR10) swapchain, a full-size image in the
     /// application's own format: the swapchain images hold 8-bit SDR pixels
     /// written through the application's view, so they are copied raw here
     /// before being scaled and read as SDR by the filter chain.
     staging: Option<StagingImage>,
+}
+
+/// 1x1 image cleared to opaque black, blitted into the letterbox bars.
+///
+/// librashader clears the whole output to *transparent* black before drawing
+/// into the viewport, and a compositor takes that alpha seriously (the bars
+/// show up white under KWin), so the bars are repainted afterwards.
+struct BlackImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+}
+
+impl BlackImage {
+    unsafe fn new(dev: &DeviceData, format: vk::Format) -> Result<BlackImage, vk::Result> {
+        let (image, memory) = create_image(
+            dev,
+            format,
+            vk::Extent2D { width: 1, height: 1 },
+            vk::ImageCreateFlags::empty(),
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+        Ok(BlackImage { image, memory })
+    }
+
+    unsafe fn destroy(self, dev: &DeviceData) {
+        dev.fns.destroy_image(self.image, None);
+        dev.fns.free_memory(self.memory, None);
+    }
 }
 
 struct StagingImage {
@@ -391,6 +442,7 @@ impl SwapchainState {
             promoted: plan.promoted || plan.hdr_promoted,
             source: None,
             staging: None,
+            black: None,
         };
         for _ in 0..state.images.len() {
             match dev.fns.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) {
@@ -400,6 +452,10 @@ impl SwapchainState {
                     return Err(e);
                 }
             }
+        }
+        match BlackImage::new(dev, plan.format) {
+            Ok(black) => state.black = Some(black),
+            Err(e) => log_warn!("cannot create the bar fill image: {e}"),
         }
         if plan.promoted {
             match StagingImage::new(dev, state.source_format, state.extent) {
@@ -435,6 +491,9 @@ impl SwapchainState {
         }
         if let Some(staging) = self.staging.take() {
             staging.destroy(dev);
+        }
+        if let Some(black) = self.black.take() {
+            black.destroy(dev);
         }
     }
 }
@@ -961,19 +1020,102 @@ impl Runtime {
             *failed = true;
         }
 
-        // 5. Back to PRESENT_SRC for the presentation engine.
+        // 5. Repaint the letterbox bars opaque black (the chain cleared them
+        //    to transparent black, which a compositor shows as garbage).
+        let bars = bar_rects(r, state.extent);
+        let mut layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        if let (false, Some(black)) = (bars.is_empty(), state.black.as_ref()) {
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[
+                    barrier(
+                        image,
+                        layout,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    ),
+                    barrier(
+                        black.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    ),
+                ],
+            );
+            layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+            d.cmd_clear_color_image(
+                cmd,
+                black.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
+                &[color],
+            );
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    black.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                )],
+            );
+            let blits: Vec<vk::ImageBlit> = bars
+                .iter()
+                .map(|bar| {
+                    vk::ImageBlit::default()
+                        .src_subresource(layers)
+                        .src_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D { x: 1, y: 1, z: 1 },
+                        ])
+                        .dst_subresource(layers)
+                        .dst_offsets([
+                            vk::Offset3D { x: bar.offset.x, y: bar.offset.y, z: 0 },
+                            vk::Offset3D {
+                                x: bar.offset.x + bar.extent.width as i32,
+                                y: bar.offset.y + bar.extent.height as i32,
+                                z: 1,
+                            },
+                        ])
+                })
+                .collect();
+            d.cmd_blit_image(
+                cmd,
+                black.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &blits,
+                vk::Filter::NEAREST,
+            );
+        }
+
+        // 6. Back to PRESENT_SRC for the presentation engine.
         d.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             vk::DependencyFlags::empty(),
             &[],
             &[],
             &[barrier(
                 image,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                layout,
                 vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::empty(),
             )],
         );
@@ -1003,5 +1145,31 @@ impl Runtime {
         }
         *frame_count += 1;
         Ok(Some(signal[0]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bars_around_a_pillarboxed_picture() {
+        let total = vk::Extent2D { width: 3840, height: 2160 };
+        let picture = vk::Rect2D {
+            offset: vk::Offset2D { x: 480, y: 0 },
+            extent: vk::Extent2D { width: 2880, height: 2160 },
+        };
+        let bars = bar_rects(picture, total);
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].extent, vk::Extent2D { width: 480, height: 2160 });
+        assert_eq!(bars[1].offset.x, 3360);
+        assert_eq!(bars[1].extent, vk::Extent2D { width: 480, height: 2160 });
+    }
+
+    #[test]
+    fn no_bars_when_the_picture_fills_the_image() {
+        let total = vk::Extent2D { width: 1920, height: 1080 };
+        let picture = vk::Rect2D { offset: vk::Offset2D::default(), extent: total };
+        assert!(bar_rects(picture, total).is_empty());
     }
 }
