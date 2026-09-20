@@ -430,25 +430,10 @@ pub unsafe extern "system" fn create_swapchain(
     let mut modified = *ci;
     modified.image_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC;
 
-    // Subframes are presented by the layer itself, so it needs images of its
-    // own on top of the ones the application cycles through.
-    let subframes = crate::control::control().subframes.max(config::get().subframes);
-    crate::control::control().subframes_max = subframes;
-    if subframes > 1 {
-        let mut caps = vk::SurfaceCapabilitiesKHR::default();
-        let r = (dev.instance.surface_fn.get_physical_device_surface_capabilities_khr)(
-            dev.physical_device,
-            ci.surface,
-            &mut caps,
-        );
-        let wanted = ci.min_image_count + subframes - 1;
-        modified.min_image_count = if r == vk::Result::SUCCESS && caps.max_image_count > 0 {
-            wanted.min(caps.max_image_count)
-        } else {
-            wanted
-        };
-        log_debug!("{} subframes: asking for {} images", subframes, modified.min_image_count);
-    }
+    // Note: the layer does NOT ask for extra swapchain images for subframes.
+    // They are presented one at a time, so a free image is enough, and
+    // raising the count breaks applications that size their own swapchain
+    // arrays statically (Qt's QVulkanWindow crashes in the driver).
 
     // Application format kept for the raw-bit copy of what the game renders.
     let app_format = ci.image_format;
@@ -610,12 +595,6 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
             rt.present_subframes(&dev, submit_queue, swapchain, subframes, black);
         }
     }
-    // More subframes than the swapchain has images for: ask the application
-    // to rebuild it, the way it would after a resize.
-    let recreate = rt.wants_recreation();
     drop(guard);
-    if recreate && result == vk::Result::SUCCESS {
-        return vk::Result::ERROR_OUT_OF_DATE_KHR;
-    }
     result
 }
