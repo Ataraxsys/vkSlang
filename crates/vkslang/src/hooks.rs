@@ -430,6 +430,25 @@ pub unsafe extern "system" fn create_swapchain(
     let mut modified = *ci;
     modified.image_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC;
 
+    // Subframes are presented by the layer itself, so it needs images of its
+    // own on top of the ones the application cycles through.
+    let subframes = config::get().subframes;
+    if subframes > 1 {
+        let mut caps = vk::SurfaceCapabilitiesKHR::default();
+        let r = (dev.instance.surface_fn.get_physical_device_surface_capabilities_khr)(
+            dev.physical_device,
+            ci.surface,
+            &mut caps,
+        );
+        let wanted = ci.min_image_count + subframes - 1;
+        modified.min_image_count = if r == vk::Result::SUCCESS && caps.max_image_count > 0 {
+            wanted.min(caps.max_image_count)
+        } else {
+            wanted
+        };
+        log_debug!("{} subframes: asking for {} images", subframes, modified.min_image_count);
+    }
+
     // Application format kept for the raw-bit copy of what the game renders.
     let app_format = ci.image_format;
     let promoted = promote_to_hdr10(&dev, ci);
@@ -550,11 +569,15 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
     let indices = slice(pi.p_image_indices, pi.swapchain_count);
     let app_waits = slice(pi.p_wait_semaphores, pi.wait_semaphore_count);
     let mut waits = Vec::with_capacity(swapchains.len());
+    let mut processed = Vec::with_capacity(swapchains.len());
     for (&swapchain, &index) in swapchains.iter().zip(indices) {
         // The application's semaphores are consumed by our first submission.
         let wait: &[vk::Semaphore] = if waits.is_empty() { app_waits } else { &[] };
-        match rt.render(&dev, submit_queue, swapchain, index, wait) {
-            Ok(Some(sem)) => waits.push(sem),
+        match rt.render(&dev, submit_queue, swapchain, index, wait, None) {
+            Ok(Some(sem)) => {
+                waits.push(sem);
+                processed.push(swapchain);
+            }
             Ok(None) => {}
             Err(e) => {
                 log_error!("present hook failed: {e}");
@@ -566,13 +589,23 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
             }
         }
     }
-    drop(guard);
-
     if waits.is_empty() {
+        drop(guard);
         return next(queue, p_present_info);
     }
     let mut info = *pi;
     info.wait_semaphore_count = waits.len() as u32;
     info.p_wait_semaphores = waits.as_ptr();
-    next(queue, &info)
+    let result = next(queue, &info);
+
+    // Extra presentations of the same frame, so interlacing presets alternate
+    // fields faster than the application draws (or for black frame insertion).
+    let cfg = config::get();
+    if cfg.subframes > 1 && matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR) {
+        for swapchain in processed {
+            rt.present_subframes(&dev, submit_queue, swapchain, cfg.subframes, cfg.subframe_black);
+        }
+    }
+    drop(guard);
+    result
 }

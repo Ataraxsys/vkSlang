@@ -84,6 +84,8 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_BRIGHTNESS_NITS` / `brightness_nits` | `200` | HDR reference white (`BrightnessNits`). |
 | `VKSLANG_EXPAND_GAMUT` / `expand_gamut` | `0`–`3` | HDR colour boost (`ExpandGamut`): Accurate, Expanded, Wide, Super. |
 | `VKSLANG_HDR_OUTPUT` / `hdr_output` | `auto` \| `force` \| `off` | Promote the swapchain to HDR10 (see the HDR section). |
+| `VKSLANG_SUBFRAMES` / `subframes` | `1`–`8` | Presentations per application frame (see below). |
+| `VKSLANG_SUBFRAME_MODE` / `subframe_mode` | `shader` \| `black` | Run the preset again for each subframe, or insert black frames. |
 
 ### Logical resolution (`VKSLANG_SOURCE_RES`)
 
@@ -93,6 +95,18 @@ librashader's `FrameOptions` has no "source resolution" field: the shaders get `
 2. passes that image to `FilterChain::frame` as `Original`, with the viewport set to the 4K region.
 
 As a result, scanlines, masks and curvature line up with the 240 original lines rather than the 2160 output lines. With `gamescope -w 320 -h 240 -S integer -F nearest`, the nearest downsample recovers the original pixels exactly.
+
+### Subframes (interlacing, BFI)
+
+CRT presets that simulate interlacing alternate fields on every frame, which at 60 Hz means 30 Hz per field and visible flicker. On a high refresh display, `subframes` makes the layer present the same application frame several times:
+
+```sh
+VKSLANG_SUBFRAMES=3   # 60 Hz game on a 240 Hz display -> 180 presentations per second
+```
+
+Each subframe advances `FrameCount` and binds `CurrentSubFrame`/`TotalSubFrames`, so presets that alternate fields on `FrameCount` (guest-advanced and friends) interlace at the presentation rate. `subframe_mode = black` inserts black frames instead of running the preset, which costs almost nothing.
+
+The layer acquires images of its own for this, so the swapchain is created with extras, and anything unexpected (no image within 50 ms, a resize) just ends the extra presentations for that frame. In FIFO the application is naturally limited to `refresh / subframes`, which is why 3 subframes suit a 60 Hz game on a 240 Hz display. Note that a compositor that recomposites (gamescope on its Wayland backend) collapses the subframes; with `gamescope --backend sdl` the layer drives gamescope's own swapchain and they survive.
 
 ### Steam and Proton
 
