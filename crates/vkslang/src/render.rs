@@ -296,7 +296,7 @@ impl SourceImage {
         source: &Source,
     ) -> Result<SourceImage, vk::Result> {
         let rect = source.picture_rect(swapchain_extent);
-        let extent = source.res.unwrap_or(rect.extent);
+        let extent = source.size_for(rect.extent);
         let view_format = srgb_to_unorm(format).unwrap_or(format);
 
         let mut flags = vk::ImageCreateFlags::empty();

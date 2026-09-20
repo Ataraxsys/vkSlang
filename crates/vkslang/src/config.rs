@@ -32,8 +32,8 @@ pub enum HdrOutput {
 /// How the swapchain image is turned into the chain's `Original` input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
-    /// Logical (retro) resolution fed to the filter chain as `Original`.
-    pub res: Option<vk::Extent2D>,
+    /// Logical (retro) size fed to the filter chain as `Original`.
+    pub res: vkslang_ipc::SourceSize,
     pub filter: vk::Filter,
     pub rect: SourceRect,
     /// `rect` as written by the user (`4:3` stays `4:3`).
@@ -42,7 +42,12 @@ pub struct Source {
 
 impl Default for Source {
     fn default() -> Self {
-        Source { res: None, filter: vk::Filter::NEAREST, rect: SourceRect::Full, rect_spec: "full".into() }
+        Source {
+            res: vkslang_ipc::SourceSize::Native,
+            filter: vk::Filter::NEAREST,
+            rect: SourceRect::Full,
+            rect_spec: "full".into(),
+        }
     }
 }
 
@@ -90,6 +95,25 @@ fn parse_file(text: &str) -> HashMap<String, String> {
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .filter(|(k, _)| !k.is_empty())
         .collect()
+}
+
+/// `native`, `/2`, `50%` or `320x240`
+pub fn parse_source_size(spec: &str) -> Option<vkslang_ipc::SourceSize> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("native") {
+        return Some(vkslang_ipc::SourceSize::Native);
+    }
+    if let Some(percent) = spec.strip_suffix('%') {
+        let percent: f32 = percent.trim().parse().ok()?;
+        return (percent > 0.0).then_some(vkslang_ipc::SourceSize::Divide { by: 100.0 / percent });
+    }
+    // "/2", "1/2" and plain "2" all mean "half the picture".
+    let divisor = spec.strip_prefix('/').or_else(|| spec.strip_prefix("1/"));
+    if let Some(by) = divisor {
+        let by: f32 = by.trim().parse().ok()?;
+        return (by >= 1.0 && by.is_finite()).then_some(vkslang_ipc::SourceSize::Divide { by });
+    }
+    parse_extent(spec).map(|e| vkslang_ipc::SourceSize::Fixed { size: [e.width, e.height] })
 }
 
 /// `320x240`
@@ -162,14 +186,13 @@ impl Config {
 
         let source_res = kv
             .get("source_res")
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("native"))
-            .and_then(|s| {
-                let e = parse_extent(s);
-                if e.is_none() {
-                    crate::log_warn!("invalid source_res '{s}', expected WxH");
-                }
-                e
-            });
+            .map(|spec| {
+                parse_source_size(spec).unwrap_or_else(|| {
+                    crate::log_warn!("invalid source_res '{spec}', expected WxH, /N or native");
+                    vkslang_ipc::SourceSize::Native
+                })
+            })
+            .unwrap_or(vkslang_ipc::SourceSize::Native);
 
         let filter = match kv.get("source_filter").map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("linear") => vk::Filter::LINEAR,
@@ -253,9 +276,13 @@ impl Source {
     pub fn from_ipc(s: &vkslang_ipc::SourceSettings) -> Result<Source, String> {
         let rect = parse_rect(&s.rect).ok_or_else(|| format!("invalid source rect '{}'", s.rect))?;
         let res = match s.res {
-            Some([0, _]) | Some([_, 0]) => return Err("source resolution must be non-zero".into()),
-            Some([width, height]) => Some(vk::Extent2D { width, height }),
-            None => None,
+            vkslang_ipc::SourceSize::Fixed { size: [0, _] } | vkslang_ipc::SourceSize::Fixed { size: [_, 0] } => {
+                return Err("source resolution must be non-zero".into())
+            }
+            vkslang_ipc::SourceSize::Divide { by } if !(by >= 1.0 && by.is_finite()) => {
+                return Err("the divisor must be at least 1".into())
+            }
+            other => other,
         };
         let filter = match s.filter {
             vkslang_ipc::Filter::Nearest => vk::Filter::NEAREST,
@@ -266,13 +293,25 @@ impl Source {
 
     pub fn to_ipc(&self) -> vkslang_ipc::SourceSettings {
         vkslang_ipc::SourceSettings {
-            res: self.res.map(|e| [e.width, e.height]),
+            res: self.res,
             filter: if self.filter == vk::Filter::LINEAR {
                 vkslang_ipc::Filter::Linear
             } else {
                 vkslang_ipc::Filter::Nearest
             },
             rect: self.rect_spec.clone(),
+        }
+    }
+
+    /// Size of the source image for a given picture area.
+    pub fn size_for(&self, picture: vk::Extent2D) -> vk::Extent2D {
+        match self.res {
+            vkslang_ipc::SourceSize::Native => picture,
+            vkslang_ipc::SourceSize::Divide { by } => vk::Extent2D {
+                width: ((picture.width as f32 / by).round() as u32).max(1),
+                height: ((picture.height as f32 / by).round() as u32).max(1),
+            },
+            vkslang_ipc::SourceSize::Fixed { size: [width, height] } => vk::Extent2D { width, height },
         }
     }
 
@@ -319,6 +358,19 @@ mod tests {
         assert_eq!(parse_extent(" 640 X 480 "), Some(vk::Extent2D { width: 640, height: 480 }));
         assert_eq!(parse_extent("0x240"), None);
         assert_eq!(parse_extent("native"), None);
+        use vkslang_ipc::SourceSize;
+        assert_eq!(parse_source_size("native"), Some(SourceSize::Native));
+        assert_eq!(parse_source_size("/2"), Some(SourceSize::Divide { by: 2.0 }));
+        assert_eq!(parse_source_size("1/3"), Some(SourceSize::Divide { by: 3.0 }));
+        assert_eq!(parse_source_size("50%"), Some(SourceSize::Divide { by: 2.0 }));
+        assert_eq!(parse_source_size("320x240"), Some(SourceSize::Fixed { size: [320, 240] }));
+        assert_eq!(parse_source_size("/0.5"), None);
+
+        let src = Source { res: SourceSize::Divide { by: 3.0 }, ..Default::default() };
+        assert_eq!(
+            src.size_for(vk::Extent2D { width: 3840, height: 2160 }),
+            vk::Extent2D { width: 1280, height: 720 }
+        );
     }
 
     #[test]

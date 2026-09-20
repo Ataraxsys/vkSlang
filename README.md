@@ -73,7 +73,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 |---|---|---|
 | `ENABLE_VKSLANG` | `1` | Enables the implicit layer (`DISABLE_VKSLANG=1` forces it off). |
 | `VKSLANG_PRESET` / `preset` | `/…/crt-royale.slangp` | Preset to load. Without one, the layer passes everything through. |
-| `VKSLANG_SOURCE_RES` / `source_res` | `320x240` | Logical source resolution (see below). |
+| `VKSLANG_SOURCE_RES` / `source_res` | `320x240`, `/3`, `50%`, `native` | Logical source resolution: fixed, the picture divided by N, or untouched (see below). |
 | `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
 | `VKSLANG_SOURCE_RECT` / `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the swapchain image that holds the picture (for gamescope pillarboxing). |
 | `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
@@ -91,7 +91,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 
 librashader's `FrameOptions` has no "source resolution" field: the shaders get `OriginalSize`/`SourceSize` from the size of the **input image**. On every present, vkSlang therefore:
 
-1. blits the picture region of the swapchain image (4K, say) into a `source_res` image (320×240, say) with a `nearest` filter;
+1. blits the picture region of the swapchain image (4K, say) into a `source_res` image with a `nearest` filter. That size is either fixed (`320x240`), the picture divided by a factor (`/3`, or `50%`, which keeps the output's aspect ratio whatever the resolution), or `native` for no downscale;
 2. passes that image to `FilterChain::frame` as `Original`, with the viewport set to the 4K region.
 
 As a result, scanlines, masks and curvature line up with the 240 original lines rather than the 2160 output lines. With `gamescope -w 320 -h 240 -S integer -F nearest`, the nearest downsample recovers the original pixels exactly.
