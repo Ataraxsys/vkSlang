@@ -74,7 +74,9 @@ struct SourceEdit {
     filter: Filter,
     rect: String,
     display: String,
-    display_scale: f32,
+    display_scale: [f32; 2],
+    /// Move both axes together.
+    scale_locked: bool,
 }
 
 impl SourceEdit {
@@ -88,6 +90,7 @@ impl SourceEdit {
             rect: s.rect.clone(),
             display: s.display.clone(),
             display_scale: s.display_scale,
+            scale_locked: (s.display_scale[0] - s.display_scale[1]).abs() < 0.001,
         };
         match s.res {
             SourceSize::Fixed { size: [w, h] } => (edit.width, edit.height) = (w, h),
@@ -576,19 +579,36 @@ impl App {
             }
             ui.separator();
             ui.label("Scale");
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut edit.display_scale, 0.25..=2.0)
-                        .step_by(0.01)
-                        .fixed_decimals(2),
-                )
-                .on_hover_text(
-                    "Below 1 the drawn area shrinks; above 1 it grows to the edges of the screen \
-                     first, then crops the picture on the axis that cannot grow any further",
-                )
-                .changed();
+            let mut moved: Option<usize> = None;
+            for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
+                if ui
+                    .add(
+                        egui::Slider::new(&mut edit.display_scale[axis], 0.25..=2.0)
+                            .step_by(0.01)
+                            .fixed_decimals(2)
+                            .text(label),
+                    )
+                    .on_hover_text(
+                        "Below 1 the drawn area shrinks; above 1 it grows to the edges of the \
+                         screen first, then crops the picture on the axis that cannot grow",
+                    )
+                    .changed()
+                {
+                    moved = Some(axis);
+                }
+            }
+            if let Some(axis) = moved {
+                if edit.scale_locked {
+                    edit.display_scale = [edit.display_scale[axis]; 2];
+                }
+                changed = true;
+            }
+            if ui.checkbox(&mut edit.scale_locked, "lock").changed() && edit.scale_locked {
+                edit.display_scale[1] = edit.display_scale[0];
+                changed = true;
+            }
             if ui.small_button("1:1").clicked() {
-                edit.display_scale = 1.0;
+                edit.display_scale = [1.0, 1.0];
                 changed = true;
             }
         });
