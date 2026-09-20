@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -192,6 +192,10 @@ pub struct State {
     /// Color space written by the running preset's final pass.
     pub preset_color_space: Option<ColorSpace>,
     pub hdr: HdrSettings,
+    /// Frames per second the application draws.
+    pub source_fps: f32,
+    /// Presentations per second reaching the display (subframes included).
+    pub present_fps: f32,
     /// Presentations per application frame (1 = untouched).
     pub subframes: u32,
     /// Extra subframes are black instead of running the preset.

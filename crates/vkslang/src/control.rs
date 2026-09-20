@@ -38,6 +38,8 @@ pub struct Control {
     pub params: Vec<Param>,
     pub preset_color_space: Option<ColorSpace>,
     pub outputs: Vec<Output>,
+    pub source_fps: f32,
+    pub present_fps: f32,
 }
 
 static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
@@ -60,6 +62,8 @@ static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
         params: Vec::new(),
         preset_color_space: None,
         outputs: Vec::new(),
+        source_fps: 0.0,
+        present_fps: 0.0,
     })
 });
 
@@ -81,6 +85,8 @@ impl Control {
             outputs: self.outputs.clone(),
             preset_color_space: self.preset_color_space,
             hdr: self.hdr,
+            source_fps: self.source_fps,
+            present_fps: self.present_fps,
             subframes: self.subframes,
             subframe_black: self.subframe_black,
             subframes_max: self.subframes_max,

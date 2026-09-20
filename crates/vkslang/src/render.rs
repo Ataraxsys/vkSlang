@@ -536,9 +536,17 @@ pub struct Runtime {
     applied_source_gen: u64,
     swapchains: HashMap<vk::SwapchainKHR, SwapchainState>,
     frame_count: usize,
+    /// Last frame the application drew (subframes excluded).
     last_frame: Option<Instant>,
-    /// Smoothed application frame rate, bound as the `FPS` uniform.
+    /// Rates are counted over a window: averaging the inverse of each
+    /// interval would be skewed by the subframes, presented back to back.
+    rate_window: Instant,
+    frames_in_window: u32,
+    presents_in_window: u32,
+    /// Application frame rate, bound as the `FPS` uniform.
     fps: f32,
+    /// Presentations per second (subframes included).
+    present_fps: f32,
 }
 
 impl Runtime {
@@ -572,7 +580,11 @@ impl Runtime {
             swapchains: HashMap::new(),
             frame_count: 0,
             last_frame: None,
+            rate_window: Instant::now(),
+            frames_in_window: 0,
+            presents_in_window: 0,
             fps: 60.0,
+            present_fps: 60.0,
         };
         for _ in 0..RING {
             let slot = allocate_cmd(dev, pool).and_then(|cmd| {
@@ -666,9 +678,20 @@ impl Runtime {
             self.finish_load(dev, result);
         }
 
+        let window = self.rate_window.elapsed().as_secs_f32();
+        if window >= 0.5 {
+            self.fps = self.frames_in_window as f32 / window;
+            self.present_fps = self.presents_in_window as f32 / window;
+            self.frames_in_window = 0;
+            self.presents_in_window = 0;
+            self.rate_window = Instant::now();
+        }
+
         let mut ctl = control();
         self.enabled = ctl.enabled;
         self.hdr = ctl.hdr;
+        ctl.source_fps = self.fps;
+        ctl.present_fps = self.present_fps;
 
         // New preset requested (one load at a time; a newer request made
         // meanwhile starts as soon as the current one is installed).
@@ -863,6 +886,8 @@ impl Runtime {
         image_index: u32,
         acquire: vk::Semaphore,
     ) -> Option<vk::Semaphore> {
+        self.presents_in_window += 1;
+
         let state = self.swapchains.get(&swapchain)?;
         let image = *state.images.get(image_index as usize)?;
         let signal = [*state.semaphores.get(image_index as usize)?];
@@ -959,8 +984,20 @@ impl Runtime {
         if !self.is_rendering() {
             return Ok(None);
         }
+        let self_fps_value = self.fps;
         let Runtime {
-            slots, next_slot, chain, failed, hdr, pending_init, swapchains, frame_count, last_frame, fps, ..
+            slots,
+            next_slot,
+            chain,
+            failed,
+            hdr,
+            pending_init,
+            swapchains,
+            frame_count,
+            last_frame,
+            frames_in_window,
+            presents_in_window,
+            ..
         } = self;
         let (Some(state), Some(active)) = (swapchains.get(&swapchain), chain.as_mut()) else {
             return Ok(None);
@@ -969,6 +1006,7 @@ impl Runtime {
             return Ok(None);
         };
         let d = &dev.fns;
+        let self_fps = self_fps_value;
 
         let slot = &mut slots[*next_slot];
         *next_slot = (*next_slot + 1) % RING;
@@ -1176,17 +1214,16 @@ impl Runtime {
         // 4. Run the preset. The viewport is the picture region, so pillar/
         //    letterbox bars are cleared to black by librashader's final pass.
         let now = Instant::now();
+        // The application's own rhythm: subframes must not shorten it, or the
+        // shaders would believe the game runs three times faster.
         let elapsed = last_frame.map(|t| now.duration_since(t));
         if subframe.is_none() {
-            // Measured, not guessed: presets that animate on time need it,
-            // and librashader defaults the uniform to 1 fps.
-            if let Some(seconds) = elapsed.map(|e| e.as_secs_f32()).filter(|s| *s > 0.0001) {
-                *fps = *fps * 0.9 + (1.0 / seconds) * 0.1;
-            }
+            *frames_in_window += 1;
         }
+        *presents_in_window += 1;
         let options = FrameOptions {
             frametime_delta: elapsed.map_or(0, |e| e.as_millis() as u32),
-            frames_per_second: *fps,
+            frames_per_second: self_fps,
             // Binds HDRMode / BrightnessNits / ExpandGamut for HDR presets.
             color_space: state.color_space,
             brightness_nits: hdr.brightness_nits,
@@ -1198,7 +1235,9 @@ impl Runtime {
             total_subframes: subframe.map_or(1, |(_, total)| total),
             ..Default::default()
         };
-        *last_frame = Some(now);
+        if subframe.is_none() {
+            *last_frame = Some(now);
+        }
 
         let input = VulkanImage {
             image: source.image,
