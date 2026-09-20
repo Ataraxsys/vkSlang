@@ -63,7 +63,7 @@ sudo VKSLANG_NO_BUILD=1 PREFIX=/usr ./scripts/install.sh
 
 Without a Rust toolchain, take `libvkslang.so` and `vkslang-ui` from the CI artifact, put them in `target/release/`, and install with `VKSLANG_NO_BUILD=1 ./scripts/install.sh`. The script otherwise always rebuilds, so a stale binary is never installed under a fresh manifest.
 
-Requirements: Rust ≥ 1.95 (for `vkslang-ui`; the layer alone builds with 1.80), a C/C++ compiler (librashader builds SPIRV-Cross and glslang), and the Vulkan loader.
+Requirements: Rust ≥ 1.95 (for `vkslang-ui`; the layer alone builds with 1.82), a C/C++ compiler (librashader builds SPIRV-Cross and glslang), and the Vulkan loader.
 
 ## 4. Configuration
 
