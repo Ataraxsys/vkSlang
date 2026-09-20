@@ -59,6 +59,7 @@ struct SourceEdit {
     divisor: f32,
     filter: Filter,
     rect: String,
+    display: String,
 }
 
 impl SourceEdit {
@@ -70,6 +71,7 @@ impl SourceEdit {
             divisor: 2.0,
             filter: s.filter,
             rect: s.rect.clone(),
+            display: s.display.clone(),
         };
         match s.res {
             SourceSize::Fixed { size: [w, h] } => (edit.width, edit.height) = (w, h),
@@ -80,7 +82,12 @@ impl SourceEdit {
     }
 
     fn to_settings(&self) -> SourceSettings {
-        SourceSettings { res: self.mode, filter: self.filter, rect: self.rect.trim().to_string() }
+        SourceSettings {
+            res: self.mode,
+            filter: self.filter,
+            rect: self.rect.trim().to_string(),
+            display: self.display.trim().to_string(),
+        }
     }
 }
 
@@ -107,8 +114,11 @@ struct App {
     /// Pixel grid assistant.
     grid_open: bool,
     grid_texture: Option<GridImage>,
-    /// Grid pitch, in captured-image pixels.
-    grid_cell: f32,
+    /// Grid pitch, in captured-image pixels, per axis (pixels are not always
+    /// square: 320x200 stretched to 4:3, CGA/EGA modes...).
+    grid_cell: egui::Vec2,
+    /// Keep both axes equal.
+    grid_square: bool,
     grid_offset: egui::Vec2,
     grid_zoom: f32,
     /// Last capture request, to avoid asking on every frame.
@@ -222,7 +232,8 @@ impl App {
             param_filter: String::new(),
             grid_open: false,
             grid_texture: None,
-            grid_cell: 4.0,
+            grid_cell: egui::vec2(4.0, 4.0),
+            grid_square: true,
             grid_offset: egui::Vec2::ZERO,
             grid_zoom: 2.0,
             grid_requested: None,
@@ -529,6 +540,18 @@ impl App {
                 open_grid = true;
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Display area")
+                .on_hover_text("Where the preset draws. Different from the picture area it stretches the image: a 640×360 source drawn into a 4:3 area gives non-square pixels, scanlines stretched with it.");
+            let r = ui.add(egui::TextEdit::singleline(&mut edit.display).desired_width(110.0));
+            changed |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            for preset in ["full", "4:3", "16:9", "5:4"] {
+                if ui.small_button(preset).clicked() {
+                    edit.display = preset.into();
+                    changed = true;
+                }
+            }
+        });
         if changed {
             let source = edit.to_settings();
             self.send(Request::SetSource { source });
@@ -760,10 +783,23 @@ impl App {
         let mut request_capture = self.grid_texture.is_none() && stale;
         let mut apply: Option<SourceSize> = None;
         egui::Window::new("Pixel grid").open(&mut open).default_size([760.0, 560.0]).show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 request_capture |= ui.button("Capture the picture").clicked();
                 ui.add(egui::Slider::new(&mut self.grid_zoom, 1.0..=8.0).text("zoom"));
-                ui.add(egui::Slider::new(&mut self.grid_cell, 1.0..=64.0).step_by(0.05).text("pixel size"));
+                ui.checkbox(&mut self.grid_square, "square pixels");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Pixel size");
+                let w = ui.add(
+                    egui::Slider::new(&mut self.grid_cell.x, 1.0..=64.0).step_by(0.05).text("width"),
+                );
+                let h = ui.add_enabled(
+                    !self.grid_square,
+                    egui::Slider::new(&mut self.grid_cell.y, 1.0..=64.0).step_by(0.05).text("height"),
+                );
+                if self.grid_square && (w.changed() || h.changed() || self.grid_cell.y != self.grid_cell.x) {
+                    self.grid_cell.y = self.grid_cell.x;
+                }
             });
             ui.weak("Align the grid with the game's pixels: drag the image to shift it, adjust the size until the lines follow the blocks.");
 
@@ -772,28 +808,40 @@ impl App {
                 return;
             };
             // What one captured pixel is worth on the real output.
-            let scale = grid.picture[0] as f32 / grid.size[0] as f32;
-            let cell_output = self.grid_cell * scale;
+            let scale = egui::vec2(
+                grid.picture[0] as f32 / grid.size[0] as f32,
+                grid.picture[1] as f32 / grid.size[1] as f32,
+            );
+            let cell_output = egui::vec2(self.grid_cell.x * scale.x, self.grid_cell.y * scale.y);
             let native = [
-                (grid.picture[0] as f32 / cell_output).round().max(1.0),
-                (grid.picture[1] as f32 / cell_output).round().max(1.0),
+                (grid.picture[0] as f32 / cell_output.x).round().max(1.0),
+                (grid.picture[1] as f32 / cell_output.y).round().max(1.0),
             ];
+            // 1.0 = square pixels, 1.2 = 320x200 stretched to 4:3...
+            let par = cell_output.x / cell_output.y;
 
             ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("{} × {}", native[0], native[1]));
                 ui.weak(format!(
-                    "pixels of {cell_output:.2} output pixels, picture {}×{}",
-                    grid.picture[0], grid.picture[1]
+                    "pixels of {:.2}×{:.2} output pixels, picture {}×{}",
+                    cell_output.x, cell_output.y, grid.picture[0], grid.picture[1]
                 ));
+                if (par - 1.0).abs() > 0.01 {
+                    ui.weak(format!("· pixel aspect {par:.2}"));
+                }
                 if ui.button("Use as fixed resolution").clicked() {
                     apply = Some(SourceSize::Fixed { size: [native[0] as u32, native[1] as u32] });
                 }
+                // A single factor cannot describe rectangular pixels.
                 if ui
-                    .button(format!("Use as ÷{cell_output:.2}"))
+                    .add_enabled(
+                        (par - 1.0).abs() <= 0.01,
+                        egui::Button::new(format!("Use as ÷{:.2}", cell_output.x)),
+                    )
                     .on_hover_text("Keeps the ratio if the output resolution changes")
                     .clicked()
                 {
-                    apply = Some(SourceSize::Divide { by: cell_output });
+                    apply = Some(SourceSize::Divide { by: cell_output.x });
                 }
             });
 
@@ -812,21 +860,21 @@ impl App {
                     egui::Color32::WHITE,
                 );
                 let step = self.grid_cell * zoom;
-                if step >= 2.0 {
+                if step.x >= 2.0 && step.y >= 2.0 {
                     let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180));
                     let (ox, oy) = (
-                        self.grid_offset.x.rem_euclid(self.grid_cell) * zoom,
-                        self.grid_offset.y.rem_euclid(self.grid_cell) * zoom,
+                        self.grid_offset.x.rem_euclid(self.grid_cell.x) * zoom,
+                        self.grid_offset.y.rem_euclid(self.grid_cell.y) * zoom,
                     );
                     let mut x = rect.left() + ox;
                     while x <= rect.right() {
                         painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
-                        x += step;
+                        x += step.x;
                     }
                     let mut y = rect.top() + oy;
                     while y <= rect.bottom() {
                         painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
-                        y += step;
+                        y += step.y;
                     }
                 }
             });

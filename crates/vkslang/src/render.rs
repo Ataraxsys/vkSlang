@@ -285,6 +285,9 @@ struct SourceImage {
     view_format: vk::Format,
     /// Region of the swapchain image holding the game picture.
     rect: vk::Rect2D,
+    /// Region the preset draws into: differs from `rect` when the picture is
+    /// stretched (square pixels rendered into a 4:3 area, for instance).
+    display: vk::Rect2D,
     filter: vk::Filter,
 }
 
@@ -296,6 +299,7 @@ impl SourceImage {
         source: &Source,
     ) -> Result<SourceImage, vk::Result> {
         let rect = source.picture_rect(swapchain_extent);
+        let display = source.display_rect(swapchain_extent);
         let extent = source.size_for(rect.extent);
         let view_format = srgb_to_unorm(format).unwrap_or(format);
 
@@ -311,10 +315,16 @@ impl SourceImage {
             | vk::ImageUsageFlags::SAMPLED;
         let (image, memory) = create_image(dev, format, extent, flags, usage)?;
         log_debug!(
-            "source {}x{} {:?} from picture {:?} of {}x{}",
-            extent.width, extent.height, format, rect, swapchain_extent.width, swapchain_extent.height
+            "source {}x{} {:?} from picture {:?}, drawn into {:?} of {}x{}",
+            extent.width,
+            extent.height,
+            format,
+            rect,
+            display,
+            swapchain_extent.width,
+            swapchain_extent.height
         );
-        Ok(SourceImage { image, memory, extent, view_format, rect, filter: source.filter })
+        Ok(SourceImage { image, memory, extent, view_format, rect, display, filter: source.filter })
     }
 
     unsafe fn destroy(self, dev: &DeviceData) {
@@ -1453,16 +1463,17 @@ impl Runtime {
             size: Size::new(source.extent.width, source.extent.height),
             format: source.view_format,
         };
+        let display = source.display;
         let viewport = Viewport {
-            x: r.offset.x as f32,
-            y: r.offset.y as f32,
+            x: display.offset.x as f32,
+            y: display.offset.y as f32,
             mvp: None,
             output: VulkanImage {
                 image,
                 size: Size::new(state.extent.width, state.extent.height),
                 format: state.output_format,
             },
-            size: Size::new(r.extent.width, r.extent.height),
+            size: Size::new(display.extent.width, display.extent.height),
         };
         if let Err(e) = active.chain.frame(&input, &viewport, cmd, *frame_count, Some(&options)) {
             log_error!("filter chain frame failed, disabling: {e}");
@@ -1471,7 +1482,7 @@ impl Runtime {
 
         // 5. Repaint the letterbox bars opaque black (the chain cleared them
         //    to transparent black, which a compositor shows as garbage).
-        let bars = bar_rects(r, state.extent);
+        let bars = bar_rects(display, state.extent);
         let mut layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         if let (false, Some(black)) = (bars.is_empty(), state.black.as_ref()) {
             d.cmd_pipeline_barrier(

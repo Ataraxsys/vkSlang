@@ -38,6 +38,9 @@ pub struct Source {
     pub rect: SourceRect,
     /// `rect` as written by the user (`4:3` stays `4:3`).
     pub rect_spec: String,
+    /// Region the preset draws into (stretches the picture when it differs).
+    pub display: SourceRect,
+    pub display_spec: String,
 }
 
 impl Default for Source {
@@ -47,6 +50,8 @@ impl Default for Source {
             filter: vk::Filter::NEAREST,
             rect: SourceRect::Full,
             rect_spec: "full".into(),
+            display: SourceRect::Full,
+            display_spec: "full".into(),
         }
     }
 }
@@ -199,6 +204,17 @@ impl Config {
             _ => vk::Filter::NEAREST,
         };
 
+        let (display, display_spec) = match kv.get("display_rect") {
+            Some(spec) => match parse_rect(spec) {
+                Some(rect) => (rect, spec.clone()),
+                None => {
+                    crate::log_warn!("invalid display_rect '{spec}', using full");
+                    (SourceRect::Full, "full".into())
+                }
+            },
+            None => (SourceRect::Full, "full".into()),
+        };
+
         let (rect, rect_spec) = match kv.get("source_rect") {
             Some(spec) => match parse_rect(spec) {
                 Some(rect) => (rect, spec.clone()),
@@ -222,7 +238,7 @@ impl Config {
 
         Config {
             preset: kv.get("preset").filter(|p| !p.is_empty()).map(PathBuf::from),
-            source: Source { res: source_res, filter, rect, rect_spec },
+            source: Source { res: source_res, filter, rect, rect_spec, display, display_spec },
             process,
             params,
             ipc: kv.get("ipc").is_none_or(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
@@ -288,7 +304,16 @@ impl Source {
             vkslang_ipc::Filter::Nearest => vk::Filter::NEAREST,
             vkslang_ipc::Filter::Linear => vk::Filter::LINEAR,
         };
-        Ok(Source { res, filter, rect, rect_spec: s.rect.trim().to_string() })
+        let display =
+            parse_rect(&s.display).ok_or_else(|| format!("invalid display area '{}'", s.display))?;
+        Ok(Source {
+            res,
+            filter,
+            rect,
+            rect_spec: s.rect.trim().to_string(),
+            display,
+            display_spec: s.display.trim().to_string(),
+        })
     }
 
     pub fn to_ipc(&self) -> vkslang_ipc::SourceSettings {
@@ -300,6 +325,7 @@ impl Source {
                 vkslang_ipc::Filter::Nearest
             },
             rect: self.rect_spec.clone(),
+            display: self.display_spec.clone(),
         }
     }
 
@@ -315,10 +341,19 @@ impl Source {
         }
     }
 
+    /// Area of the swapchain the preset draws into.
+    pub fn display_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
+        Self::region(self.display, extent)
+    }
+
     /// Area of a `extent`-sized swapchain image that holds the picture.
     pub fn picture_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
+        Self::region(self.rect, extent)
+    }
+
+    fn region(spec: SourceRect, extent: vk::Extent2D) -> vk::Rect2D {
         let full = vk::Rect2D { offset: vk::Offset2D::default(), extent };
-        match self.rect {
+        match spec {
             SourceRect::Full => full,
             SourceRect::Aspect(ratio) => {
                 let (w, h) = (extent.width as f32, extent.height as f32);
