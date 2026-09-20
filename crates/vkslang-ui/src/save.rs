@@ -103,7 +103,8 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
     out.push(format!("source_rect = {}", src.rect));
     out.push(format!("brightness_nits = {}", state.hdr.brightness_nits));
     out.push(format!("expand_gamut = {}", state.hdr.expand_gamut));
-    out.push(format!("subframes = {}", state.subframes));
+    // 0 only happens with a default-constructed state; 1 is "untouched".
+    out.push(format!("subframes = {}", state.subframes.max(1)));
     out.push(format!("subframe_mode = {}", if state.subframe_black { "black" } else { "shader" }));
     for (name, value) in changed_params(state) {
         out.push(format!("param.{name} = {value}"));
