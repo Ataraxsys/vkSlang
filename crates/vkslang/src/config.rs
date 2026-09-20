@@ -350,12 +350,6 @@ impl Source {
         }
     }
 
-    /// The display area before any scaling.
-    #[cfg(test)]
-    pub fn display_rect_unscaled(&self, extent: vk::Extent2D) -> vk::Rect2D {
-        Self::region(self.display, extent)
-    }
-
     /// Size of the source image for a given picture area.
     pub fn size_for(&self, picture: vk::Extent2D) -> vk::Extent2D {
         match self.res {
@@ -368,47 +362,59 @@ impl Source {
         }
     }
 
-    /// Area of the swapchain the preset draws into.
+    /// Picture area read and area drawn into, for a given swapchain size.
     ///
-    /// A scale below 1 shrinks it around its centre. Above 1 it stays put and
-    /// the picture is cropped instead (see [`Self::picture_rect`]): librashader
-    /// uses the viewport as its scissor, and a scissor reaching outside the
-    /// image is invalid, so the picture would simply vanish.
-    pub fn display_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
-        let base = Self::region(self.display, extent);
-        if self.display_scale >= 1.0 {
-            return base;
+    /// A scale below 1 simply shrinks the drawn area. Above 1 the drawn area
+    /// grows until it reaches the edges of the screen, and only then is the
+    /// picture cropped, on the axis that could not grow: zooming a 4:3 area
+    /// on a 16:9 screen widens it first and crops top and bottom, never the
+    /// sides.
+    ///
+    /// The drawn area always stays inside the image: librashader uses the
+    /// viewport as its scissor, and a scissor reaching outside draws nothing.
+    pub fn framing(&self, extent: vk::Extent2D) -> (vk::Rect2D, vk::Rect2D) {
+        let picture = Self::clamp_to(Self::region(self.rect, extent), extent);
+        let base = Self::clamp_to(Self::region(self.display, extent), extent);
+        if (self.display_scale - 1.0).abs() < 0.001 {
+            return (picture, base);
         }
+
         let (w, h) = (base.extent.width as f32, base.extent.height as f32);
-        let (sw, sh) = ((w * self.display_scale).max(1.0), (h * self.display_scale).max(1.0));
-        vk::Rect2D {
+        let (wanted_w, wanted_h) = (w * self.display_scale, h * self.display_scale);
+        let (screen_w, screen_h) = (extent.width as f32, extent.height as f32);
+        // As large as asked for, but never past the screen.
+        let (draw_w, draw_h) = (wanted_w.min(screen_w).max(1.0), wanted_h.min(screen_h).max(1.0));
+        let centre = (base.offset.x as f32 + w / 2.0, base.offset.y as f32 + h / 2.0);
+        let display = vk::Rect2D {
             offset: vk::Offset2D {
-                x: base.offset.x + ((w - sw) / 2.0).round() as i32,
-                y: base.offset.y + ((h - sh) / 2.0).round() as i32,
+                x: (centre.0 - draw_w / 2.0).clamp(0.0, screen_w - draw_w).round() as i32,
+                y: (centre.1 - draw_h / 2.0).clamp(0.0, screen_h - draw_h).round() as i32,
             },
-            extent: vk::Extent2D { width: sw.round() as u32, height: sh.round() as u32 },
-        }
+            extent: vk::Extent2D { width: draw_w.round() as u32, height: draw_h.round() as u32 },
+        };
+
+        // Whatever the drawn area could not grow by is taken off the picture.
+        let (keep_x, keep_y) = (draw_w / wanted_w, draw_h / wanted_h);
+        let (pw, ph) = (picture.extent.width as f32, picture.extent.height as f32);
+        let (crop_w, crop_h) = ((pw * keep_x).max(1.0), (ph * keep_y).max(1.0));
+        let picture = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: picture.offset.x + ((pw - crop_w) / 2.0).round() as i32,
+                y: picture.offset.y + ((ph - crop_h) / 2.0).round() as i32,
+            },
+            extent: vk::Extent2D { width: crop_w.round() as u32, height: crop_h.round() as u32 },
+        };
+        (picture, display)
+    }
+
+    /// Area of the swapchain the preset draws into.
+    pub fn display_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
+        self.framing(extent).1
     }
 
     /// Area of a `extent`-sized swapchain image that holds the picture.
-    ///
-    /// A display scale above 1 crops it around its centre, which zooms the
-    /// picture in: it then covers more of the screen, at the cost of its
-    /// edges.
     pub fn picture_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
-        let base = Self::region(self.rect, extent);
-        if self.display_scale <= 1.0 {
-            return base;
-        }
-        let (w, h) = (base.extent.width as f32, base.extent.height as f32);
-        let (cw, ch) = ((w / self.display_scale).max(1.0), (h / self.display_scale).max(1.0));
-        vk::Rect2D {
-            offset: vk::Offset2D {
-                x: base.offset.x + ((w - cw) / 2.0).round() as i32,
-                y: base.offset.y + ((h - ch) / 2.0).round() as i32,
-            },
-            extent: vk::Extent2D { width: cw.round() as u32, height: ch.round() as u32 },
-        }
+        self.framing(extent).0
     }
 
     /// Keeps a rectangle inside the image: librashader's scissor rejects
@@ -479,27 +485,29 @@ mod tests {
         let screen = vk::Extent2D { width: 3840, height: 2160 };
 
         // Below 1: the drawn area shrinks, the picture stays whole.
-        let small = Source {
-            display: SourceRect::Aspect(4.0 / 3.0),
-            display_scale: 0.5,
-            ..Default::default()
-        };
-        let d = small.display_rect(screen);
-        assert_eq!(d.extent, vk::Extent2D { width: 1440, height: 1080 });
-        assert_eq!((d.offset.x, d.offset.y), (480 + 720, 540));
-        assert_eq!(small.picture_rect(screen).extent, screen);
+        let small =
+            Source { display: SourceRect::Aspect(4.0 / 3.0), display_scale: 0.5, ..Default::default() };
+        let (picture, display) = small.framing(screen);
+        assert_eq!(display.extent, vk::Extent2D { width: 1440, height: 1080 });
+        assert_eq!((display.offset.x, display.offset.y), (480 + 720, 540));
+        assert_eq!(picture.extent, screen);
 
-        // Above 1: the drawn area is untouched (a scissor outside the image
-        // draws nothing) and the picture is cropped instead.
-        let zoom = Source {
-            display: SourceRect::Aspect(4.0 / 3.0),
-            display_scale: 2.0,
-            ..Default::default()
-        };
-        assert_eq!(zoom.display_rect(screen), small.display_rect_unscaled(screen));
-        let p = zoom.picture_rect(screen);
-        assert_eq!(p.extent, vk::Extent2D { width: 1920, height: 1080 });
-        assert_eq!((p.offset.x, p.offset.y), (960, 540));
+        // Above 1: a 4:3 area on a 16:9 screen has room left sideways, so it
+        // widens first; only the height, already maxed out, crops the picture.
+        let zoom =
+            Source { display: SourceRect::Aspect(4.0 / 3.0), display_scale: 1.2, ..Default::default() };
+        let (picture, display) = zoom.framing(screen);
+        assert_eq!(display.extent, vk::Extent2D { width: 3456, height: 2160 });
+        assert_eq!(picture.extent.width, 3840, "the sides must not be cropped");
+        assert_eq!(picture.extent.height, 1800);
+
+        // Far enough and the drawn area fills the screen, cropping vertically.
+        let full =
+            Source { display: SourceRect::Aspect(4.0 / 3.0), display_scale: 2.0, ..Default::default() };
+        let (picture, display) = full.framing(screen);
+        assert_eq!(display.offset, vk::Offset2D { x: 0, y: 0 });
+        assert_eq!(display.extent, screen);
+        assert_eq!(picture.extent, vk::Extent2D { width: 2560, height: 1080 });
 
         let src = Source { rect: SourceRect::Aspect(4.0 / 3.0), ..Default::default() };
         let r = src.picture_rect(vk::Extent2D { width: 3840, height: 2160 });

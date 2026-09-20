@@ -583,8 +583,8 @@ impl App {
                         .fixed_decimals(2),
                 )
                 .on_hover_text(
-                    "Below 1 the drawn area shrinks; above 1 the picture is zoomed in, covering more \
-                     of the screen with its edges cropped",
+                    "Below 1 the drawn area shrinks; above 1 it grows to the edges of the screen \
+                     first, then crops the picture on the axis that cannot grow any further",
                 )
                 .changed();
             if ui.small_button("1:1").clicked() {
