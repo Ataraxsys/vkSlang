@@ -41,6 +41,8 @@ pub struct Source {
     /// Region the preset draws into (stretches the picture when it differs).
     pub display: SourceRect,
     pub display_spec: String,
+    /// Scales the display area around its centre.
+    pub display_scale: f32,
 }
 
 impl Default for Source {
@@ -52,6 +54,7 @@ impl Default for Source {
             rect_spec: "full".into(),
             display: SourceRect::Full,
             display_spec: "full".into(),
+            display_scale: 1.0,
         }
     }
 }
@@ -238,7 +241,20 @@ impl Config {
 
         Config {
             preset: kv.get("preset").filter(|p| !p.is_empty()).map(PathBuf::from),
-            source: Source { res: source_res, filter, rect, rect_spec, display, display_spec },
+            source: Source {
+                res: source_res,
+                filter,
+                rect,
+                rect_spec,
+                display,
+                display_spec,
+                display_scale: kv
+                    .get("display_scale")
+                    .and_then(|v| v.parse().ok())
+                    .filter(|v: &f32| v.is_finite())
+                    .unwrap_or(1.0)
+                    .clamp(0.1, 4.0),
+            },
             process,
             params,
             ipc: kv.get("ipc").is_none_or(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
@@ -306,6 +322,9 @@ impl Source {
         };
         let display =
             parse_rect(&s.display).ok_or_else(|| format!("invalid display area '{}'", s.display))?;
+        if !(s.display_scale.is_finite() && (0.1..=4.0).contains(&s.display_scale)) {
+            return Err("the display scale must be between 0.1 and 4".into());
+        }
         Ok(Source {
             res,
             filter,
@@ -313,6 +332,7 @@ impl Source {
             rect_spec: s.rect.trim().to_string(),
             display,
             display_spec: s.display.trim().to_string(),
+            display_scale: s.display_scale,
         })
     }
 
@@ -326,6 +346,7 @@ impl Source {
             },
             rect: self.rect_spec.clone(),
             display: self.display_spec.clone(),
+            display_scale: self.display_scale,
         }
     }
 
@@ -341,9 +362,23 @@ impl Source {
         }
     }
 
-    /// Area of the swapchain the preset draws into.
+    /// Area of the swapchain the preset draws into, scaled around its centre.
     pub fn display_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
-        Self::region(self.display, extent)
+        let base = Self::region(self.display, extent);
+        if (self.display_scale - 1.0).abs() < 0.001 {
+            return base;
+        }
+        let (w, h) = (base.extent.width as f32, base.extent.height as f32);
+        let (sw, sh) = ((w * self.display_scale).max(1.0), (h * self.display_scale).max(1.0));
+        vk::Rect2D {
+            // Negative offsets are allowed: the picture then overflows the
+            // screen and is clipped, which is what overscan means.
+            offset: vk::Offset2D {
+                x: base.offset.x + ((w - sw) / 2.0).round() as i32,
+                y: base.offset.y + ((h - sh) / 2.0).round() as i32,
+            },
+            extent: vk::Extent2D { width: sw.round() as u32, height: sh.round() as u32 },
+        }
     }
 
     /// Area of a `extent`-sized swapchain image that holds the picture.
@@ -412,6 +447,15 @@ mod tests {
     fn rect() {
         assert_eq!(parse_rect("full"), Some(SourceRect::Full));
         assert_eq!(parse_rect("4:3"), Some(SourceRect::Aspect(4.0 / 3.0)));
+        let scaled = Source {
+            display: SourceRect::Aspect(4.0 / 3.0),
+            display_scale: 0.5,
+            ..Default::default()
+        };
+        let d = scaled.display_rect(vk::Extent2D { width: 3840, height: 2160 });
+        assert_eq!(d.extent, vk::Extent2D { width: 1440, height: 1080 });
+        assert_eq!((d.offset.x, d.offset.y), (480 + 720, 540));
+
         let src = Source { rect: SourceRect::Aspect(4.0 / 3.0), ..Default::default() };
         let r = src.picture_rect(vk::Extent2D { width: 3840, height: 2160 });
         assert_eq!((r.offset.x, r.offset.y, r.extent.width, r.extent.height), (480, 0, 2880, 2160));

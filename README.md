@@ -77,6 +77,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
 | `VKSLANG_SOURCE_RECT` / `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the swapchain image that holds the picture (for gamescope pillarboxing). |
 | `VKSLANG_DISPLAY_RECT` / `display_rect` | `full`, `4:3`, `5:4` | Region the preset draws into; stretches the picture when it differs from `source_rect`. |
+| `VKSLANG_DISPLAY_SCALE` / `display_scale` | `0.1`–`4` | Scales that region around its centre (above 1 = overscan). |
 | `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
 | `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
 | `VKSLANG_LOG` | `debug` | Log level. |
@@ -115,6 +116,7 @@ Old PC and console modes are displayed stretched: 640×360 or 320×200 in memory
 
 - `source_rect` says what to **read**, and `source_res` the size of the input, so the grid stays aligned on the real pixels (640×360).
 - `display_rect` says where the preset **draws**. Set to `4:3`, the picture is stretched into that area, **and the shader is stretched with it**: scanlines and mask follow the display geometry, exactly like a CRT fed a 200-line signal.
+- `display_scale` resizes that area around its centre, for when the result sits too small on the screen, or to overscan past its edges.
 
 ### Pixel grid assistant
 
