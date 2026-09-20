@@ -77,7 +77,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
 | `VKSLANG_SOURCE_RECT` / `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the swapchain image that holds the picture (for gamescope pillarboxing). |
 | `VKSLANG_DISPLAY_RECT` / `display_rect` | `full`, `4:3`, `5:4` | Region the preset draws into; stretches the picture when it differs from `source_rect`. |
-| `VKSLANG_DISPLAY_SCALE` / `display_scale` | `0.1`–`4` | Below 1 shrinks the drawn area; above 1 grows it to the screen, then crops the axis that cannot grow. |
+| `VKSLANG_DISPLAY_SCALE` / `display_scale` | `1.2`, `1.2,1.0` | Scales the drawn area, both axes or each one; below 1 shrinks it, above 1 grows it to the screen then crops what cannot grow. |
 | `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
 | `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
 | `VKSLANG_LOG` | `debug` | Log level. |
