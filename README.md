@@ -77,7 +77,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
 | `VKSLANG_SOURCE_RECT` / `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the swapchain image that holds the picture (for gamescope pillarboxing). |
 | `VKSLANG_DISPLAY_RECT` / `display_rect` | `full`, `4:3`, `5:4` | Region the preset draws into; stretches the picture when it differs from `source_rect`. |
-| `VKSLANG_DISPLAY_SCALE` / `display_scale` | `0.1`–`4` | Below 1 shrinks the drawn area; above 1 zooms the picture in (edges cropped). |
+| `VKSLANG_DISPLAY_SCALE` / `display_scale` | `0.1`–`4` | Below 1 shrinks the drawn area; above 1 grows it to the screen, then crops the axis that cannot grow. |
 | `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
 | `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
 | `VKSLANG_LOG` | `debug` | Log level. |
@@ -116,7 +116,7 @@ Old PC and console modes are displayed stretched: 640×360 or 320×200 in memory
 
 - `source_rect` says what to **read**, and `source_res` the size of the input, so the grid stays aligned on the real pixels (640×360).
 - `display_rect` says where the preset **draws**. Set to `4:3`, the picture is stretched into that area, **and the shader is stretched with it**: scanlines and mask follow the display geometry, exactly like a CRT fed a 200-line signal.
-- `display_scale` resizes the result: below 1 the drawn area shrinks, above 1 the picture is zoomed in so it covers more of the screen, its edges cropped. It cannot overflow the screen: librashader uses the viewport as its scissor, and a scissor reaching outside the image draws nothing at all.
+- `display_scale` resizes the result. Below 1 the drawn area shrinks. Above 1 it grows until it reaches the edges of the screen, and only then is the picture cropped, on the axis that could not grow: a 4:3 area on a 16:9 screen widens first and loses its top and bottom, never its sides. It never overflows the screen, because librashader uses the viewport as its scissor and a scissor reaching outside draws nothing.
 
 ### Pixel grid assistant
 
