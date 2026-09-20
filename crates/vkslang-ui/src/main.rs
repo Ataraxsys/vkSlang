@@ -488,8 +488,6 @@ impl App {
     fn presentation_panel(&mut self, ui: &mut egui::Ui) {
         let Some(state) = self.state.as_ref() else { return };
         let (mut subframes, mut black) = (state.subframes, state.subframe_black);
-        let (max_ready, fps) = (state.subframes_max, state.outputs.first().map(|o| o.size));
-        let _ = fps;
         let mut changed = false;
 
         ui.horizontal_wrapped(|ui| {
@@ -509,15 +507,6 @@ impl App {
                     .changed();
             });
         });
-        if subframes > max_ready {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.weak(format!(
-                    "asking the game to rebuild its swapchain for {subframes} presentations \
-                     (it had room for {max_ready}); if it refuses, the count falls back on its own"
-                ));
-            });
-        }
         if changed {
             self.send(Request::SetSubframes { subframes, black });
         }
