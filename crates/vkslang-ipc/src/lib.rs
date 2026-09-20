@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -125,10 +125,39 @@ pub enum Filter {
     Linear,
 }
 
+/// Size of the image handed to the filter chain as `Original`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SourceSize {
+    /// The picture area itself, untouched.
+    Native,
+    /// The picture area divided by `by` (2 = half, 3 = a third...).
+    Divide { by: f32 },
+    /// A fixed resolution, whatever the output is.
+    Fixed { size: [u32; 2] },
+}
+
+impl Default for SourceSize {
+    fn default() -> Self {
+        SourceSize::Native
+    }
+}
+
+impl SourceSize {
+    /// As written in vkSlang.conf (`native`, `/2`, `320x240`).
+    pub fn to_config(self) -> String {
+        match self {
+            SourceSize::Native => "native".into(),
+            SourceSize::Divide { by } => format!("/{by}"),
+            SourceSize::Fixed { size: [w, h] } => format!("{w}x{h}"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SourceSettings {
-    /// Logical source resolution; `None` = swapchain (picture) size.
-    pub res: Option<[u32; 2]>,
+    /// Logical source resolution.
+    pub res: SourceSize,
     pub filter: Filter,
     /// `full`, `4:3`, or `X,Y,WxH`.
     pub rect: String,
@@ -136,7 +165,7 @@ pub struct SourceSettings {
 
 impl Default for SourceSettings {
     fn default() -> Self {
-        SourceSettings { res: None, filter: Filter::Nearest, rect: "full".into() }
+        SourceSettings { res: SourceSize::default(), filter: Filter::Nearest, rect: "full".into() }
     }
 }
 

@@ -10,7 +10,9 @@ use eframe::egui;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use vkslang_ipc::{color_space_warning, Client, Filter, Request, Response, SourceSettings, State, GAMUT_NAMES};
+use vkslang_ipc::{
+    color_space_warning, Client, Filter, Request, Response, SourceSettings, SourceSize, State, GAMUT_NAMES,
+};
 
 const POLL: Duration = Duration::from_millis(400);
 const SCAN: Duration = Duration::from_secs(2);
@@ -28,25 +30,35 @@ struct Target {
 /// Editable copy of the source settings (not overwritten by polling while
 /// the user edits it).
 struct SourceEdit {
-    native: bool,
+    mode: SourceSize,
+    /// Kept while another mode is selected, so switching back restores them.
     width: u32,
     height: u32,
+    divisor: f32,
     filter: Filter,
     rect: String,
 }
 
 impl SourceEdit {
     fn from(s: &SourceSettings) -> SourceEdit {
-        let [width, height] = s.res.unwrap_or([320, 240]);
-        SourceEdit { native: s.res.is_none(), width, height, filter: s.filter, rect: s.rect.clone() }
+        let mut edit = SourceEdit {
+            mode: s.res,
+            width: 320,
+            height: 240,
+            divisor: 2.0,
+            filter: s.filter,
+            rect: s.rect.clone(),
+        };
+        match s.res {
+            SourceSize::Fixed { size: [w, h] } => (edit.width, edit.height) = (w, h),
+            SourceSize::Divide { by } => edit.divisor = by,
+            SourceSize::Native => {}
+        }
+        edit
     }
 
     fn to_settings(&self) -> SourceSettings {
-        SourceSettings {
-            res: (!self.native).then_some([self.width, self.height]),
-            filter: self.filter,
-            rect: self.rect.trim().to_string(),
-        }
+        SourceSettings { res: self.mode, filter: self.filter, rect: self.rect.trim().to_string() }
     }
 }
 
@@ -402,18 +414,58 @@ impl App {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             ui.label("Source resolution");
-            changed |= ui.checkbox(&mut edit.native, "native").changed();
-            ui.add_enabled_ui(!edit.native, |ui| {
-                changed |= ui.add(egui::DragValue::new(&mut edit.width).range(1..=7680)).changed();
-                ui.label("×");
-                changed |= ui.add(egui::DragValue::new(&mut edit.height).range(1..=4320)).changed();
-                for (w, h) in [(256, 224), (320, 240), (640, 480)] {
-                    if ui.small_button(format!("{w}×{h}")).clicked() {
-                        (edit.width, edit.height) = (w, h);
+            let native = matches!(edit.mode, SourceSize::Native);
+            let divide = matches!(edit.mode, SourceSize::Divide { .. });
+            if ui.selectable_label(native, "native").clicked() && !native {
+                edit.mode = SourceSize::Native;
+                changed = true;
+            }
+            if ui.selectable_label(divide, "divide").on_hover_text("Native size divided by N").clicked()
+                && !divide
+            {
+                edit.mode = SourceSize::Divide { by: edit.divisor };
+                changed = true;
+            }
+            if ui.selectable_label(!native && !divide, "fixed").clicked() && (native || divide) {
+                edit.mode = SourceSize::Fixed { size: [edit.width, edit.height] };
+                changed = true;
+            }
+
+            match edit.mode {
+                SourceSize::Divide { .. } => {
+                    ui.label("÷");
+                    if ui
+                        .add(egui::DragValue::new(&mut edit.divisor).speed(0.05).range(1.0..=16.0).max_decimals(2))
+                        .changed()
+                    {
+                        edit.mode = SourceSize::Divide { by: edit.divisor };
+                        changed = true;
+                    }
+                    for by in [2.0, 3.0, 4.0, 6.0] {
+                        if ui.small_button(format!("÷{by:.0}")).clicked() {
+                            edit.divisor = by;
+                            edit.mode = SourceSize::Divide { by };
+                            changed = true;
+                        }
+                    }
+                }
+                SourceSize::Fixed { .. } => {
+                    let mut edited = ui.add(egui::DragValue::new(&mut edit.width).range(1..=7680)).changed();
+                    ui.label("×");
+                    edited |= ui.add(egui::DragValue::new(&mut edit.height).range(1..=4320)).changed();
+                    for (w, h) in [(256, 224), (320, 240), (640, 480)] {
+                        if ui.small_button(format!("{w}×{h}")).clicked() {
+                            (edit.width, edit.height) = (w, h);
+                            edited = true;
+                        }
+                    }
+                    if edited {
+                        edit.mode = SourceSize::Fixed { size: [edit.width, edit.height] };
                         changed = true;
                     }
                 }
-            });
+                SourceSize::Native => {}
+            }
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Filter");

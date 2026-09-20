@@ -92,10 +92,7 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
         out.push(format!("preset = {preset}"));
     }
     let src = &state.source;
-    out.push(format!(
-        "source_res = {}",
-        src.res.map_or("native".to_string(), |[w, h]| format!("{w}x{h}"))
-    ));
+    out.push(format!("source_res = {}", src.res.to_config()));
     out.push(format!(
         "source_filter = {}",
         if src.filter == Filter::Linear { "linear" } else { "nearest" }
@@ -140,7 +137,11 @@ mod tests {
         };
         State {
             preset: Some("/s/crt.slangp".into()),
-            source: SourceSettings { res: Some([320, 240]), filter: Filter::Nearest, rect: "4:3".into() },
+            source: SourceSettings {
+                res: vkslang_ipc::SourceSize::Fixed { size: [320, 240] },
+                filter: Filter::Nearest,
+                rect: "4:3".into(),
+            },
             params: vec![
                 p("HEADER", 0.0, 0.0, 0.0, 0.0),
                 p("GAMMA", 2.2, 2.4, 1.0, 3.0),
