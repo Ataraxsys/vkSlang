@@ -23,8 +23,22 @@ struct GridImage {
     texture: egui::TextureHandle,
     /// Size of the captured image.
     size: [u32; 2],
-    /// Size of the picture it came from, in output pixels.
-    picture: [u32; 2],
+    /// Size of the whole output image it came from.
+    base: [u32; 2],
+    /// Picture area when it was taken, in output pixels.
+    area: [i32; 4],
+}
+
+/// Converts a frame drawn on the capture into a picture area in output
+/// pixels, as `source_rect` spells it.
+fn frame_to_area(frame: egui::Rect, capture: [u32; 2], base: [u32; 2]) -> String {
+    let to_output =
+        egui::vec2(base[0] as f32 / capture[0] as f32, base[1] as f32 / capture[1] as f32);
+    let x = (frame.min.x * to_output.x).round().max(0.0);
+    let y = (frame.min.y * to_output.y).round().max(0.0);
+    let w = (frame.width() * to_output.x).round().max(1.0).min(base[0] as f32 - x);
+    let h = (frame.height() * to_output.y).round().max(1.0).min(base[1] as f32 - y);
+    format!("{x},{y},{w}x{h}")
 }
 
 /// Decodes the raw capture written by the layer (magic, width, height, RGBA8).
@@ -117,15 +131,19 @@ struct App {
     /// Pixel grid assistant.
     grid_open: bool,
     grid_texture: Option<GridImage>,
-    /// Grid pitch, in captured-image pixels, per axis (pixels are not always
-    /// square: 320x200 stretched to 4:3, CGA/EGA modes...).
-    grid_cell: egui::Vec2,
-    /// Keep both axes equal.
-    grid_square: bool,
+    /// Grid pitch, in captured-image pixels. Square: non-square pixels are
+    /// reproduced by stretching the display area, not the measuring grid.
+    grid_cell: f32,
     grid_offset: egui::Vec2,
     grid_zoom: f32,
     /// Last capture request, to avoid asking on every frame.
     grid_requested: Option<Instant>,
+    /// Picture area being framed, in captured-image pixels.
+    frame_rect: egui::Rect,
+    /// Which edges the current drag is moving (none = moving the whole frame).
+    frame_drag: Option<[bool; 4]>,
+    /// Show the framing tool rather than the measuring grid.
+    frame_mode: bool,
     source: Option<SourceEdit>,
     save_path: String,
 }
@@ -235,11 +253,13 @@ impl App {
             param_filter: String::new(),
             grid_open: false,
             grid_texture: None,
-            grid_cell: egui::vec2(4.0, 4.0),
-            grid_square: true,
+            grid_cell: 4.0,
             grid_offset: egui::Vec2::ZERO,
             grid_zoom: 2.0,
             grid_requested: None,
+            frame_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(64.0, 64.0)),
+            frame_drag: None,
+            frame_mode: false,
             source: None,
             save_path: String::new(),
         }
@@ -787,8 +807,18 @@ impl App {
             if self.grid_texture.as_ref().is_none_or(|g| g.id != capture.id) {
                 if let Some((image, size)) = load_capture(Path::new(&capture.path)) {
                     let texture = ctx.load_texture("vkslang-capture", image, egui::TextureOptions::NEAREST);
-                    self.grid_texture =
-                        Some(GridImage { id: capture.id, texture, size, picture: capture.picture });
+                    // The frame starts on the current picture area, in
+                    // captured-image coordinates.
+                    let scale = size[0] as f32 / capture.base[0] as f32;
+                    let [ax, ay, aw, ah] = capture.area.map(|v| v as f32 * scale);
+                    self.frame_rect = egui::Rect::from_min_size(egui::pos2(ax, ay), egui::vec2(aw, ah));
+                    self.grid_texture = Some(GridImage {
+                        id: capture.id,
+                        texture,
+                        size,
+                        base: capture.base,
+                        area: capture.area,
+                    });
                 }
             }
         }
@@ -799,26 +829,21 @@ impl App {
         let stale = self.grid_requested.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
         let mut request_capture = self.grid_texture.is_none() && stale;
         let mut apply: Option<SourceSize> = None;
+        let mut apply_rect: Option<String> = None;
         egui::Window::new("Pixel grid").open(&mut open).default_size([760.0, 560.0]).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 request_capture |= ui.button("Capture the picture").clicked();
                 ui.add(egui::Slider::new(&mut self.grid_zoom, 1.0..=8.0).text("zoom"));
-                ui.checkbox(&mut self.grid_square, "square pixels");
+                ui.add(egui::Slider::new(&mut self.grid_cell, 1.0..=64.0).step_by(0.05).text("pixel size"));
+                ui.separator();
+                ui.selectable_value(&mut self.frame_mode, false, "measure");
+                ui.selectable_value(&mut self.frame_mode, true, "frame the picture");
             });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Pixel size");
-                let w = ui.add(
-                    egui::Slider::new(&mut self.grid_cell.x, 1.0..=64.0).step_by(0.05).text("width"),
-                );
-                let h = ui.add_enabled(
-                    !self.grid_square,
-                    egui::Slider::new(&mut self.grid_cell.y, 1.0..=64.0).step_by(0.05).text("height"),
-                );
-                if self.grid_square && (w.changed() || h.changed() || self.grid_cell.y != self.grid_cell.x) {
-                    self.grid_cell.y = self.grid_cell.x;
-                }
-            });
-            ui.weak("Align the grid with the game's pixels: drag the image to shift it, adjust the size until the lines follow the blocks.");
+            if self.frame_mode {
+                ui.weak("Drag the frame to enclose the picture: inside to move it, near an edge to resize.");
+            } else {
+                ui.weak("Align the grid with the game's pixels: drag the image to shift it, adjust the size until the lines follow the blocks.");
+            }
 
             let Some(grid) = self.grid_texture.as_ref() else {
                 ui.label("No capture yet.");
@@ -826,35 +851,44 @@ impl App {
             };
             // What one captured pixel is worth on the real output.
             let scale = egui::vec2(
-                grid.picture[0] as f32 / grid.size[0] as f32,
-                grid.picture[1] as f32 / grid.size[1] as f32,
+                grid.base[0] as f32 / grid.size[0] as f32,
+                grid.base[1] as f32 / grid.size[1] as f32,
             );
-            let cell_output = egui::vec2(self.grid_cell.x * scale.x, self.grid_cell.y * scale.y);
+            let cell_output = egui::vec2(self.grid_cell * scale.x, self.grid_cell * scale.y);
+
+            // Measured inside the picture area, not the whole image.
+            let area = egui::vec2(grid.area[2] as f32, grid.area[3] as f32);
             let native = [
-                (grid.picture[0] as f32 / cell_output.x).round().max(1.0),
-                (grid.picture[1] as f32 / cell_output.y).round().max(1.0),
+                (area.x / cell_output.x).round().max(1.0),
+                (area.y / cell_output.y).round().max(1.0),
             ];
-            // 1.0 = square pixels, 1.2 = 320x200 stretched to 4:3...
-            let par = cell_output.x / cell_output.y;
 
             ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("{} × {}", native[0], native[1]));
                 ui.weak(format!(
-                    "pixels of {:.2}×{:.2} output pixels, picture {}×{}",
-                    cell_output.x, cell_output.y, grid.picture[0], grid.picture[1]
+                    "pixels of {:.2} output pixels, picture {}×{}",
+                    cell_output.x, grid.area[2], grid.area[3]
                 ));
-                if (par - 1.0).abs() > 0.01 {
-                    ui.weak(format!("· pixel aspect {par:.2}"));
+                if self.frame_mode {
+                    let area = frame_to_area(self.frame_rect, grid.size, grid.base);
+                    ui.strong(area.clone());
+                    if ui.button("Use as picture area").clicked() {
+                        apply_rect = Some(area);
+                    }
+                    if ui.button("Whole image").clicked() {
+                        self.frame_rect = egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(grid.size[0] as f32, grid.size[1] as f32),
+                        );
+                        apply_rect = Some("full".into());
+                    }
+                    return;
                 }
                 if ui.button("Use as fixed resolution").clicked() {
                     apply = Some(SourceSize::Fixed { size: [native[0] as u32, native[1] as u32] });
                 }
-                // A single factor cannot describe rectangular pixels.
                 if ui
-                    .add_enabled(
-                        (par - 1.0).abs() <= 0.01,
-                        egui::Button::new(format!("Use as ÷{:.2}", cell_output.x)),
-                    )
+                    .add(egui::Button::new(format!("Use as ÷{:.2}", cell_output.x)))
                     .on_hover_text("Keeps the ratio if the output resolution changes")
                     .clicked()
                 {
@@ -876,22 +910,98 @@ impl App {
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
+                if self.frame_mode {
+                    // Frame in screen coordinates.
+                    let to_screen = |p: egui::Pos2| rect.min + p.to_vec2() * zoom;
+                    let frame = egui::Rect::from_min_max(
+                        to_screen(self.frame_rect.min),
+                        to_screen(self.frame_rect.max),
+                    );
+                    // Everything outside the frame is dimmed.
+                    let shade = egui::Color32::from_black_alpha(140);
+                    for outside in [
+                        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), frame.top())),
+                        egui::Rect::from_min_max(egui::pos2(rect.left(), frame.bottom()), rect.max),
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), frame.top()),
+                            egui::pos2(frame.left(), frame.bottom()),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(frame.right(), frame.top()),
+                            egui::pos2(rect.right(), frame.bottom()),
+                        ),
+                    ] {
+                        painter.rect_filled(outside, 0.0, shade);
+                    }
+                    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 170, 60));
+                    painter.rect_stroke(frame, 0.0, stroke, egui::StrokeKind::Middle);
+                    for corner in
+                        [frame.left_top(), frame.right_top(), frame.left_bottom(), frame.right_bottom()]
+                    {
+                        painter.circle_filled(corner, 4.0, stroke.color);
+                    }
+
+                    // Edges under the pointer decide what a drag resizes.
+                    let margin = 10.0;
+                    if response.drag_started() {
+                        let p = response.interact_pointer_pos().unwrap_or(frame.center());
+                        self.frame_drag = Some([
+                            (p.x - frame.left()).abs() < margin,
+                            (p.y - frame.top()).abs() < margin,
+                            (p.x - frame.right()).abs() < margin,
+                            (p.y - frame.bottom()).abs() < margin,
+                        ]);
+                    }
+                    if response.dragged() {
+                        let delta = response.drag_delta() / zoom;
+                        let edges = self.frame_drag.unwrap_or([false; 4]);
+                        let mut r = self.frame_rect;
+                        if edges == [false; 4] {
+                            r = r.translate(delta);
+                        } else {
+                            if edges[0] {
+                                r.min.x += delta.x;
+                            }
+                            if edges[1] {
+                                r.min.y += delta.y;
+                            }
+                            if edges[2] {
+                                r.max.x += delta.x;
+                            }
+                            if edges[3] {
+                                r.max.y += delta.y;
+                            }
+                        }
+                        // Keep it inside the image and never inside out.
+                        let (w, h) = (grid.size[0] as f32, grid.size[1] as f32);
+                        r.min.x = r.min.x.clamp(0.0, w - 8.0);
+                        r.min.y = r.min.y.clamp(0.0, h - 8.0);
+                        r.max.x = r.max.x.clamp(r.min.x + 8.0, w);
+                        r.max.y = r.max.y.clamp(r.min.y + 8.0, h);
+                        self.frame_rect = r;
+                    }
+                    if response.drag_stopped() {
+                        self.frame_drag = None;
+                    }
+                    return;
+                }
+
                 let step = self.grid_cell * zoom;
-                if step.x >= 2.0 && step.y >= 2.0 {
+                if step >= 2.0 {
                     let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180));
                     let (ox, oy) = (
-                        self.grid_offset.x.rem_euclid(self.grid_cell.x) * zoom,
-                        self.grid_offset.y.rem_euclid(self.grid_cell.y) * zoom,
+                        self.grid_offset.x.rem_euclid(self.grid_cell) * zoom,
+                        self.grid_offset.y.rem_euclid(self.grid_cell) * zoom,
                     );
                     let mut x = rect.left() + ox;
                     while x <= rect.right() {
                         painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
-                        x += step.x;
+                        x += step;
                     }
                     let mut y = rect.top() + oy;
                     while y <= rect.bottom() {
                         painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
-                        y += step.y;
+                        y += step;
                     }
                 }
             });
@@ -907,6 +1017,15 @@ impl App {
                 let source = edit.to_settings();
                 self.send(Request::SetSource { source });
             }
+        }
+        if let Some(rect) = apply_rect {
+            if let Some(edit) = self.source.as_mut() {
+                edit.rect = rect;
+                let source = edit.to_settings();
+                self.send(Request::SetSource { source });
+            }
+            // Take a new capture so the frame follows the new area.
+            self.grid_requested = None;
         }
     }
 }
@@ -949,4 +1068,22 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("vkSlang", options, Box::new(|_cc| Ok(Box::new(App::new()))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_maps_to_output_pixels() {
+        // Capture 960 wide for a 3840 wide output: one captured pixel is four.
+        let frame = egui::Rect::from_min_size(egui::pos2(120.0, 0.0), egui::vec2(720.0, 540.0));
+        assert_eq!(frame_to_area(frame, [960, 540], [3840, 2160]), "480,0,2880x2160");
+    }
+
+    #[test]
+    fn frame_stays_inside_the_image() {
+        let frame = egui::Rect::from_min_size(egui::pos2(-10.0, 500.0), egui::vec2(2000.0, 2000.0));
+        assert_eq!(frame_to_area(frame, [960, 540], [3840, 2160]), "0,2000,3840x160");
+    }
 }
