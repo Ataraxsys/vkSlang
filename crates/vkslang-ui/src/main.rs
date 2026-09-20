@@ -17,6 +17,28 @@ use vkslang_ipc::{
 const POLL: Duration = Duration::from_millis(400);
 const SCAN: Duration = Duration::from_secs(2);
 
+/// Capture shown by the pixel grid assistant.
+struct GridImage {
+    id: u64,
+    texture: egui::TextureHandle,
+    /// Size of the captured image.
+    size: [u32; 2],
+    /// Size of the picture it came from, in output pixels.
+    picture: [u32; 2],
+}
+
+/// Decodes the raw capture written by the layer (magic, width, height, RGBA8).
+fn load_capture(path: &Path) -> Option<(egui::ColorImage, [u32; 2])> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 12 || data[..4] != vkslang_ipc::CAPTURE_MAGIC {
+        return None;
+    }
+    let width = u32::from_le_bytes(data[4..8].try_into().ok()?);
+    let height = u32::from_le_bytes(data[8..12].try_into().ok()?);
+    let pixels = data.get(12..12 + (width as usize * height as usize * 4))?;
+    Some((egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], pixels), [width, height]))
+}
+
 struct Target {
     pid: u32,
     path: PathBuf,
@@ -82,6 +104,15 @@ struct App {
     preset_filter: String,
 
     param_filter: String,
+    /// Pixel grid assistant.
+    grid_open: bool,
+    grid_texture: Option<GridImage>,
+    /// Grid pitch, in captured-image pixels.
+    grid_cell: f32,
+    grid_offset: egui::Vec2,
+    grid_zoom: f32,
+    /// Last capture request, to avoid asking on every frame.
+    grid_requested: Option<Instant>,
     source: Option<SourceEdit>,
     save_path: String,
 }
@@ -189,6 +220,12 @@ impl App {
             scanned_root: None,
             preset_filter: String::new(),
             param_filter: String::new(),
+            grid_open: false,
+            grid_texture: None,
+            grid_cell: 4.0,
+            grid_offset: egui::Vec2::ZERO,
+            grid_zoom: 2.0,
+            grid_requested: None,
             source: None,
             save_path: String::new(),
         }
@@ -411,6 +448,7 @@ impl App {
 
     fn source_panel(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
+        let mut open_grid = false;
         if let Some(o) = self.state.as_ref().and_then(|s| s.outputs.first()).cloned() {
             let ([w, h], [pw, ph], [iw, ih]) = (o.size, o.picture, o.input);
             let picture = if [pw, ph] == [w, h] { String::new() } else { format!("picture {pw}×{ph}, ") };
@@ -486,10 +524,18 @@ impl App {
                     changed = true;
                 }
             }
+            ui.separator();
+            if ui.button("Pixel grid…").clicked() {
+                open_grid = true;
+            }
         });
         if changed {
             let source = edit.to_settings();
             self.send(Request::SetSource { source });
+        }
+        if open_grid {
+            self.grid_open = true;
+            self.send(Request::Capture { max_width: 1280 });
         }
     }
 
@@ -689,6 +735,117 @@ fn draw_tree(
     }
 }
 
+impl App {
+    /// Assistant: overlay a grid on a capture of the game to read off its
+    /// pixel size, and turn that into a source resolution.
+    fn pixel_grid_window(&mut self, ctx: &egui::Context) {
+        if !self.grid_open {
+            return;
+        }
+        // Pick up a new capture as soon as the layer publishes one.
+        if let Some(capture) = self.state.as_ref().and_then(|s| s.capture.clone()) {
+            if self.grid_texture.as_ref().is_none_or(|g| g.id != capture.id) {
+                if let Some((image, size)) = load_capture(Path::new(&capture.path)) {
+                    let texture = ctx.load_texture("vkslang-capture", image, egui::TextureOptions::NEAREST);
+                    self.grid_texture =
+                        Some(GridImage { id: capture.id, texture, size, picture: capture.picture });
+                }
+            }
+        }
+
+        // Nothing to show yet: ask for a picture, retrying at most every
+        // two seconds.
+        let mut open = self.grid_open;
+        let stale = self.grid_requested.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+        let mut request_capture = self.grid_texture.is_none() && stale;
+        let mut apply: Option<SourceSize> = None;
+        egui::Window::new("Pixel grid").open(&mut open).default_size([760.0, 560.0]).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                request_capture |= ui.button("Capture the picture").clicked();
+                ui.add(egui::Slider::new(&mut self.grid_zoom, 1.0..=8.0).text("zoom"));
+                ui.add(egui::Slider::new(&mut self.grid_cell, 1.0..=64.0).step_by(0.05).text("pixel size"));
+            });
+            ui.weak("Align the grid with the game's pixels: drag the image to shift it, adjust the size until the lines follow the blocks.");
+
+            let Some(grid) = self.grid_texture.as_ref() else {
+                ui.label("No capture yet.");
+                return;
+            };
+            // What one captured pixel is worth on the real output.
+            let scale = grid.picture[0] as f32 / grid.size[0] as f32;
+            let cell_output = self.grid_cell * scale;
+            let native = [
+                (grid.picture[0] as f32 / cell_output).round().max(1.0),
+                (grid.picture[1] as f32 / cell_output).round().max(1.0),
+            ];
+
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("{} × {}", native[0], native[1]));
+                ui.weak(format!(
+                    "pixels of {cell_output:.2} output pixels, picture {}×{}",
+                    grid.picture[0], grid.picture[1]
+                ));
+                if ui.button("Use as fixed resolution").clicked() {
+                    apply = Some(SourceSize::Fixed { size: [native[0] as u32, native[1] as u32] });
+                }
+                if ui
+                    .button(format!("Use as ÷{cell_output:.2}"))
+                    .on_hover_text("Keeps the ratio if the output resolution changes")
+                    .clicked()
+                {
+                    apply = Some(SourceSize::Divide { by: cell_output });
+                }
+            });
+
+            egui::ScrollArea::both().show(ui, |ui| {
+                let zoom = self.grid_zoom;
+                let size = egui::vec2(grid.size[0] as f32 * zoom, grid.size[1] as f32 * zoom);
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
+                if response.dragged() {
+                    self.grid_offset += response.drag_delta() / zoom;
+                }
+                let painter = ui.painter_at(rect);
+                painter.image(
+                    grid.texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                let step = self.grid_cell * zoom;
+                if step >= 2.0 {
+                    let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180));
+                    let (ox, oy) = (
+                        self.grid_offset.x.rem_euclid(self.grid_cell) * zoom,
+                        self.grid_offset.y.rem_euclid(self.grid_cell) * zoom,
+                    );
+                    let mut x = rect.left() + ox;
+                    while x <= rect.right() {
+                        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+                        x += step;
+                    }
+                    let mut y = rect.top() + oy;
+                    while y <= rect.bottom() {
+                        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
+                        y += step;
+                    }
+                }
+            });
+        });
+        self.grid_open = open;
+        if request_capture {
+            self.grid_requested = Some(Instant::now());
+            self.send(Request::Capture { max_width: 1280 });
+        }
+        if let Some(res) = apply {
+            if let Some(edit) = self.source.as_mut() {
+                edit.mode = res;
+                let source = edit.to_settings();
+                self.send(Request::SetSource { source });
+            }
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.tick();
@@ -713,6 +870,7 @@ impl eframe::App for App {
             self.params_panel(ui);
             self.save_panel(ui);
         });
+        self.pixel_grid_window(ui.ctx());
         ui.ctx().request_repaint_after(POLL);
     }
 }

@@ -108,6 +108,12 @@ Each subframe advances `FrameCount` and binds `CurrentSubFrame`/`TotalSubFrames`
 
 The layer acquires images of its own for this, one at a time, and never asks the swapchain for extras: raising the image count crashes applications that size their swapchain arrays statically (Qt's QVulkanWindow does). If no image is free within 50 ms, the remaining subframes of that frame are simply skipped. In FIFO the application is naturally limited to `refresh / subframes`, which is why 3 subframes suit a 60 Hz game on a 240 Hz display. Note that a compositor that recomposites (gamescope on its Wayland backend) collapses the subframes; with `gamescope --backend sdl` the layer drives gamescope's own swapchain and they survive.
 
+### Pixel grid assistant
+
+When you do not know a game's internal resolution, open **Pixel grid…** next to the source settings. The layer grabs the picture as the application drew it, before the preset, and the UI overlays an adjustable grid: line the grid up with the game's pixel blocks, and it reads off the pixel size and the resulting resolution. One click applies it, either as a fixed resolution or as a division factor.
+
+The capture is written next to the control socket as raw RGBA (magic `VKSC`, width, height, pixels), downscaled to the requested width, and costs one frame wait only when asked for.
+
 ### Steam and Proton
 
 - Install **system-wide** (`PREFIX=/usr sudo -E ./scripts/install.sh`): the Steam container (pressure-vessel) imports the layers it finds in `/usr`.

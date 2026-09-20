@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -31,7 +31,27 @@ pub enum Request {
     SetHdr { hdr: HdrSettings },
     /// Presentations per application frame (interlacing, BFI).
     SetSubframes { subframes: u32, black: bool },
+    /// Grab the picture as the application drew it, before the preset, so the
+    /// UI can measure its pixel size. Answered immediately; the capture shows
+    /// up in `State::capture` once a frame has been presented.
+    Capture { max_width: u32 },
 }
+
+/// A picture grabbed by the layer, written next to the control socket.
+///
+/// Raw file: magic `VKSC`, width, height (little endian u32), then RGBA8 rows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Capture {
+    pub path: String,
+    /// Size of the captured image (downscaled to the requested width).
+    pub size: [u32; 2],
+    /// Size of the picture area it was taken from, in output pixels.
+    pub picture: [u32; 2],
+    /// Increments with every capture, so a client can tell them apart.
+    pub id: u64,
+}
+
+pub const CAPTURE_MAGIC: [u8; 4] = *b"VKSC";
 
 /// Color space of a swapchain or of a preset's final pass.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -234,6 +254,8 @@ pub struct State {
     pub subframes_max: u32,
     /// Parameters in declaration order.
     pub params: Vec<Param>,
+    /// Last picture grabbed by [`Request::Capture`].
+    pub capture: Option<Capture>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
