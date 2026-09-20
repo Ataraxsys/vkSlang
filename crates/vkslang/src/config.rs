@@ -225,7 +225,7 @@ impl Config {
             source: Source { res: source_res, filter, rect, rect_spec },
             process,
             params,
-            ipc: kv.get("ipc").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false")),
+            ipc: kv.get("ipc").is_none_or(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
             hdr: parse_hdr(&kv),
             subframes: kv.get("subframes").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 8),
             subframe_black: kv
