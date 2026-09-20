@@ -492,6 +492,7 @@ impl App {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Presentations per frame");
+            let (source, presented) = (state.source_fps, state.present_fps);
             changed |= ui
                 .add(egui::Slider::new(&mut subframes, 1..=8).integer())
                 .on_hover_text(
@@ -499,6 +500,7 @@ impl App {
                      faster than the game draws. 3 suits a 60 Hz game on a 240 Hz display.",
                 )
                 .changed();
+            ui.weak(format!("· {source:.0} fps source, {presented:.0} presented/s"));
             ui.add_enabled_ui(subframes > 1, |ui| {
                 changed |= ui.selectable_value(&mut black, false, "preset").changed();
                 changed |= ui
