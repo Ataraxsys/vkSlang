@@ -60,6 +60,12 @@ pub struct Config {
     pub hdr: vkslang_ipc::HdrSettings,
     /// Whether the swapchain may be promoted to HDR10.
     pub hdr_output: HdrOutput,
+    /// Presentations per application frame (1 = untouched). With a 60 Hz
+    /// source on a 240 Hz display, 3 or 4 let interlacing presets alternate
+    /// fields faster than the game's frame rate.
+    pub subframes: u32,
+    /// Extra subframes are black (cheap BFI) instead of running the chain.
+    pub subframe_black: bool,
 }
 
 pub fn get() -> &'static Config {
@@ -198,6 +204,10 @@ impl Config {
             params,
             ipc: kv.get("ipc").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false")),
             hdr: parse_hdr(&kv),
+            subframes: kv.get("subframes").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 8),
+            subframe_black: kv
+                .get("subframe_mode")
+                .is_some_and(|v| v.eq_ignore_ascii_case("black") || v.eq_ignore_ascii_case("bfi")),
             hdr_output: match kv.get("hdr_output").map(|v| v.to_ascii_lowercase()).as_deref() {
                 Some("off") | Some("0") | Some("false") => HdrOutput::Off,
                 Some("force") | Some("1") | Some("true") => HdrOutput::Force,

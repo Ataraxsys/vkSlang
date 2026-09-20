@@ -503,6 +503,9 @@ impl SwapchainState {
 struct FrameSlot {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Signalled by our own vkAcquireNextImageKHR for a subframe; safe to
+    /// reuse once this slot's fence has been waited on.
+    acquire: vk::Semaphore,
     /// Preset upload submitted with this slot; its pool is destroyed once the
     /// fence signals.
     init: Option<(vk::CommandPool, vk::CommandBuffer)>,
@@ -534,6 +537,8 @@ pub struct Runtime {
     swapchains: HashMap<vk::SwapchainKHR, SwapchainState>,
     frame_count: usize,
     last_frame: Option<Instant>,
+    /// Smoothed application frame rate, bound as the `FPS` uniform.
+    fps: f32,
 }
 
 impl Runtime {
@@ -567,6 +572,7 @@ impl Runtime {
             swapchains: HashMap::new(),
             frame_count: 0,
             last_frame: None,
+            fps: 60.0,
         };
         for _ in 0..RING {
             let slot = allocate_cmd(dev, pool).and_then(|cmd| {
@@ -574,7 +580,8 @@ impl Runtime {
                     &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                     None,
                 )?;
-                Ok(FrameSlot { cmd, fence, init: None })
+                let acquire = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+                Ok(FrameSlot { cmd, fence, init: None, acquire })
             });
             match slot {
                 Ok(slot) => rt.slots.push(slot),
@@ -774,10 +781,163 @@ impl Runtime {
                 dev.fns.destroy_command_pool(pool, None);
             }
             dev.fns.destroy_fence(slot.fence, None);
+            dev.fns.destroy_semaphore(slot.acquire, None);
         }
         // Destroying the pool frees every command buffer allocated from it.
         dev.fns.destroy_command_pool(self.pool, None);
         control().outputs.clear();
+    }
+
+    /// Presents the same application frame `total - 1` more times, so
+    /// presets can alternate fields (interlacing) or insert black frames
+    /// faster than the application's frame rate.
+    ///
+    /// The layer acquires images of its own, which is why the swapchain was
+    /// created with extras. Anything unexpected (no image available in time,
+    /// a resize) simply ends the extra presentations for this frame.
+    pub unsafe fn present_subframes(
+        &mut self,
+        dev: &DeviceData,
+        queue: vk::Queue,
+        swapchain: vk::SwapchainKHR,
+        total: u32,
+        black: bool,
+    ) {
+        if total <= 1 || !self.is_rendering() || !self.swapchains.contains_key(&swapchain) {
+            return;
+        }
+        let d = &dev.fns;
+        for current in 2..=total {
+            // The slot render() will use: waiting on its fence here frees its
+            // acquire semaphore before we reuse it.
+            let slot = self.next_slot;
+            if d.wait_for_fences(&[self.slots[slot].fence], true, u64::MAX).is_err() {
+                return;
+            }
+            let acquire = self.slots[slot].acquire;
+            let mut index = 0;
+            let r = (dev.swapchain_fn.acquire_next_image_khr)(
+                dev.handle,
+                swapchain,
+                50_000_000, // 50 ms: never hold the application's loop hostage
+                acquire,
+                vk::Fence::null(),
+                &mut index,
+            );
+            if r != vk::Result::SUCCESS && r != vk::Result::SUBOPTIMAL_KHR {
+                log_debug!("no image for subframe {current}/{total} ({r})");
+                return;
+            }
+
+            let done = if black {
+                self.present_black(dev, queue, swapchain, index, acquire)
+            } else {
+                self.render(dev, queue, swapchain, index, &[acquire], Some((current, total)))
+                    .unwrap_or(None)
+            };
+            let Some(done) = done else { return };
+
+            let wait = [done];
+            let swapchains = [swapchain];
+            let indices = [index];
+            let info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&wait)
+                .swapchains(&swapchains)
+                .image_indices(&indices);
+            let r = (dev.swapchain_fn.queue_present_khr)(queue, &info);
+            if r != vk::Result::SUCCESS && r != vk::Result::SUBOPTIMAL_KHR {
+                log_debug!("subframe present failed ({r})");
+                return;
+            }
+        }
+    }
+
+    /// Cheap black frame insertion: clear the acquired image, no shader.
+    unsafe fn present_black(
+        &mut self,
+        dev: &DeviceData,
+        queue: vk::Queue,
+        swapchain: vk::SwapchainKHR,
+        image_index: u32,
+        acquire: vk::Semaphore,
+    ) -> Option<vk::Semaphore> {
+        let state = self.swapchains.get(&swapchain)?;
+        let image = *state.images.get(image_index as usize)?;
+        let signal = [*state.semaphores.get(image_index as usize)?];
+        let d = &dev.fns;
+
+        let slot = &mut self.slots[self.next_slot];
+        self.next_slot = (self.next_slot + 1) % RING;
+        let cmd = slot.cmd;
+        d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok()?;
+        d.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .ok()?;
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let barrier = |old, new, src, dst| {
+            vk::ImageMemoryBarrier::default()
+                .image(image)
+                .old_layout(old)
+                .new_layout(new)
+                .src_access_mask(src)
+                .dst_access_mask(dst)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(range)
+        };
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            )],
+        );
+        d.cmd_clear_color_image(
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
+            &[range],
+        );
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            )],
+        );
+        d.end_command_buffer(cmd).ok()?;
+
+        let wait = [acquire];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&wait)
+            .wait_dst_stage_mask(&stages)
+            .command_buffers(&cmds)
+            .signal_semaphores(&signal);
+        d.reset_fences(&[slot.fence]).ok()?;
+        d.queue_submit(queue, &[submit], slot.fence).ok()?;
+        Some(signal[0])
     }
 
     /// Records and submits the filter chain for one presented image. Returns
@@ -790,12 +950,15 @@ impl Runtime {
         swapchain: vk::SwapchainKHR,
         image_index: u32,
         wait_semaphores: &[vk::Semaphore],
+        // `(current, total)` when rendering an extra presentation of the
+        // same application frame.
+        subframe: Option<(u32, u32)>,
     ) -> Result<Option<vk::Semaphore>, vk::Result> {
         if !self.is_rendering() {
             return Ok(None);
         }
         let Runtime {
-            slots, next_slot, chain, failed, hdr, pending_init, swapchains, frame_count, last_frame, ..
+            slots, next_slot, chain, failed, hdr, pending_init, swapchains, frame_count, last_frame, fps, ..
         } = self;
         let (Some(state), Some(active)) = (swapchains.get(&swapchain), chain.as_mut()) else {
             return Ok(None);
@@ -834,167 +997,203 @@ impl Runtime {
                 .subresource_range(color)
         };
 
-        // 1. swapchain -> TRANSFER_SRC, source -> TRANSFER_DST (previous
-        //    contents discarded; the chain keeps its own history copies).
-        let mut first = vec![
-            barrier(
-                image,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::AccessFlags::MEMORY_WRITE,
-                vk::AccessFlags::TRANSFER_READ,
-            ),
-            barrier(
-                source.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-            ),
-        ];
-        if let Some(staging) = &state.staging {
-            first.push(barrier(
-                staging.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-            ));
-        }
-        d.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &first,
-        );
-
         let layers = vk::ImageSubresourceLayers::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .layer_count(1);
+        let r = source.rect;
 
-        // 2. On a promoted (HDR10) swapchain, the application's pixels are
-        //    8-bit SDR written through its own view: copy them raw (format
-        //    classes are compatible) so they can be read as SDR.
-        let picture = match &state.staging {
-            Some(staging) => {
+        if subframe.is_none() {
+            // 1. swapchain -> TRANSFER_SRC, source -> TRANSFER_DST (previous
+            //    contents discarded; the chain keeps its own history copies).
+            let mut first = vec![
+                barrier(
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::MEMORY_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                ),
+                barrier(
+                    source.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                ),
+            ];
+            if let Some(staging) = &state.staging {
+                first.push(barrier(
+                    staging.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                ));
+            }
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &first,
+            );
+
+            // 2. On a promoted (HDR10) swapchain, the application's pixels are
+            //    8-bit SDR written through its own view: copy them raw (format
+            //    classes are compatible) so they can be read as SDR.
+            let picture = match &state.staging {
+                Some(staging) => {
+                    d.cmd_copy_image(
+                        cmd,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        staging.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::ImageCopy::default()
+                            .src_subresource(layers)
+                            .dst_subresource(layers)
+                            .extent(vk::Extent3D {
+                                width: state.extent.width,
+                                height: state.extent.height,
+                                depth: 1,
+                            })],
+                    );
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier(
+                            staging.image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::TRANSFER_READ,
+                        )],
+                    );
+                    staging.image
+                }
+                None => image,
+            };
+
+            // 2b. Downsample the picture region to the logical source resolution.
+            if r.extent == source.extent {
                 d.cmd_copy_image(
                     cmd,
-                    image,
+                    picture,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    staging.image,
+                    source.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[vk::ImageCopy::default()
                         .src_subresource(layers)
+                        .src_offset(vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 })
                         .dst_subresource(layers)
-                        .extent(vk::Extent3D {
-                            width: state.extent.width,
-                            height: state.extent.height,
-                            depth: 1,
-                        })],
+                        .extent(vk::Extent3D { width: r.extent.width, height: r.extent.height, depth: 1 })],
                 );
-                d.cmd_pipeline_barrier(
+            } else {
+                let sz = source.extent;
+                d.cmd_blit_image(
                     cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[barrier(
-                        staging.image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::AccessFlags::TRANSFER_READ,
-                    )],
-                );
-                staging.image
-            }
-            None => image,
-        };
-
-        // 2b. Downsample the picture region to the logical source resolution.
-        let r = source.rect;
-        if r.extent == source.extent {
-            d.cmd_copy_image(
-                cmd,
-                picture,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                source.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::ImageCopy::default()
-                    .src_subresource(layers)
-                    .src_offset(vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 })
-                    .dst_subresource(layers)
-                    .extent(vk::Extent3D { width: r.extent.width, height: r.extent.height, depth: 1 })],
-            );
-        } else {
-            let sz = source.extent;
-            d.cmd_blit_image(
-                cmd,
-                picture,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                source.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::ImageBlit::default()
-                    .src_subresource(layers)
-                    .src_offsets([
-                        vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 },
-                        vk::Offset3D {
-                            x: r.offset.x + r.extent.width as i32,
-                            y: r.offset.y + r.extent.height as i32,
-                            z: 1,
-                        },
-                    ])
-                    .dst_subresource(layers)
-                    .dst_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D { x: sz.width as i32, y: sz.height as i32, z: 1 },
-                    ])],
-                source.filter,
-            );
-        }
-
-        // 3. source -> SHADER_READ_ONLY (librashader input contract),
-        //    swapchain -> COLOR_ATTACHMENT (librashader output contract).
-        d.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER
-                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                | vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[
-                barrier(
+                    picture,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     source.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
-                ),
-                barrier(
+                    &[vk::ImageBlit::default()
+                        .src_subresource(layers)
+                        .src_offsets([
+                            vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 },
+                            vk::Offset3D {
+                                x: r.offset.x + r.extent.width as i32,
+                                y: r.offset.y + r.extent.height as i32,
+                                z: 1,
+                            },
+                        ])
+                        .dst_subresource(layers)
+                        .dst_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D { x: sz.width as i32, y: sz.height as i32, z: 1 },
+                        ])],
+                    source.filter,
+                );
+            }
+
+            // 3. source -> SHADER_READ_ONLY (librashader input contract),
+            //    swapchain -> COLOR_ATTACHMENT (librashader output contract).
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[
+                    barrier(
+                        source.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
+                    ),
+                    barrier(
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    ),
+                ],
+            );
+
+        } else {
+            // Subframe: the source image still holds this frame's picture and
+            // is still in SHADER_READ_ONLY, so only the freshly acquired image
+            // needs a layout; its previous contents are discarded.
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
                     image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     vk::AccessFlags::empty(),
                     vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                ),
-            ],
-        );
+                )],
+            );
+        }
 
         // 4. Run the preset. The viewport is the picture region, so pillar/
         //    letterbox bars are cleared to black by librashader's final pass.
         let now = Instant::now();
+        let elapsed = last_frame.map(|t| now.duration_since(t));
+        if subframe.is_none() {
+            // Measured, not guessed: presets that animate on time need it,
+            // and librashader defaults the uniform to 1 fps.
+            if let Some(seconds) = elapsed.map(|e| e.as_secs_f32()).filter(|s| *s > 0.0001) {
+                *fps = *fps * 0.9 + (1.0 / seconds) * 0.1;
+            }
+        }
         let options = FrameOptions {
-            frametime_delta: last_frame.map_or(0, |t| now.duration_since(t).as_millis() as u32),
+            frametime_delta: elapsed.map_or(0, |e| e.as_millis() as u32),
+            frames_per_second: *fps,
             // Binds HDRMode / BrightnessNits / ExpandGamut for HDR presets.
             color_space: state.color_space,
             brightness_nits: hdr.brightness_nits,
             expand_gamut: hdr.expand_gamut,
+            // Bound as CurrentSubFrame / TotalSubFrames; FrameCount also
+            // advances per subframe, so presets that alternate fields on it
+            // interlace at the presentation rate rather than the game's.
+            current_subframe: subframe.map_or(1, |(current, _)| current),
+            total_subframes: subframe.map_or(1, |(_, total)| total),
             ..Default::default()
         };
         *last_frame = Some(now);
