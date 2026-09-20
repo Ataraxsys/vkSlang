@@ -60,7 +60,14 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
     let managed = |key: &str| {
         matches!(
             key,
-            "preset" | "source_res" | "source_filter" | "source_rect" | "brightness_nits" | "expand_gamut"
+            "preset"
+                | "source_res"
+                | "source_filter"
+                | "source_rect"
+                | "brightness_nits"
+                | "expand_gamut"
+                | "subframes"
+                | "subframe_mode"
         ) || key.starts_with("param.")
     };
     let mut out: Vec<String> = existing
@@ -96,6 +103,8 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
     out.push(format!("source_rect = {}", src.rect));
     out.push(format!("brightness_nits = {}", state.hdr.brightness_nits));
     out.push(format!("expand_gamut = {}", state.hdr.expand_gamut));
+    out.push(format!("subframes = {}", state.subframes));
+    out.push(format!("subframe_mode = {}", if state.subframe_black { "black" } else { "shader" }));
     for (name, value) in changed_params(state) {
         out.push(format!("param.{name} = {value}"));
     }
@@ -158,6 +167,7 @@ mod tests {
         assert!(new.contains("source_rect = 4:3"));
         assert!(new.contains("brightness_nits = 200"));
         assert!(new.contains("expand_gamut = 0"));
+        assert!(new.contains("subframes = 1"));
         assert!(new.contains("param.GAMMA = 2.4"));
         assert!(!new.contains("param.MASK"));
     }

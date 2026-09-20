@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -29,6 +29,8 @@ pub enum Request {
     SetSource { source: SourceSettings },
     /// HDR uniforms (`BrightnessNits`, `ExpandGamut`) for HDR-aware presets.
     SetHdr { hdr: HdrSettings },
+    /// Presentations per application frame (interlacing, BFI).
+    SetSubframes { subframes: u32, black: bool },
 }
 
 /// Color space of a swapchain or of a preset's final pass.
@@ -190,6 +192,13 @@ pub struct State {
     /// Color space written by the running preset's final pass.
     pub preset_color_space: Option<ColorSpace>,
     pub hdr: HdrSettings,
+    /// Presentations per application frame (1 = untouched).
+    pub subframes: u32,
+    /// Extra subframes are black instead of running the preset.
+    pub subframe_black: bool,
+    /// Subframes the swapchain was created with room for; asking for more
+    /// only takes effect after the application restarts.
+    pub subframes_max: u32,
     /// Parameters in declaration order.
     pub params: Vec<Param>,
 }
