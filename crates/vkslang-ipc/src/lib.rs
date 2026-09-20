@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -185,6 +185,9 @@ pub struct SourceSettings {
     /// stretches the picture: a 640x360 source drawn into a 4:3 area gives
     /// the old "non-square pixels" look, scanlines stretched along with it.
     pub display: String,
+    /// Scales that region around its centre: 1.0 fills it, below shrinks the
+    /// picture, above overscans (the edges fall outside the screen).
+    pub display_scale: f32,
 }
 
 impl Default for SourceSettings {
@@ -194,6 +197,7 @@ impl Default for SourceSettings {
             filter: Filter::Nearest,
             rect: "full".into(),
             display: "full".into(),
+            display_scale: 1.0,
         }
     }
 }

@@ -60,6 +60,7 @@ struct SourceEdit {
     filter: Filter,
     rect: String,
     display: String,
+    display_scale: f32,
 }
 
 impl SourceEdit {
@@ -72,6 +73,7 @@ impl SourceEdit {
             filter: s.filter,
             rect: s.rect.clone(),
             display: s.display.clone(),
+            display_scale: s.display_scale,
         };
         match s.res {
             SourceSize::Fixed { size: [w, h] } => (edit.width, edit.height) = (w, h),
@@ -87,6 +89,7 @@ impl SourceEdit {
             filter: self.filter,
             rect: self.rect.trim().to_string(),
             display: self.display.trim().to_string(),
+            display_scale: self.display_scale,
         }
     }
 }
@@ -550,6 +553,20 @@ impl App {
                     edit.display = preset.into();
                     changed = true;
                 }
+            }
+            ui.separator();
+            ui.label("Scale");
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut edit.display_scale, 0.25..=2.0)
+                        .step_by(0.01)
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Size of that area: above 1 the picture overflows the screen (overscan)")
+                .changed();
+            if ui.small_button("1:1").clicked() {
+                edit.display_scale = 1.0;
+                changed = true;
             }
         });
         if changed {
