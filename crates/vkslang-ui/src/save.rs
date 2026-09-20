@@ -64,6 +64,7 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
                 | "source_res"
                 | "source_filter"
                 | "source_rect"
+                | "display_rect"
                 | "brightness_nits"
                 | "expand_gamut"
                 | "subframes"
@@ -98,6 +99,7 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
         if src.filter == Filter::Linear { "linear" } else { "nearest" }
     ));
     out.push(format!("source_rect = {}", src.rect));
+    out.push(format!("display_rect = {}", src.display));
     out.push(format!("brightness_nits = {}", state.hdr.brightness_nits));
     out.push(format!("expand_gamut = {}", state.hdr.expand_gamut));
     // 0 only happens with a default-constructed state; 1 is "untouched".
@@ -141,6 +143,7 @@ mod tests {
                 res: vkslang_ipc::SourceSize::Fixed { size: [320, 240] },
                 filter: Filter::Nearest,
                 rect: "4:3".into(),
+                display: "full".into(),
             },
             params: vec![
                 p("HEADER", 0.0, 0.0, 0.0, 0.0),
