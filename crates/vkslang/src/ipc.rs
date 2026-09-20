@@ -110,6 +110,10 @@ pub fn handle(request: Request) -> Response {
             Err(message) => return Response::Error { message },
         },
         Request::SetHdr { hdr } => ctl.hdr = config::sanitize_hdr(hdr),
+        Request::SetSubframes { subframes, black } => {
+            ctl.subframes = subframes.clamp(1, 8);
+            ctl.subframe_black = black;
+        }
     }
     Response::State(ctl.snapshot())
 }

@@ -26,6 +26,10 @@ pub struct Control {
     pub source_gen: u64,
     /// Read every frame, no generation needed.
     pub hdr: HdrSettings,
+    pub subframes: u32,
+    pub subframe_black: bool,
+    /// Room reserved in the swapchain at creation time.
+    pub subframes_max: u32,
 
     // ---- published (written by the runtime) ----
     pub running_preset: Option<PathBuf>,
@@ -47,6 +51,9 @@ static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
         source: cfg.source.clone(),
         source_gen: 0,
         hdr: cfg.hdr,
+        subframes: cfg.subframes,
+        subframe_black: cfg.subframe_black,
+        subframes_max: cfg.subframes,
         running_preset: None,
         loading: false,
         error: None,
@@ -74,6 +81,9 @@ impl Control {
             outputs: self.outputs.clone(),
             preset_color_space: self.preset_color_space,
             hdr: self.hdr,
+            subframes: self.subframes,
+            subframe_black: self.subframe_black,
+            subframes_max: self.subframes_max,
             params: self.params.clone(),
         }
     }

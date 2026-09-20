@@ -432,7 +432,8 @@ pub unsafe extern "system" fn create_swapchain(
 
     // Subframes are presented by the layer itself, so it needs images of its
     // own on top of the ones the application cycles through.
-    let subframes = config::get().subframes;
+    let subframes = crate::control::control().subframes.max(config::get().subframes);
+    crate::control::control().subframes_max = subframes;
     if subframes > 1 {
         let mut caps = vk::SurfaceCapabilitiesKHR::default();
         let r = (dev.instance.surface_fn.get_physical_device_surface_capabilities_khr)(
@@ -600,10 +601,13 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
 
     // Extra presentations of the same frame, so interlacing presets alternate
     // fields faster than the application draws (or for black frame insertion).
-    let cfg = config::get();
-    if cfg.subframes > 1 && matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR) {
+    let (subframes, black) = {
+        let ctl = crate::control::control();
+        (ctl.subframes, ctl.subframe_black)
+    };
+    if subframes > 1 && matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR) {
         for swapchain in processed {
-            rt.present_subframes(&dev, submit_queue, swapchain, cfg.subframes, cfg.subframe_black);
+            rt.present_subframes(&dev, submit_queue, swapchain, subframes, black);
         }
     }
     drop(guard);

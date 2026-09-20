@@ -485,6 +485,44 @@ impl App {
         }
     }
 
+    fn presentation_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(state) = self.state.as_ref() else { return };
+        let (mut subframes, mut black) = (state.subframes, state.subframe_black);
+        let (max_ready, fps) = (state.subframes_max, state.outputs.first().map(|o| o.size));
+        let _ = fps;
+        let mut changed = false;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Presentations per frame");
+            changed |= ui
+                .add(egui::Slider::new(&mut subframes, 1..=8).integer())
+                .on_hover_text(
+                    "Present each frame several times so interlacing presets alternate fields \
+                     faster than the game draws. 3 suits a 60 Hz game on a 240 Hz display.",
+                )
+                .changed();
+            ui.add_enabled_ui(subframes > 1, |ui| {
+                changed |= ui.selectable_value(&mut black, false, "preset").changed();
+                changed |= ui
+                    .selectable_value(&mut black, true, "black (BFI)")
+                    .on_hover_text("Insert black frames instead of running the preset again")
+                    .changed();
+            });
+        });
+        if subframes > max_ready {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 170, 60),
+                format!(
+                    "⚠ the swapchain only has room for {max_ready}: set subframes = {subframes} in \
+                     vkSlang.conf and restart the game"
+                ),
+            );
+        }
+        if changed {
+            self.send(Request::SetSubframes { subframes, black });
+        }
+    }
+
     fn params_panel(&mut self, ui: &mut egui::Ui) {
         let Some(state) = self.state.as_mut() else { return };
         ui.horizontal(|ui| {
@@ -621,6 +659,8 @@ impl eframe::App for App {
             self.source_panel(ui);
             ui.separator();
             self.hdr_panel(ui);
+            ui.separator();
+            self.presentation_panel(ui);
             ui.separator();
             self.params_panel(ui);
             self.save_panel(ui);
