@@ -610,6 +610,12 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
             rt.present_subframes(&dev, submit_queue, swapchain, subframes, black);
         }
     }
+    // More subframes than the swapchain has images for: ask the application
+    // to rebuild it, the way it would after a resize.
+    let recreate = rt.wants_recreation();
     drop(guard);
+    if recreate && result == vk::Result::SUCCESS {
+        return vk::Result::ERROR_OUT_OF_DATE_KHR;
+    }
     result
 }

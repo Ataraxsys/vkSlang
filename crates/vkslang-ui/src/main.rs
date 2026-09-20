@@ -510,13 +510,13 @@ impl App {
             });
         });
         if subframes > max_ready {
-            ui.colored_label(
-                egui::Color32::from_rgb(255, 170, 60),
-                format!(
-                    "⚠ the swapchain only has room for {max_ready}: set subframes = {subframes} in \
-                     vkSlang.conf and restart the game"
-                ),
-            );
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak(format!(
+                    "asking the game to rebuild its swapchain for {subframes} presentations \
+                     (it had room for {max_ready}); if it refuses, the count falls back on its own"
+                ));
+            });
         }
         if changed {
             self.send(Request::SetSubframes { subframes, black });
