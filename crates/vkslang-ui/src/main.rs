@@ -410,8 +410,13 @@ impl App {
     }
 
     fn source_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(edit) = self.source.as_mut() else { return };
         let mut changed = false;
+        if let Some(o) = self.state.as_ref().and_then(|s| s.outputs.first()).cloned() {
+            let ([w, h], [pw, ph], [iw, ih]) = (o.size, o.picture, o.input);
+            let picture = if [pw, ph] == [w, h] { String::new() } else { format!("picture {pw}×{ph}, ") };
+            ui.weak(format!("base {w}×{h}, {picture}input {iw}×{ih}, output {w}×{h}"));
+        }
+        let Some(edit) = self.source.as_mut() else { return };
         ui.horizontal_wrapped(|ui| {
             ui.label("Source resolution");
             let native = matches!(edit.mode, SourceSize::Native);
