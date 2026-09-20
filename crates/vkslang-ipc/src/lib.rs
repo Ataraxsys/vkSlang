@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -108,7 +108,12 @@ pub const GAMUT_NAMES: [&str; 4] = ["Accurate", "Expanded", "Wide", "Super"];
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct Output {
+    /// Swapchain size: what the application renders and what is presented.
     pub size: [u32; 2],
+    /// Region of it holding the picture (differs with a 4:3 picture area).
+    pub picture: [u32; 2],
+    /// Size of the image fed to the preset as `Original`.
+    pub input: [u32; 2],
     /// Vulkan format name, e.g. `A2B10G10R10_UNORM_PACK32`.
     pub format: String,
     pub color_space: ColorSpace,

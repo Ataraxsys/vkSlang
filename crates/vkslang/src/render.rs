@@ -749,6 +749,16 @@ impl Runtime {
             .values()
             .map(|s| Output {
                 size: [s.extent.width, s.extent.height],
+                picture: s
+                    .source
+                    .as_ref()
+                    .map_or([s.extent.width, s.extent.height], |src| {
+                        [src.rect.extent.width, src.rect.extent.height]
+                    }),
+                input: s
+                    .source
+                    .as_ref()
+                    .map_or([0, 0], |src| [src.extent.width, src.extent.height]),
                 format: format!("{:?}", s.format),
                 color_space: to_ipc(s.color_space),
                 promoted: s.promoted,
