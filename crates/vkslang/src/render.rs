@@ -368,6 +368,95 @@ pub struct SwapchainState {
     staging: Option<StagingImage>,
 }
 
+/// Readback target for [`Request::Capture`]: an RGBA8 copy of the picture
+/// the application drew, before the preset.
+struct CaptureTarget {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    buffer: vk::Buffer,
+    buffer_memory: vk::DeviceMemory,
+    /// Mapped pointer kept as an address: `Runtime` travels between threads
+    /// (it lives behind the device mutex) and a raw pointer is not `Send`.
+    mapped: usize,
+    extent: vk::Extent2D,
+}
+
+impl CaptureTarget {
+    unsafe fn new(dev: &DeviceData, extent: vk::Extent2D) -> Result<CaptureTarget, vk::Result> {
+        let d = &dev.fns;
+        let (image, memory) = create_image(
+            dev,
+            vk::Format::R8G8B8A8_UNORM,
+            extent,
+            vk::ImageCreateFlags::empty(),
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+        )?;
+        let size = u64::from(extent.width) * u64::from(extent.height) * 4;
+        let buffer = d.create_buffer(
+            &vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST),
+            None,
+        )?;
+        let reqs = d.get_buffer_memory_requirements(buffer);
+        let props = dev.instance.fns.get_physical_device_memory_properties(dev.physical_device);
+        let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let type_index = (0..props.memory_type_count).find(|&i| {
+            reqs.memory_type_bits & (1 << i) != 0
+                && props.memory_types[i as usize].property_flags.contains(wanted)
+        });
+        let cleanup = |e: vk::Result| {
+            d.destroy_buffer(buffer, None);
+            d.destroy_image(image, None);
+            d.free_memory(memory, None);
+            e
+        };
+        let Some(type_index) = type_index else {
+            return Err(cleanup(vk::Result::ERROR_OUT_OF_HOST_MEMORY));
+        };
+        let buffer_memory = d
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index),
+                None,
+            )
+            .map_err(cleanup)?;
+        d.bind_buffer_memory(buffer, buffer_memory, 0).map_err(cleanup)?;
+        let mapped = d
+            .map_memory(buffer_memory, 0, size, vk::MemoryMapFlags::empty())
+            .map_err(cleanup)? as usize;
+        Ok(CaptureTarget { image, memory, buffer, buffer_memory, mapped, extent })
+    }
+
+    unsafe fn destroy(self, dev: &DeviceData) {
+        let d = &dev.fns;
+        d.unmap_memory(self.buffer_memory);
+        d.destroy_buffer(self.buffer, None);
+        d.free_memory(self.buffer_memory, None);
+        d.destroy_image(self.image, None);
+        d.free_memory(self.memory, None);
+    }
+
+    /// Writes the mapped pixels next to the control socket.
+    unsafe fn write(&self, picture: vk::Extent2D) -> std::io::Result<vkslang_ipc::Capture> {
+        use std::io::Write;
+        let dir = vkslang_ipc::socket_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}-capture.bin", std::process::id()));
+        let len = (self.extent.width * self.extent.height * 4) as usize;
+        let pixels = std::slice::from_raw_parts(self.mapped as *const u8, len);
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        file.write_all(&vkslang_ipc::CAPTURE_MAGIC)?;
+        file.write_all(&self.extent.width.to_le_bytes())?;
+        file.write_all(&self.extent.height.to_le_bytes())?;
+        file.write_all(pixels)?;
+        file.flush()?;
+        Ok(vkslang_ipc::Capture {
+            path: path.display().to_string(),
+            size: [self.extent.width, self.extent.height],
+            picture: [picture.width, picture.height],
+            id: 0,
+        })
+    }
+}
+
 /// 1x1 image cleared to opaque black, blitted into the letterbox bars.
 ///
 /// librashader clears the whole output to *transparent* black before drawing
@@ -543,6 +632,7 @@ pub struct Runtime {
     rate_window: Instant,
     frames_in_window: u32,
     presents_in_window: u32,
+    capture: Option<CaptureTarget>,
     /// Application frame rate, bound as the `FPS` uniform.
     fps: f32,
     /// Presentations per second (subframes included).
@@ -583,6 +673,7 @@ impl Runtime {
             rate_window: Instant::now(),
             frames_in_window: 0,
             presents_in_window: 0,
+            capture: None,
             fps: 60.0,
             present_fps: 60.0,
         };
@@ -811,6 +902,9 @@ impl Runtime {
         if let Some((pool, _)) = self.pending_init.take() {
             dev.fns.destroy_command_pool(pool, None);
         }
+        if let Some(capture) = self.capture.take() {
+            capture.destroy(dev);
+        }
         for slot in &mut self.slots {
             if let Some((pool, _)) = slot.init.take() {
                 dev.fns.destroy_command_pool(pool, None);
@@ -1009,6 +1103,7 @@ impl Runtime {
             last_frame,
             frames_in_window,
             presents_in_window,
+            capture,
             ..
         } = self;
         let (Some(state), Some(active)) = (swapchains.get(&swapchain), chain.as_mut()) else {
@@ -1053,6 +1148,8 @@ impl Runtime {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .layer_count(1);
         let r = source.rect;
+        // Set when a capture was recorded into this frame's commands.
+        let mut captured = None;
 
         if subframe.is_none() {
             // 1. swapchain -> TRANSFER_SRC, source -> TRANSFER_DST (previous
@@ -1132,7 +1229,107 @@ impl Runtime {
                 None => image,
             };
 
-            // 2b. Downsample the picture region to the logical source resolution.
+            // 2a. Capture requested by vkslang-ui: an RGBA8 copy of the picture as
+        //     the application drew it, before the preset touches it.
+        if subframe.is_none() {
+            if let Some(max_width) = control().capture_request {
+                let rect = source.rect;
+                let scale = (max_width as f32 / rect.extent.width as f32).min(1.0);
+                let extent = vk::Extent2D {
+                    width: ((rect.extent.width as f32 * scale).round() as u32).max(1),
+                    height: ((rect.extent.height as f32 * scale).round() as u32).max(1),
+                };
+                if capture.as_ref().is_none_or(|c| c.extent != extent) {
+                    if let Some(old) = capture.take() {
+                        old.destroy(dev);
+                    }
+                    match CaptureTarget::new(dev, extent) {
+                        Ok(target) => *capture = Some(target),
+                        Err(e) => log_error!("cannot create the capture target: {e}"),
+                    }
+                }
+                if let Some(target) = capture.as_ref() {
+                    let barrier_capture = |old, new, src, dst| {
+                        vk::ImageMemoryBarrier::default()
+                            .image(target.image)
+                            .old_layout(old)
+                            .new_layout(new)
+                            .src_access_mask(src)
+                            .dst_access_mask(dst)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .subresource_range(color)
+                    };
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier_capture(
+                            vk::ImageLayout::UNDEFINED,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::AccessFlags::empty(),
+                            vk::AccessFlags::TRANSFER_WRITE,
+                        )],
+                    );
+                    d.cmd_blit_image(
+                        cmd,
+                        picture,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        target.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::ImageBlit::default()
+                            .src_subresource(layers)
+                            .src_offsets([
+                                vk::Offset3D { x: rect.offset.x, y: rect.offset.y, z: 0 },
+                                vk::Offset3D {
+                                    x: rect.offset.x + rect.extent.width as i32,
+                                    y: rect.offset.y + rect.extent.height as i32,
+                                    z: 1,
+                                },
+                            ])
+                            .dst_subresource(layers)
+                            .dst_offsets([
+                                vk::Offset3D::default(),
+                                vk::Offset3D { x: extent.width as i32, y: extent.height as i32, z: 1 },
+                            ])],
+                        vk::Filter::LINEAR,
+                    );
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier_capture(
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::TRANSFER_READ,
+                        )],
+                    );
+                    d.cmd_copy_image_to_buffer(
+                        cmd,
+                        target.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        target.buffer,
+                        &[vk::BufferImageCopy::default()
+                            .image_subresource(layers)
+                            .image_extent(vk::Extent3D {
+                                width: extent.width,
+                                height: extent.height,
+                                depth: 1,
+                            })],
+                    );
+                    captured = Some(rect.extent);
+                }
+            }
+        }
+
+        // 2b. Downsample the picture region to the logical source resolution.
             if r.extent == source.extent {
                 d.cmd_copy_image(
                     cmd,
@@ -1396,6 +1593,25 @@ impl Runtime {
             return Err(e);
         }
         *frame_count += 1;
+
+        // The capture is read back once the frame has run, which costs one
+        // wait but only on the frame the UI asked for.
+        if let (Some(picture), Some(target)) = (captured, capture.as_ref()) {
+            let fence = slot.fence;
+            if d.wait_for_fences(&[fence], true, 1_000_000_000).is_ok() {
+                let mut ctl = control();
+                let id = ctl.capture.as_ref().map_or(1, |c| c.id + 1);
+                match target.write(picture) {
+                    Ok(mut info) => {
+                        info.id = id;
+                        log_debug!("capture {}x{} -> {}", info.size[0], info.size[1], info.path);
+                        ctl.capture = Some(info);
+                    }
+                    Err(e) => log_error!("cannot write the capture: {e}"),
+                }
+                ctl.capture_request = None;
+            }
+        }
         Ok(Some(signal[0]))
     }
 }

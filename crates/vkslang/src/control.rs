@@ -12,7 +12,7 @@ use crate::config::{self, Source};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, MutexGuard};
-use vkslang_ipc::{ColorSpace, HdrSettings, Output, Param, State, PROTOCOL_VERSION};
+use vkslang_ipc::{Capture, ColorSpace, HdrSettings, Output, Param, State, PROTOCOL_VERSION};
 
 pub struct Control {
     // ---- desired (written by IPC) ----
@@ -40,6 +40,9 @@ pub struct Control {
     pub outputs: Vec<Output>,
     pub source_fps: f32,
     pub present_fps: f32,
+    /// Pending capture request (maximum width), honoured on the next frame.
+    pub capture_request: Option<u32>,
+    pub capture: Option<Capture>,
 }
 
 static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
@@ -64,6 +67,8 @@ static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
         outputs: Vec::new(),
         source_fps: 0.0,
         present_fps: 0.0,
+        capture_request: None,
+        capture: None,
     })
 });
 
@@ -91,6 +96,7 @@ impl Control {
             subframe_black: self.subframe_black,
             subframes_max: self.subframes_max,
             params: self.params.clone(),
+            capture: self.capture.clone(),
         }
     }
 
