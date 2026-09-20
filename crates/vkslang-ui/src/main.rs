@@ -582,7 +582,10 @@ impl App {
                         .step_by(0.01)
                         .fixed_decimals(2),
                 )
-                .on_hover_text("Size of that area: above 1 the picture overflows the screen (overscan)")
+                .on_hover_text(
+                    "Below 1 the drawn area shrinks; above 1 the picture is zoomed in, covering more \
+                     of the screen with its edges cropped",
+                )
                 .changed();
             if ui.small_button("1:1").clicked() {
                 edit.display_scale = 1.0;

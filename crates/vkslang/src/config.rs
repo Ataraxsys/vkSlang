@@ -350,6 +350,12 @@ impl Source {
         }
     }
 
+    /// The display area before any scaling.
+    #[cfg(test)]
+    pub fn display_rect_unscaled(&self, extent: vk::Extent2D) -> vk::Rect2D {
+        Self::region(self.display, extent)
+    }
+
     /// Size of the source image for a given picture area.
     pub fn size_for(&self, picture: vk::Extent2D) -> vk::Extent2D {
         match self.res {
@@ -362,17 +368,20 @@ impl Source {
         }
     }
 
-    /// Area of the swapchain the preset draws into, scaled around its centre.
+    /// Area of the swapchain the preset draws into.
+    ///
+    /// A scale below 1 shrinks it around its centre. Above 1 it stays put and
+    /// the picture is cropped instead (see [`Self::picture_rect`]): librashader
+    /// uses the viewport as its scissor, and a scissor reaching outside the
+    /// image is invalid, so the picture would simply vanish.
     pub fn display_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
         let base = Self::region(self.display, extent);
-        if (self.display_scale - 1.0).abs() < 0.001 {
+        if self.display_scale >= 1.0 {
             return base;
         }
         let (w, h) = (base.extent.width as f32, base.extent.height as f32);
         let (sw, sh) = ((w * self.display_scale).max(1.0), (h * self.display_scale).max(1.0));
         vk::Rect2D {
-            // Negative offsets are allowed: the picture then overflows the
-            // screen and is clipped, which is what overscan means.
             offset: vk::Offset2D {
                 x: base.offset.x + ((w - sw) / 2.0).round() as i32,
                 y: base.offset.y + ((h - sh) / 2.0).round() as i32,
@@ -382,8 +391,38 @@ impl Source {
     }
 
     /// Area of a `extent`-sized swapchain image that holds the picture.
+    ///
+    /// A display scale above 1 crops it around its centre, which zooms the
+    /// picture in: it then covers more of the screen, at the cost of its
+    /// edges.
     pub fn picture_rect(&self, extent: vk::Extent2D) -> vk::Rect2D {
-        Self::region(self.rect, extent)
+        let base = Self::region(self.rect, extent);
+        if self.display_scale <= 1.0 {
+            return base;
+        }
+        let (w, h) = (base.extent.width as f32, base.extent.height as f32);
+        let (cw, ch) = ((w / self.display_scale).max(1.0), (h / self.display_scale).max(1.0));
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: base.offset.x + ((w - cw) / 2.0).round() as i32,
+                y: base.offset.y + ((h - ch) / 2.0).round() as i32,
+            },
+            extent: vk::Extent2D { width: cw.round() as u32, height: ch.round() as u32 },
+        }
+    }
+
+    /// Keeps a rectangle inside the image: librashader's scissor rejects
+    /// anything reaching outside, and nothing would be drawn at all.
+    fn clamp_to(rect: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
+        let x = (rect.offset.x.max(0) as u32).min(extent.width.saturating_sub(1));
+        let y = (rect.offset.y.max(0) as u32).min(extent.height.saturating_sub(1));
+        vk::Rect2D {
+            offset: vk::Offset2D { x: x as i32, y: y as i32 },
+            extent: vk::Extent2D {
+                width: rect.extent.width.min(extent.width - x).max(1),
+                height: rect.extent.height.min(extent.height - y).max(1),
+            },
+        }
     }
 
     fn region(spec: SourceRect, extent: vk::Extent2D) -> vk::Rect2D {
@@ -402,18 +441,8 @@ impl Source {
                     extent: vk::Extent2D { width: rw, height: rh },
                 }
             }
-            SourceRect::Explicit(r) => {
-                // Clamp into the image so the blit stays valid after a resize.
-                let x = (r.offset.x.max(0) as u32).min(extent.width - 1);
-                let y = (r.offset.y.max(0) as u32).min(extent.height - 1);
-                vk::Rect2D {
-                    offset: vk::Offset2D { x: x as i32, y: y as i32 },
-                    extent: vk::Extent2D {
-                        width: r.extent.width.min(extent.width - x),
-                        height: r.extent.height.min(extent.height - y),
-                    },
-                }
-            }
+            // Clamped so the blit stays valid after a resize.
+            SourceRect::Explicit(r) => Self::clamp_to(r, extent),
         }
     }
 }
@@ -447,14 +476,30 @@ mod tests {
     fn rect() {
         assert_eq!(parse_rect("full"), Some(SourceRect::Full));
         assert_eq!(parse_rect("4:3"), Some(SourceRect::Aspect(4.0 / 3.0)));
-        let scaled = Source {
+        let screen = vk::Extent2D { width: 3840, height: 2160 };
+
+        // Below 1: the drawn area shrinks, the picture stays whole.
+        let small = Source {
             display: SourceRect::Aspect(4.0 / 3.0),
             display_scale: 0.5,
             ..Default::default()
         };
-        let d = scaled.display_rect(vk::Extent2D { width: 3840, height: 2160 });
+        let d = small.display_rect(screen);
         assert_eq!(d.extent, vk::Extent2D { width: 1440, height: 1080 });
         assert_eq!((d.offset.x, d.offset.y), (480 + 720, 540));
+        assert_eq!(small.picture_rect(screen).extent, screen);
+
+        // Above 1: the drawn area is untouched (a scissor outside the image
+        // draws nothing) and the picture is cropped instead.
+        let zoom = Source {
+            display: SourceRect::Aspect(4.0 / 3.0),
+            display_scale: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(zoom.display_rect(screen), small.display_rect_unscaled(screen));
+        let p = zoom.picture_rect(screen);
+        assert_eq!(p.extent, vk::Extent2D { width: 1920, height: 1080 });
+        assert_eq!((p.offset.x, p.offset.y), (960, 540));
 
         let src = Source { rect: SourceRect::Aspect(4.0 / 3.0), ..Default::default() };
         let r = src.picture_rect(vk::Extent2D { width: 3840, height: 2160 });
