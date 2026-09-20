@@ -126,21 +126,16 @@ pub enum Filter {
 }
 
 /// Size of the image handed to the filter chain as `Original`.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum SourceSize {
     /// The picture area itself, untouched.
+    #[default]
     Native,
     /// The picture area divided by `by` (2 = half, 3 = a third...).
     Divide { by: f32 },
     /// A fixed resolution, whatever the output is.
     Fixed { size: [u32; 2] },
-}
-
-impl Default for SourceSize {
-    fn default() -> Self {
-        SourceSize::Native
-    }
 }
 
 impl SourceSize {
