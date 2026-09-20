@@ -76,6 +76,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_SOURCE_RES` / `source_res` | `320x240`, `/3`, `50%`, `native` | Logical source resolution: fixed, the picture divided by N, or untouched (see below). |
 | `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
 | `VKSLANG_SOURCE_RECT` / `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the swapchain image that holds the picture (for gamescope pillarboxing). |
+| `VKSLANG_DISPLAY_RECT` / `display_rect` | `full`, `4:3`, `5:4` | Region the preset draws into; stretches the picture when it differs from `source_rect`. |
 | `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
 | `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
 | `VKSLANG_LOG` | `debug` | Log level. |
@@ -107,6 +108,13 @@ VKSLANG_SUBFRAMES=3   # 60 Hz game on a 240 Hz display -> 180 presentations per 
 Each subframe advances `FrameCount` and binds `CurrentSubFrame`/`TotalSubFrames`, so presets that alternate fields on `FrameCount` (guest-advanced and friends) interlace at the presentation rate. `subframe_mode = black` inserts black frames instead of running the preset, which costs almost nothing. Both are adjustable live from `vkslang-ui` ("Presentations per frame"), which also shows the measured rates: what the application draws, and what reaches the display. The source line shows the whole chain of sizes: base (swapchain), picture area, input given to the preset, and output.
 
 The layer acquires images of its own for this, one at a time, and never asks the swapchain for extras: raising the image count crashes applications that size their swapchain arrays statically (Qt's QVulkanWindow does). If no image is free within 50 ms, the remaining subframes of that frame are simply skipped. In FIFO the application is naturally limited to `refresh / subframes`, which is why 3 subframes suit a 60 Hz game on a 240 Hz display. Note that a compositor that recomposites (gamescope on its Wayland backend) collapses the subframes; with `gamescope --backend sdl` the layer drives gamescope's own swapchain and they survive.
+
+### Non-square pixels
+
+Old PC and console modes are displayed stretched: 640×360 or 320×200 in memory, shown at 4:3. Reproducing that takes two settings:
+
+- `source_rect` says what to **read**, and `source_res` the size of the input, so the grid stays aligned on the real pixels (640×360).
+- `display_rect` says where the preset **draws**. Set to `4:3`, the picture is stretched into that area, **and the shader is stretched with it**: scanlines and mask follow the display geometry, exactly like a CRT fed a 200-line signal.
 
 ### Pixel grid assistant
 

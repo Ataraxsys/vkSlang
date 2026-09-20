@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -179,13 +179,22 @@ pub struct SourceSettings {
     /// Logical source resolution.
     pub res: SourceSize,
     pub filter: Filter,
-    /// `full`, `4:3`, or `X,Y,WxH`.
+    /// Region read from the swapchain: `full`, `4:3`, or `X,Y,WxH`.
     pub rect: String,
+    /// Region the preset draws into, same syntax. Different from `rect` it
+    /// stretches the picture: a 640x360 source drawn into a 4:3 area gives
+    /// the old "non-square pixels" look, scanlines stretched along with it.
+    pub display: String,
 }
 
 impl Default for SourceSettings {
     fn default() -> Self {
-        SourceSettings { res: SourceSize::default(), filter: Filter::Nearest, rect: "full".into() }
+        SourceSettings {
+            res: SourceSize::default(),
+            filter: Filter::Nearest,
+            rect: "full".into(),
+            display: "full".into(),
+        }
     }
 }
 
