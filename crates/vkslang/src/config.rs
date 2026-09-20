@@ -41,8 +41,8 @@ pub struct Source {
     /// Region the preset draws into (stretches the picture when it differs).
     pub display: SourceRect,
     pub display_spec: String,
-    /// Scales the display area around its centre.
-    pub display_scale: f32,
+    /// Scales the display area around its centre, per axis.
+    pub display_scale: [f32; 2],
 }
 
 impl Default for Source {
@@ -54,7 +54,7 @@ impl Default for Source {
             rect_spec: "full".into(),
             display: SourceRect::Full,
             display_spec: "full".into(),
-            display_scale: 1.0,
+            display_scale: [1.0, 1.0],
         }
     }
 }
@@ -103,6 +103,19 @@ fn parse_file(text: &str) -> HashMap<String, String> {
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .filter(|(k, _)| !k.is_empty())
         .collect()
+}
+
+/// `1.2` (both axes) or `1.2,1.0` (horizontal, vertical)
+pub fn parse_scale(spec: &str) -> Option<[f32; 2]> {
+    let ok = |v: f32| (v.is_finite() && (0.1..=4.0).contains(&v)).then_some(v);
+    let (x, y) = match spec.split_once([',', 'x']) {
+        Some((x, y)) => (x.trim().parse().ok()?, y.trim().parse().ok()?),
+        None => {
+            let both: f32 = spec.trim().parse().ok()?;
+            (both, both)
+        }
+    };
+    Some([ok(x)?, ok(y)?])
 }
 
 /// `native`, `/2`, `50%` or `320x240`
@@ -250,10 +263,8 @@ impl Config {
                 display_spec,
                 display_scale: kv
                     .get("display_scale")
-                    .and_then(|v| v.parse().ok())
-                    .filter(|v: &f32| v.is_finite())
-                    .unwrap_or(1.0)
-                    .clamp(0.1, 4.0),
+                    .and_then(|v| parse_scale(v))
+                    .unwrap_or([1.0, 1.0]),
             },
             process,
             params,
@@ -322,7 +333,7 @@ impl Source {
         };
         let display =
             parse_rect(&s.display).ok_or_else(|| format!("invalid display area '{}'", s.display))?;
-        if !(s.display_scale.is_finite() && (0.1..=4.0).contains(&s.display_scale)) {
+        if !s.display_scale.iter().all(|v| v.is_finite() && (0.1..=4.0).contains(v)) {
             return Err("the display scale must be between 0.1 and 4".into());
         }
         Ok(Source {
@@ -375,12 +386,13 @@ impl Source {
     pub fn framing(&self, extent: vk::Extent2D) -> (vk::Rect2D, vk::Rect2D) {
         let picture = Self::clamp_to(Self::region(self.rect, extent), extent);
         let base = Self::clamp_to(Self::region(self.display, extent), extent);
-        if (self.display_scale - 1.0).abs() < 0.001 {
+        let [scale_x, scale_y] = self.display_scale;
+        if (scale_x - 1.0).abs() < 0.001 && (scale_y - 1.0).abs() < 0.001 {
             return (picture, base);
         }
 
         let (w, h) = (base.extent.width as f32, base.extent.height as f32);
-        let (wanted_w, wanted_h) = (w * self.display_scale, h * self.display_scale);
+        let (wanted_w, wanted_h) = (w * scale_x, h * scale_y);
         let (screen_w, screen_h) = (extent.width as f32, extent.height as f32);
         // As large as asked for, but never past the screen.
         let (draw_w, draw_h) = (wanted_w.min(screen_w).max(1.0), wanted_h.min(screen_h).max(1.0));
@@ -485,8 +497,11 @@ mod tests {
         let screen = vk::Extent2D { width: 3840, height: 2160 };
 
         // Below 1: the drawn area shrinks, the picture stays whole.
-        let small =
-            Source { display: SourceRect::Aspect(4.0 / 3.0), display_scale: 0.5, ..Default::default() };
+        let small = Source {
+            display: SourceRect::Aspect(4.0 / 3.0),
+            display_scale: [0.5, 0.5],
+            ..Default::default()
+        };
         let (picture, display) = small.framing(screen);
         assert_eq!(display.extent, vk::Extent2D { width: 1440, height: 1080 });
         assert_eq!((display.offset.x, display.offset.y), (480 + 720, 540));
@@ -494,16 +509,22 @@ mod tests {
 
         // Above 1: a 4:3 area on a 16:9 screen has room left sideways, so it
         // widens first; only the height, already maxed out, crops the picture.
-        let zoom =
-            Source { display: SourceRect::Aspect(4.0 / 3.0), display_scale: 1.2, ..Default::default() };
+        let zoom = Source {
+            display: SourceRect::Aspect(4.0 / 3.0),
+            display_scale: [1.2, 1.2],
+            ..Default::default()
+        };
         let (picture, display) = zoom.framing(screen);
         assert_eq!(display.extent, vk::Extent2D { width: 3456, height: 2160 });
         assert_eq!(picture.extent.width, 3840, "the sides must not be cropped");
         assert_eq!(picture.extent.height, 1800);
 
         // Far enough and the drawn area fills the screen, cropping vertically.
-        let full =
-            Source { display: SourceRect::Aspect(4.0 / 3.0), display_scale: 2.0, ..Default::default() };
+        let full = Source {
+            display: SourceRect::Aspect(4.0 / 3.0),
+            display_scale: [2.0, 2.0],
+            ..Default::default()
+        };
         let (picture, display) = full.framing(screen);
         assert_eq!(display.offset, vk::Offset2D { x: 0, y: 0 });
         assert_eq!(display.extent, screen);
@@ -512,6 +533,22 @@ mod tests {
         let src = Source { rect: SourceRect::Aspect(4.0 / 3.0), ..Default::default() };
         let r = src.picture_rect(vk::Extent2D { width: 3840, height: 2160 });
         assert_eq!((r.offset.x, r.offset.y, r.extent.width, r.extent.height), (480, 0, 2880, 2160));
+    }
+
+    #[test]
+    fn scales() {
+        assert_eq!(parse_scale("1.5"), Some([1.5, 1.5]));
+        assert_eq!(parse_scale("1.2,0.8"), Some([1.2, 0.8]));
+        assert_eq!(parse_scale("2x1"), Some([2.0, 1.0]));
+        assert_eq!(parse_scale("0"), None);
+        assert_eq!(parse_scale("5,1"), None);
+
+        // Stretching only one axis: the other keeps the picture whole.
+        let wide = Source { display_scale: [1.5, 1.0], ..Default::default() };
+        let screen = vk::Extent2D { width: 1000, height: 1000 };
+        let (picture, display) = wide.framing(screen);
+        assert_eq!(display.extent, screen, "already full width, cannot grow");
+        assert_eq!(picture.extent, vk::Extent2D { width: 667, height: 1000 });
     }
 
     #[test]
