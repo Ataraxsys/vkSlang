@@ -120,7 +120,10 @@ Old PC and console modes are displayed stretched: 640×360 or 320×200 in memory
 
 ### Pixel grid assistant
 
-When you do not know a game's internal resolution, open **Pixel grid…** next to the source settings. The layer grabs the picture as the application drew it, before the preset, and the UI overlays an adjustable grid: line the grid up with the game's pixel blocks, and it reads off the pixel size and the resulting resolution. One click applies it, either as a fixed resolution or as a division factor.
+When you do not know a game's internal resolution, open **Pixel grid…** next to the source settings. The layer grabs the whole image as the application drew it, before the preset, and the window offers two tools:
+
+- **measure**: an adjustable grid. Line it up with the game's pixel blocks and it reads off the pixel size and the resulting resolution, applied as a fixed resolution or a division factor.
+- **frame the picture**: a rectangle to drag over the image, inside to move it, near an edge to resize. It sets the picture area (`source_rect`) without typing coordinates, which matters when the game leaves black borders of its own.
 
 The capture is written next to the control socket as raw RGBA (magic `VKSC`, width, height, pixels), downscaled to the requested width, and costs one frame wait only when asked for.
 

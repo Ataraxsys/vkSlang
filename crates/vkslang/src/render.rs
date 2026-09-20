@@ -445,7 +445,11 @@ impl CaptureTarget {
     }
 
     /// Writes the mapped pixels next to the control socket.
-    unsafe fn write(&self, picture: vk::Extent2D) -> std::io::Result<vkslang_ipc::Capture> {
+    unsafe fn write(
+        &self,
+        base: vk::Extent2D,
+        area: vk::Rect2D,
+    ) -> std::io::Result<vkslang_ipc::Capture> {
         use std::io::Write;
         let dir = vkslang_ipc::socket_dir();
         std::fs::create_dir_all(&dir)?;
@@ -461,7 +465,13 @@ impl CaptureTarget {
         Ok(vkslang_ipc::Capture {
             path: path.display().to_string(),
             size: [self.extent.width, self.extent.height],
-            picture: [picture.width, picture.height],
+            base: [base.width, base.height],
+            area: [
+                area.offset.x,
+                area.offset.y,
+                area.extent.width as i32,
+                area.extent.height as i32,
+            ],
             id: 0,
         })
     }
@@ -1243,7 +1253,9 @@ impl Runtime {
         //     the application drew it, before the preset touches it.
         if subframe.is_none() {
             if let Some(max_width) = control().capture_request {
-                let rect = source.rect;
+                // The whole image, so the UI can also frame a new picture
+                // area outside the current one.
+                let rect = vk::Rect2D { offset: vk::Offset2D::default(), extent: state.extent };
                 let scale = (max_width as f32 / rect.extent.width as f32).min(1.0);
                 let extent = vk::Extent2D {
                     width: ((rect.extent.width as f32 * scale).round() as u32).max(1),
@@ -1334,7 +1346,7 @@ impl Runtime {
                                 depth: 1,
                             })],
                     );
-                    captured = Some(rect.extent);
+                    captured = Some((rect.extent, source.rect));
                 }
             }
         }
@@ -1607,12 +1619,12 @@ impl Runtime {
 
         // The capture is read back once the frame has run, which costs one
         // wait but only on the frame the UI asked for.
-        if let (Some(picture), Some(target)) = (captured, capture.as_ref()) {
+        if let (Some((base, area)), Some(target)) = (captured, capture.as_ref()) {
             let fence = slot.fence;
             if d.wait_for_fences(&[fence], true, 1_000_000_000).is_ok() {
                 let mut ctl = control();
                 let id = ctl.capture.as_ref().map_or(1, |c| c.id + 1);
-                match target.write(picture) {
+                match target.write(base, area) {
                     Ok(mut info) => {
                         info.id = id;
                         log_debug!("capture {}x{} -> {}", info.size[0], info.size[1], info.path);
