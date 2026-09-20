@@ -260,6 +260,9 @@ pub struct State {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// The state is the whole point of a response; boxing it would only move the
+// allocation around, and responses are built one at a time.
+#[allow(clippy::large_enum_variant)]
 pub enum Response {
     State(State),
     Error { message: String },
