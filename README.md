@@ -72,6 +72,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | Variable / key | Example | Purpose |
 |---|---|---|
 | `ENABLE_VKSLANG` | `1` | Enables the implicit layer (`DISABLE_VKSLANG=1` forces it off). |
+| `profile.<executable>` / `profile` | `Amiga 4:3` | Profile loaded automatically for that process, or for everything (file only). |
 | `VKSLANG_PRESET` / `preset` | `/…/crt-royale.slangp` | Preset to load, or several separated by commas to chain them. Without one, the layer passes everything through. |
 | `VKSLANG_SOURCE_RES` / `source_res` | `320x240`, `/3`, `50%`, `native` | Logical source resolution: fixed, the picture divided by N, or untouched (see below). |
 | `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
@@ -178,7 +179,7 @@ The external app (egui, OpenGL, so it never loads the layer itself) connects to 
 - **adjust parameters** with sliders (min/max/step from `#pragma parameter`, declaration order, section headers, ↺ to restore the preset value);
 - change the **source resolution**, the **filter** and the **picture area** live;
 - turn the shader **on/off** (bypass);
-- **save a profile**: a named look kept in `~/.config/vkSlang/profiles/<name>.json`, holding the preset chain, the parameters you changed, the source resolution, the picture and display areas with their scale, the HDR uniforms and the subframes. One click puts it back on a running game, parameters included (they are applied once the chain has finished compiling).
+- **save a profile**: a named look kept in `~/.config/vkSlang/profiles/<name>.json`, holding the preset chain, the parameters you changed, the source resolution, the picture and display areas with their scale, the HDR uniforms and the subframes. One click puts it back on a running game, parameters included (they are applied once the chain has finished compiling). The ☆ next to a profile makes the layer load it **automatically for that process**, by writing `profile.<executable>` into `vkSlang.conf`; anything spelled out in the file or the environment still wins.
 - **save** also to a RetroArch-compatible `.slangp` (`#reference` + modified parameters, single preset only) or **as default** in `vkSlang.conf`, leaving your other lines untouched.
 
 ### Protocol
