@@ -56,6 +56,49 @@ pub fn save_slangp(state: &State, path: &Path) -> io::Result<()> {
     std::fs::write(path, text)
 }
 
+/// Key tying a process to the profile loaded automatically for it.
+fn profile_key(process: &str) -> String {
+    format!("profile.{}", process.trim())
+}
+
+/// Profile vkSlang.conf loads automatically for `process`, if any.
+pub fn default_profile_for(process: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    let key = profile_key(process).to_lowercase();
+    text.lines()
+        .filter_map(|line| line.split('#').next().unwrap_or("").split_once('='))
+        .find(|(k, _)| k.trim().to_lowercase() == key)
+        .map(|(_, v)| v.trim().to_string())
+}
+
+/// Sets (or clears, with `None`) that profile, leaving the rest of the file
+/// alone.
+pub fn set_default_profile(process: &str, name: Option<&str>) -> io::Result<()> {
+    let path = config_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let key = profile_key(process);
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|line| {
+            let content = line.split('#').next().unwrap_or("");
+            match content.split_once('=') {
+                Some((k, _)) => !k.trim().eq_ignore_ascii_case(&key),
+                None => true,
+            }
+        })
+        .map(str::to_string)
+        .collect();
+    if let Some(name) = name {
+        lines.push(format!("{key} = {name}"));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(&path, text)
+}
+
 /// Rewrites the keys vkSlang manages, keeping the user's other lines and
 /// comments.
 pub fn update_config_text(existing: &str, state: &State) -> String {
@@ -167,6 +210,21 @@ mod tests {
     #[test]
     fn slangp_only_changed() {
         assert_eq!(slangp_text(&state()).unwrap(), "#reference \"/s/crt.slangp\"\nGAMMA = \"2.4\"\n");
+    }
+
+    #[test]
+    fn default_profile_line_is_rewritten() {
+        let old = "# mine\nprofile.soh.exe = Old\nprocess = gamescope\n";
+        let kept: Vec<&str> = old
+            .lines()
+            .filter(|line| {
+                !line.split('#').next().unwrap_or("").split_once('=').is_some_and(|(k, _)| {
+                    k.trim().eq_ignore_ascii_case(&profile_key("soh.exe"))
+                })
+            })
+            .collect();
+        assert_eq!(kept, vec!["# mine", "process = gamescope"]);
+        assert_eq!(profile_key("soh.exe"), "profile.soh.exe");
     }
 
     #[test]
