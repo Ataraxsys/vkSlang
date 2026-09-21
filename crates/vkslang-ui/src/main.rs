@@ -76,8 +76,10 @@ struct SourceEdit {
     rect: String,
     display: String,
     display_scale: [f32; 2],
-    /// Move both axes together.
+    /// Move both axes together, keeping the ratio they had when locked.
     scale_locked: bool,
+    /// That ratio, vertical over horizontal.
+    scale_ratio: f32,
 }
 
 impl SourceEdit {
@@ -91,7 +93,12 @@ impl SourceEdit {
             rect: s.rect.clone(),
             display: s.display.clone(),
             display_scale: s.display_scale,
-            scale_locked: (s.display_scale[0] - s.display_scale[1]).abs() < 0.001,
+            scale_locked: true,
+            scale_ratio: if s.display_scale[0] > 0.0 {
+                s.display_scale[1] / s.display_scale[0]
+            } else {
+                1.0
+            },
         };
         match s.res {
             SourceSize::Fixed { size: [w, h] } => (edit.width, edit.height) = (w, h),
@@ -684,16 +691,32 @@ impl App {
             }
             if let Some(axis) = moved {
                 if edit.scale_locked {
-                    edit.display_scale = [edit.display_scale[axis]; 2];
+                    // Follow the ratio rather than forcing both to be equal.
+                    let ratio = edit.scale_ratio.max(0.01);
+                    let other = if axis == 0 {
+                        edit.display_scale[0] * ratio
+                    } else {
+                        edit.display_scale[1] / ratio
+                    };
+                    edit.display_scale[1 - axis] = other.clamp(0.25, 2.0);
                 }
                 changed = true;
             }
-            if ui.checkbox(&mut edit.scale_locked, "lock").changed() && edit.scale_locked {
-                edit.display_scale[1] = edit.display_scale[0];
-                changed = true;
+            if ui
+                .checkbox(&mut edit.scale_locked, "lock")
+                .on_hover_text("Keep the current ratio between the two axes")
+                .changed()
+                && edit.scale_locked
+            {
+                edit.scale_ratio = if edit.display_scale[0] > 0.0 {
+                    edit.display_scale[1] / edit.display_scale[0]
+                } else {
+                    1.0
+                };
             }
-            if ui.small_button("1:1").clicked() {
+            if ui.small_button("1:1").on_hover_text("Back to full size, square").clicked() {
                 edit.display_scale = [1.0, 1.0];
+                edit.scale_ratio = 1.0;
                 changed = true;
             }
         });
