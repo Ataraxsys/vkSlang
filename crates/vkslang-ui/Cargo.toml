@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 vkslang-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 # OpenGL (glow) backend on purpose: a Vulkan-based UI would itself load the
 # vkSlang layer when ENABLE_VKSLANG=1 is exported globally.
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
