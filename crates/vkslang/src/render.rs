@@ -331,6 +331,12 @@ unsafe fn create_image(
 struct SourceImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
+    /// Image read from the picture before duplication. Present only when
+    /// pixels are repeated: the picture is reduced to the real pixel grid
+    /// here, then copied into `image` with a nearest blit, which repeats each
+    /// pixel exactly. Scaling straight from the picture would sample it
+    /// instead, and lines would not come out as identical copies.
+    base: Option<(vk::Image, vk::DeviceMemory, vk::Extent2D)>,
     extent: vk::Extent2D,
     /// View format librashader uses to sample it (always non-sRGB, like a
     /// RetroArch core framebuffer).
@@ -353,6 +359,7 @@ impl SourceImage {
         let rect = source.picture_rect(swapchain_extent);
         let display = source.display_rect(swapchain_extent);
         let extent = source.size_for(rect.extent);
+        let base_extent = source.base_size_for(rect.extent);
         let view_format = srgb_to_unorm(format).unwrap_or(format);
 
         let mut flags = vk::ImageCreateFlags::empty();
@@ -366,17 +373,31 @@ impl SourceImage {
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::SAMPLED;
         let (image, memory) = create_image(dev, format, extent, flags, usage)?;
+        let base = if base_extent == extent {
+            None
+        } else {
+            match create_image(dev, format, base_extent, flags, usage) {
+                Ok((base_image, base_memory)) => Some((base_image, base_memory, base_extent)),
+                Err(e) => {
+                    dev.fns.destroy_image(image, None);
+                    dev.fns.free_memory(memory, None);
+                    return Err(e);
+                }
+            }
+        };
+        let duplicated = if base.is_some() {
+            format!(" duplicated to {}x{}", extent.width, extent.height)
+        } else {
+            String::new()
+        };
         log_debug!(
-            "source {}x{} {:?} from picture {:?}, drawn into {:?} of {}x{}",
-            extent.width,
-            extent.height,
-            format,
-            rect,
-            display,
+            "source {}x{}{duplicated} {format:?} from picture {rect:?}, drawn into {display:?} of {}x{}",
+            base_extent.width,
+            base_extent.height,
             swapchain_extent.width,
             swapchain_extent.height
         );
-        Ok(SourceImage { image, memory, extent, view_format, rect, display, filter: source.filter })
+        Ok(SourceImage { image, memory, base, extent, view_format, rect, display, filter: source.filter })
     }
 
     unsafe fn destroy(self, dev: &DeviceData) {
@@ -1406,48 +1427,110 @@ impl Runtime {
             }
         }
 
-        // 2b. Downsample the picture region to the logical source resolution.
-            if r.extent == source.extent {
-                d.cmd_copy_image(
-                    cmd,
-                    picture,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    source.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::ImageCopy::default()
-                        .src_subresource(layers)
-                        .src_offset(vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 })
-                        .dst_subresource(layers)
-                        .extent(vk::Extent3D { width: r.extent.width, height: r.extent.height, depth: 1 })],
-                );
-            } else {
-                let sz = source.extent;
-                d.cmd_blit_image(
-                    cmd,
-                    picture,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    source.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::ImageBlit::default()
-                        .src_subresource(layers)
-                        .src_offsets([
-                            vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 },
-                            vk::Offset3D {
-                                x: r.offset.x + r.extent.width as i32,
-                                y: r.offset.y + r.extent.height as i32,
-                                z: 1,
-                            },
-                        ])
-                        .dst_subresource(layers)
-                        .dst_offsets([
-                            vk::Offset3D::default(),
-                            vk::Offset3D { x: sz.width as i32, y: sz.height as i32, z: 1 },
-                        ])],
-                    source.filter,
-                );
-            }
+        // 2b. Reduce the picture region to the real pixel grid, then repeat
+        //     each pixel into the source image when duplication is on. The
+        //     second step is a nearest blit between exact multiples, so every
+        //     pixel comes out as identical copies.
+        let (reduce_into, reduce_extent) = match source.base {
+            Some((image, _, extent)) => (image, extent),
+            None => (source.image, source.extent),
+        };
+        if r.extent == reduce_extent {
+            d.cmd_copy_image(
+                cmd,
+                picture,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                reduce_into,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageCopy::default()
+                    .src_subresource(layers)
+                    .src_offset(vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 })
+                    .dst_subresource(layers)
+                    .extent(vk::Extent3D { width: r.extent.width, height: r.extent.height, depth: 1 })],
+            );
+        } else {
+            d.cmd_blit_image(
+                cmd,
+                picture,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                reduce_into,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageBlit::default()
+                    .src_subresource(layers)
+                    .src_offsets([
+                        vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 },
+                        vk::Offset3D {
+                            x: r.offset.x + r.extent.width as i32,
+                            y: r.offset.y + r.extent.height as i32,
+                            z: 1,
+                        },
+                    ])
+                    .dst_subresource(layers)
+                    .dst_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: reduce_extent.width as i32,
+                            y: reduce_extent.height as i32,
+                            z: 1,
+                        },
+                    ])],
+                source.filter,
+            );
+        }
 
-            // 3. source -> SHADER_READ_ONLY (librashader input contract),
+        if let Some((base_image, _, base_extent)) = source.base {
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[
+                    barrier(
+                        base_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                    ),
+                    barrier(
+                        source.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    ),
+                ],
+            );
+            d.cmd_blit_image(
+                cmd,
+                base_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                source.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageBlit::default()
+                    .src_subresource(layers)
+                    .src_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D { x: base_extent.width as i32, y: base_extent.height as i32, z: 1 },
+                    ])
+                    .dst_subresource(layers)
+                    .dst_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: source.extent.width as i32,
+                            y: source.extent.height as i32,
+                            z: 1,
+                        },
+                    ])],
+                // Never anything but nearest here: this step exists to copy
+                // pixels, not to interpolate them.
+                vk::Filter::NEAREST,
+            );
+        }
+
+        // 3. source -> SHADER_READ_ONLY (librashader input contract),
             //    swapchain -> COLOR_ATTACHMENT (librashader output contract).
             d.cmd_pipeline_barrier(
                 cmd,

@@ -117,7 +117,7 @@ The layer acquires images of its own for this, one at a time, and never asks the
 Old PC and console modes are displayed stretched: 640×360 or 320×200 in memory, shown at 4:3. Reproducing that takes two settings:
 
 - `source_rect` says what to **read**, and `source_res` the size of the input, so the grid stays aligned on the real pixels (640×360).
-- `pixel_duplicate` repeats each source pixel. A DOS 320×200 mode with `1,2` hands the preset 400 real lines rather than 200 stretched ones, which keeps scanlines and masks working on actual lines.
+- `pixel_duplicate` repeats each source pixel. A DOS 320×200 mode with `1,2` hands the preset 400 real lines rather than 200 stretched ones, which keeps scanlines and masks working on actual lines. The picture is first reduced to the real pixel grid, then copied into the source image with a nearest blit between exact multiples, so every pixel really is duplicated rather than resampled.
 - `display_rect` says where the preset **draws**. Set to `4:3`, the picture is stretched into that area, **and the shader is stretched with it**: scanlines and mask follow the display geometry, exactly like a CRT fed a 200-line signal.
 - `display_scale` resizes the result, per axis in the UI with a lock that keeps the ratio the two axes currently have. Below 1 the drawn area shrinks. Above 1 it grows until it reaches the edges of the screen, and only then is the picture cropped, on the axis that could not grow: a 4:3 area on a 16:9 screen widens first and loses its top and bottom, never its sides. It never overflows the screen, because librashader uses the viewport as its scissor and a scissor reaching outside draws nothing.
 
