@@ -34,6 +34,8 @@ pub enum HdrOutput {
 pub struct Source {
     /// Logical (retro) size fed to the filter chain as `Original`.
     pub res: vkslang_ipc::SourceSize,
+    /// Each source pixel repeated this many times per axis.
+    pub duplicate: [u32; 2],
     pub filter: vk::Filter,
     pub rect: SourceRect,
     /// `rect` as written by the user (`4:3` stays `4:3`).
@@ -49,6 +51,7 @@ impl Default for Source {
     fn default() -> Self {
         Source {
             res: vkslang_ipc::SourceSize::Native,
+            duplicate: [1, 1],
             filter: vk::Filter::NEAREST,
             rect: SourceRect::Full,
             rect_spec: "full".into(),
@@ -104,6 +107,19 @@ fn parse_file(text: &str) -> HashMap<String, String> {
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .filter(|(k, _)| !k.is_empty())
         .collect()
+}
+
+/// `2` (both axes) or `1,2` (horizontal, vertical)
+pub fn parse_duplicate(spec: &str) -> Option<[u32; 2]> {
+    let ok = |v: u32| (1..=8).contains(&v).then_some(v);
+    let (x, y) = match spec.split_once([',', 'x']) {
+        Some((x, y)) => (x.trim().parse().ok()?, y.trim().parse().ok()?),
+        None => {
+            let both: u32 = spec.trim().parse().ok()?;
+            (both, both)
+        }
+    };
+    Some([ok(x)?, ok(y)?])
 }
 
 /// `1.2` (both axes) or `1.2,1.0` (horizontal, vertical)
@@ -309,6 +325,11 @@ impl Config {
                 (None, None) => Vec::new(),
             },
             source: Source {
+                duplicate: kv
+                    .get("pixel_duplicate")
+                    .and_then(|v| parse_duplicate(v))
+                    .or_else(|| profile.as_ref().map(|p| p.source.duplicate))
+                    .unwrap_or([1, 1]),
                 res: if from_profile("source_res") {
                     profile.as_ref().map_or(source_res, |p| p.source.res)
                 } else {
@@ -387,6 +408,9 @@ pub fn exe_name() -> String {
 impl Source {
     pub fn from_ipc(s: &vkslang_ipc::SourceSettings) -> Result<Source, String> {
         let rect = parse_rect(&s.rect).ok_or_else(|| format!("invalid source rect '{}'", s.rect))?;
+        if !s.duplicate.iter().all(|d| (1..=8).contains(d)) {
+            return Err("pixel duplication must be between 1 and 8".into());
+        }
         let res = match s.res {
             vkslang_ipc::SourceSize::Fixed { size: [0, _] } | vkslang_ipc::SourceSize::Fixed { size: [_, 0] } => {
                 return Err("source resolution must be non-zero".into())
@@ -407,6 +431,7 @@ impl Source {
         }
         Ok(Source {
             res,
+            duplicate: s.duplicate,
             filter,
             rect,
             rect_spec: s.rect.trim().to_string(),
@@ -419,6 +444,7 @@ impl Source {
     pub fn to_ipc(&self) -> vkslang_ipc::SourceSettings {
         vkslang_ipc::SourceSettings {
             res: self.res,
+            duplicate: self.duplicate,
             filter: if self.filter == vk::Filter::LINEAR {
                 vkslang_ipc::Filter::Linear
             } else {
@@ -430,8 +456,17 @@ impl Source {
         }
     }
 
-    /// Size of the source image for a given picture area.
+    /// Size of the source image for a given picture area, duplication
+    /// included.
     pub fn size_for(&self, picture: vk::Extent2D) -> vk::Extent2D {
+        let base = self.base_size_for(picture);
+        vk::Extent2D {
+            width: base.width.saturating_mul(self.duplicate[0].clamp(1, 8)).max(1),
+            height: base.height.saturating_mul(self.duplicate[1].clamp(1, 8)).max(1),
+        }
+    }
+
+    fn base_size_for(&self, picture: vk::Extent2D) -> vk::Extent2D {
         match self.res {
             vkslang_ipc::SourceSize::Native => picture,
             vkslang_ipc::SourceSize::Divide { by } => vk::Extent2D {
@@ -602,6 +637,24 @@ mod tests {
         let src = Source { rect: SourceRect::Aspect(4.0 / 3.0), ..Default::default() };
         let r = src.picture_rect(vk::Extent2D { width: 3840, height: 2160 });
         assert_eq!((r.offset.x, r.offset.y, r.extent.width, r.extent.height), (480, 0, 2880, 2160));
+    }
+
+    #[test]
+    fn duplication_multiplies_the_source() {
+        assert_eq!(parse_duplicate("2"), Some([2, 2]));
+        assert_eq!(parse_duplicate("1,2"), Some([1, 2]));
+        assert_eq!(parse_duplicate("0,2"), None);
+
+        // A DOS 320x200 mode with doubled lines: the preset sees 400.
+        let dos = Source {
+            res: vkslang_ipc::SourceSize::Fixed { size: [320, 200] },
+            duplicate: [1, 2],
+            ..Default::default()
+        };
+        assert_eq!(
+            dos.size_for(vk::Extent2D { width: 1920, height: 1080 }),
+            vk::Extent2D { width: 320, height: 400 }
+        );
     }
 
     #[test]

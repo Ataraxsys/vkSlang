@@ -68,6 +68,8 @@ struct Target {
 /// the user edits it).
 struct SourceEdit {
     mode: SourceSize,
+    /// Each source pixel repeated this many times per axis.
+    duplicate: [u32; 2],
     /// Kept while another mode is selected, so switching back restores them.
     width: u32,
     height: u32,
@@ -86,6 +88,7 @@ impl SourceEdit {
     fn from(s: &SourceSettings) -> SourceEdit {
         let mut edit = SourceEdit {
             mode: s.res,
+            duplicate: s.duplicate,
             width: 320,
             height: 240,
             divisor: 2.0,
@@ -111,6 +114,7 @@ impl SourceEdit {
     fn to_settings(&self) -> SourceSettings {
         SourceSettings {
             res: self.mode,
+            duplicate: self.duplicate,
             filter: self.filter,
             rect: self.rect.trim().to_string(),
             display: self.display.trim().to_string(),
@@ -640,6 +644,14 @@ impl App {
             }
         });
         ui.horizontal_wrapped(|ui| {
+            ui.label("Duplicate pixels")
+                .on_hover_text("Repeat each source pixel, for modes whose pixels are not square (DOS 320×200: ↕ 2 gives the preset 400 real lines)");
+            for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
+                changed |= ui
+                    .add(egui::DragValue::new(&mut edit.duplicate[axis]).range(1..=8).prefix(label))
+                    .changed();
+            }
+            ui.separator();
             ui.label("Filter");
             changed |= ui.selectable_value(&mut edit.filter, Filter::Nearest, "nearest").changed();
             changed |= ui.selectable_value(&mut edit.filter, Filter::Linear, "linear").changed();

@@ -108,6 +108,7 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
             "preset"
                 | "source_res"
                 | "source_filter"
+                | "pixel_duplicate"
                 | "source_rect"
                 | "display_rect"
                 | "display_scale"
@@ -140,6 +141,12 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
     }
     let src = &state.source;
     out.push(format!("source_res = {}", src.res.to_config()));
+    let [dx, dy] = src.duplicate;
+    out.push(if dx == dy {
+        format!("pixel_duplicate = {dx}")
+    } else {
+        format!("pixel_duplicate = {dx},{dy}")
+    });
     out.push(format!(
         "source_filter = {}",
         if src.filter == Filter::Linear { "linear" } else { "nearest" }
@@ -193,6 +200,7 @@ mod tests {
             presets: vec!["/s/crt.slangp".into()],
             source: SourceSettings {
                 res: vkslang_ipc::SourceSize::Fixed { size: [320, 240] },
+                duplicate: [1, 1],
                 filter: Filter::Nearest,
                 rect: "4:3".into(),
                 display: "full".into(),
