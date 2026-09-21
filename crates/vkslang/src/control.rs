@@ -17,7 +17,7 @@ use vkslang_ipc::{Capture, ColorSpace, HdrSettings, Output, Param, State, PROTOC
 pub struct Control {
     // ---- desired (written by IPC) ----
     pub enabled: bool,
-    pub preset: Option<PathBuf>,
+    pub presets: Vec<PathBuf>,
     pub preset_gen: u64,
     /// User overrides on top of the preset's own values.
     pub overrides: BTreeMap<String, f32>,
@@ -32,7 +32,7 @@ pub struct Control {
     pub subframes_max: u32,
 
     // ---- published (written by the runtime) ----
-    pub running_preset: Option<PathBuf>,
+    pub running_presets: Vec<PathBuf>,
     pub loading: bool,
     pub error: Option<String>,
     pub params: Vec<Param>,
@@ -49,7 +49,7 @@ static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
     let cfg = config::get();
     Mutex::new(Control {
         enabled: true,
-        preset: cfg.preset.clone(),
+        presets: cfg.preset.clone(),
         preset_gen: 0,
         overrides: cfg.params.iter().cloned().collect(),
         params_gen: 0,
@@ -59,7 +59,7 @@ static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
         subframes: cfg.subframes,
         subframe_black: cfg.subframe_black,
         subframes_max: 8,
-        running_preset: None,
+        running_presets: Vec::new(),
         loading: false,
         error: None,
         params: Vec::new(),
@@ -83,7 +83,7 @@ impl Control {
             pid: std::process::id(),
             process: config::exe_name(),
             enabled: self.enabled,
-            preset: self.running_preset.as_ref().map(|p| p.display().to_string()),
+            presets: self.running_presets.iter().map(|p| p.display().to_string()).collect(),
             loading: self.loading,
             error: self.error.clone(),
             source: self.source.to_ipc(),

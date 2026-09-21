@@ -88,12 +88,15 @@ pub fn handle(request: Request) -> Response {
             }
             ctl.params_gen += 1;
         }
-        Request::LoadPreset { path } => {
-            let path = PathBuf::from(path);
-            if !path.is_file() {
-                return Response::Error { message: format!("{} does not exist", path.display()) };
+        Request::LoadPresets { paths } => {
+            if paths.is_empty() {
+                return Response::Error { message: "no preset given".into() };
             }
-            ctl.preset = Some(path);
+            let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+            if let Some(missing) = paths.iter().find(|p| !config::resolve_path(p).is_file()) {
+                return Response::Error { message: format!("{} does not exist", missing.display()) };
+            }
+            ctl.presets = paths;
             ctl.overrides.clear();
             ctl.preset_gen += 1;
             ctl.loading = true;

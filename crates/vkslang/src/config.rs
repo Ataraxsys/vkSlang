@@ -61,7 +61,8 @@ impl Default for Source {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub preset: Option<PathBuf>,
+    /// Presets to chain, in order (`preset = a.slangp, b.slangp`).
+    pub preset: Vec<PathBuf>,
     pub source: Source,
     /// Executable names the layer is active for; empty = all.
     pub process: Vec<String>,
@@ -253,7 +254,12 @@ impl Config {
             .collect();
 
         Config {
-            preset: kv.get("preset").filter(|p| !p.is_empty()).map(PathBuf::from),
+            preset: kv
+                .get("preset")
+                .map(|v| {
+                    v.split(',').map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect()
+                })
+                .unwrap_or_default(),
             source: Source {
                 res: source_res,
                 filter,

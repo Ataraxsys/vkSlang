@@ -142,10 +142,19 @@ fn preset_params(preset: &ShaderPreset) -> Result<Vec<Param>, String> {
     Ok(params)
 }
 
+/// Names a chain for the log: `crt-royale.slangp + scanlines.slangp`.
+fn describe(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
 /// A compiled preset waiting to be installed. `cmd` (allocated from its own
 /// `pool`, so loading can run off-thread) holds the GPU uploads.
 pub struct Loaded {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     chain: FilterChain,
     params: Vec<Param>,
     /// Color space the final pass writes.
@@ -171,12 +180,55 @@ unsafe fn allocate_cmd(dev: &DeviceData, pool: vk::CommandPool) -> Result<vk::Co
     Ok(cmd)
 }
 
-/// Parses and compiles a preset. Only thread-safe `vkCreate*` calls and a
+/// Concatenates presets into a single chain: the passes of the second run on
+/// the output of the first, and so on.
+///
+/// Aliases, textures and parameters are kept unique, first one wins: two
+/// presets naming a pass `Source` would otherwise fight over the same
+/// semantic.
+fn merge_presets(paths: &[PathBuf]) -> Result<ShaderPreset, String> {
+    let mut merged: Option<ShaderPreset> = None;
+    for path in paths {
+        let path = crate::config::resolve_path(path);
+        let preset = ShaderPreset::try_parse(&path, ShaderFeatures::NONE).map_err(|e| e.to_string())?;
+        match merged.as_mut() {
+            None => merged = Some(preset),
+            Some(chain) => {
+                for mut pass in preset.passes {
+                    if pass
+                        .meta
+                        .alias
+                        .as_ref()
+                        .is_some_and(|a| chain.passes.iter().any(|p| p.meta.alias.as_ref() == Some(a)))
+                    {
+                        log_warn!("dropping the duplicate alias '{}'", pass.meta.alias.unwrap());
+                        pass.meta.alias = None;
+                    }
+                    pass.meta.id = chain.passes.len() as i32;
+                    chain.passes.push(pass);
+                }
+                for texture in preset.textures {
+                    if !chain.textures.iter().any(|t| t.meta.name == texture.meta.name) {
+                        chain.textures.push(texture);
+                    }
+                }
+                for parameter in preset.parameters {
+                    if !chain.parameters.iter().any(|p| p.name == parameter.name) {
+                        chain.parameters.push(parameter);
+                    }
+                }
+                chain.pass_count = chain.passes.len() as i32;
+            }
+        }
+    }
+    merged.ok_or_else(|| "no preset given".to_string())
+}
+
+/// Parses and compiles a chain. Only thread-safe `vkCreate*` calls and a
 /// private command pool are used, so this may run on any thread.
-unsafe fn load_chain(dev: &DeviceData, path: &Path) -> Result<Loaded, String> {
+unsafe fn load_chain(dev: &DeviceData, paths: &[PathBuf]) -> Result<Loaded, String> {
     let started = Instant::now();
-    let path = &crate::config::resolve_path(path);
-    let preset = ShaderPreset::try_parse(path, ShaderFeatures::NONE).map_err(|e| e.to_string())?;
+    let preset = merge_presets(paths)?;
     let params = preset_params(&preset)?;
     let color_space = preset.color_space().unwrap_or_else(|e| {
         log_warn!("cannot determine the preset's output color space: {e}");
@@ -216,8 +268,8 @@ unsafe fn load_chain(dev: &DeviceData, path: &Path) -> Result<Loaded, String> {
     let chain = FilterChain::load_from_preset_deferred(preset, vulkan, cmd, Some(&options))
         .map_err(|e| fail(e.to_string()))?;
     d.end_command_buffer(cmd).map_err(|e| fail(e.to_string()))?;
-    log_info!("compiled {} in {:.2?}", path.display(), started.elapsed());
-    Ok(Loaded { path: path.to_path_buf(), chain, params, color_space, pool, cmd })
+    log_info!("compiled {} in {:.2?}", describe(paths), started.elapsed());
+    Ok(Loaded { paths: paths.to_vec(), chain, params, color_space, pool, cmd })
 }
 
 // ---------------------------------------------------------------- swapchain
@@ -723,14 +775,16 @@ impl Runtime {
         if self.chain.is_some() || self.loader.is_some() || self.applied_preset_gen.is_some() {
             return;
         }
-        let (path, gen) = {
+        let (paths, gen) = {
             let ctl = control();
-            (ctl.preset.clone(), ctl.preset_gen)
+            (ctl.presets.clone(), ctl.preset_gen)
         };
         self.applied_preset_gen = Some(gen);
-        let Some(path) = path else { return };
+        if paths.is_empty() {
+            return;
+        }
         control().loading = true;
-        let result = load_chain(dev, &path);
+        let result = load_chain(dev, &paths);
         self.finish_load(dev, result);
     }
 
@@ -763,7 +817,7 @@ impl Runtime {
             .iter()
             .map(|p| Param { value: ctl.param_value(&p.name, p.initial), ..p.clone() })
             .collect();
-        ctl.running_preset = Some(loaded.path.clone());
+        ctl.running_presets = loaded.paths.clone();
         ctl.preset_color_space = Some(to_ipc(loaded.color_space));
         ctl.error = None;
         for state in self.swapchains.values() {
@@ -777,7 +831,7 @@ impl Runtime {
         self.pending_init = Some((loaded.pool, loaded.cmd));
         self.failed = false;
         self.applied_params_gen = None;
-        log_info!("running {}", loaded.path.display());
+        log_info!("running {}", describe(&loaded.paths));
     }
 
     /// Applies pending changes from the control state. Called at every
@@ -808,12 +862,13 @@ impl Runtime {
         // meanwhile starts as soon as the current one is installed).
         if self.loader.is_none() && self.applied_preset_gen != Some(ctl.preset_gen) {
             self.applied_preset_gen = Some(ctl.preset_gen);
-            if let Some(path) = ctl.preset.clone() {
+            let paths = ctl.presets.clone();
+            if !paths.is_empty() {
                 ctl.loading = true;
                 let dev = Arc::clone(dev);
                 let spawned = std::thread::Builder::new()
                     .name("vkslang-load".into())
-                    .spawn(move || unsafe { load_chain(&dev, &path) });
+                    .spawn(move || unsafe { load_chain(&dev, &paths) });
                 match spawned {
                     Ok(handle) => self.loader = Some(handle),
                     Err(e) => {
