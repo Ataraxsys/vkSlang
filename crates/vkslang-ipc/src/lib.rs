@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -182,6 +182,11 @@ impl SourceSize {
 pub struct SourceSettings {
     /// Logical source resolution.
     pub res: SourceSize,
+    /// Each source pixel repeated this many times, horizontally and
+    /// vertically, after `res` is worked out. DOS modes are the reason: at
+    /// 320x200 the pixels are taller than wide, and doubling the lines gives
+    /// the preset 400 real lines to work with instead of stretching 200.
+    pub duplicate: [u32; 2],
     pub filter: Filter,
     /// Region read from the swapchain: `full`, `4:3`, or `X,Y,WxH`.
     pub rect: String,
@@ -199,6 +204,7 @@ impl Default for SourceSettings {
     fn default() -> Self {
         SourceSettings {
             res: SourceSize::default(),
+            duplicate: [1, 1],
             filter: Filter::Nearest,
             rect: "full".into(),
             display: "full".into(),
