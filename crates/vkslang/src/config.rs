@@ -45,6 +45,8 @@ pub struct Source {
     pub display_spec: String,
     /// Scales the display area around its centre, per axis.
     pub display_scale: [f32; 2],
+    /// Scales the picture inside that area, by reading a smaller region.
+    pub source_scale: [f32; 2],
 }
 
 impl Default for Source {
@@ -58,6 +60,7 @@ impl Default for Source {
             display: SourceRect::Full,
             display_spec: "full".into(),
             display_scale: [1.0, 1.0],
+            source_scale: [1.0, 1.0],
         }
     }
 }
@@ -345,6 +348,11 @@ impl Config {
                     .and_then(|v| parse_scale(v))
                     .or_else(|| profile.as_ref().map(|p| p.source.display_scale))
                     .unwrap_or([1.0, 1.0]),
+                source_scale: kv
+                    .get("source_scale")
+                    .and_then(|v| parse_scale(v))
+                    .or_else(|| profile.as_ref().map(|p| p.source.source_scale))
+                    .unwrap_or([1.0, 1.0]),
             },
             process,
             params,
@@ -426,8 +434,10 @@ impl Source {
         };
         let display =
             parse_rect(&s.display).ok_or_else(|| format!("invalid display area '{}'", s.display))?;
-        if !s.display_scale.iter().all(|v| v.is_finite() && (0.1..=4.0).contains(v)) {
-            return Err("the display scale must be between 0.1 and 4".into());
+        for scale in [s.display_scale, s.source_scale] {
+            if !scale.iter().all(|v| v.is_finite() && (0.1..=4.0).contains(v)) {
+                return Err("scales must be between 0.1 and 4".into());
+            }
         }
         Ok(Source {
             res,
@@ -438,6 +448,7 @@ impl Source {
             display,
             display_spec: s.display.trim().to_string(),
             display_scale: s.display_scale,
+            source_scale: s.source_scale,
         })
     }
 
@@ -453,6 +464,7 @@ impl Source {
             rect: self.rect_spec.clone(),
             display: self.display_spec.clone(),
             display_scale: self.display_scale,
+            source_scale: self.source_scale,
         }
     }
 
@@ -491,16 +503,15 @@ impl Source {
     pub fn framing(&self, extent: vk::Extent2D) -> (vk::Rect2D, vk::Rect2D) {
         let picture = Self::clamp_to(Self::region(self.rect, extent), extent);
         let base = Self::clamp_to(Self::region(self.display, extent), extent);
-        let [scale_x, scale_y] = self.display_scale;
-        if (scale_x - 1.0).abs() < 0.001 && (scale_y - 1.0).abs() < 0.001 {
-            return (picture, base);
-        }
 
+        // The drawn area: the preset and the picture grow together, never
+        // past the screen (librashader uses the viewport as its scissor, and
+        // a scissor reaching outside draws nothing).
+        let [draw_scale_x, draw_scale_y] = self.display_scale;
         let (w, h) = (base.extent.width as f32, base.extent.height as f32);
-        let (wanted_w, wanted_h) = (w * scale_x, h * scale_y);
         let (screen_w, screen_h) = (extent.width as f32, extent.height as f32);
-        // As large as asked for, but never past the screen.
-        let (draw_w, draw_h) = (wanted_w.min(screen_w).max(1.0), wanted_h.min(screen_h).max(1.0));
+        let draw_w = (w * draw_scale_x).clamp(1.0, screen_w);
+        let draw_h = (h * draw_scale_y).clamp(1.0, screen_h);
         let centre = (base.offset.x as f32 + w / 2.0, base.offset.y as f32 + h / 2.0);
         let display = vk::Rect2D {
             offset: vk::Offset2D {
@@ -510,16 +521,22 @@ impl Source {
             extent: vk::Extent2D { width: draw_w.round() as u32, height: draw_h.round() as u32 },
         };
 
-        // Whatever the drawn area could not grow by is taken off the picture.
-        let (keep_x, keep_y) = (draw_w / wanted_w, draw_h / wanted_h);
+        // The picture inside that area: reading a smaller region makes it
+        // bigger on screen without the preset knowing. It still receives the
+        // same number of pixels and draws into the same area, so scanlines
+        // and mask keep their size.
+        let [zoom_x, zoom_y] = self.source_scale;
         let (pw, ph) = (picture.extent.width as f32, picture.extent.height as f32);
-        let (crop_w, crop_h) = ((pw * keep_x).max(1.0), (ph * keep_y).max(1.0));
+        let read_w = (pw / zoom_x.max(0.01)).clamp(1.0, screen_w);
+        let read_h = (ph / zoom_y.max(0.01)).clamp(1.0, screen_h);
+        let picture_centre =
+            (picture.offset.x as f32 + pw / 2.0, picture.offset.y as f32 + ph / 2.0);
         let picture = vk::Rect2D {
             offset: vk::Offset2D {
-                x: picture.offset.x + ((pw - crop_w) / 2.0).round() as i32,
-                y: picture.offset.y + ((ph - crop_h) / 2.0).round() as i32,
+                x: (picture_centre.0 - read_w / 2.0).clamp(0.0, screen_w - read_w).round() as i32,
+                y: (picture_centre.1 - read_h / 2.0).clamp(0.0, screen_h - read_h).round() as i32,
             },
-            extent: vk::Extent2D { width: crop_w.round() as u32, height: crop_h.round() as u32 },
+            extent: vk::Extent2D { width: read_w.round() as u32, height: read_h.round() as u32 },
         };
         (picture, display)
     }
@@ -612,28 +629,26 @@ mod tests {
         assert_eq!((display.offset.x, display.offset.y), (480 + 720, 540));
         assert_eq!(picture.extent, screen);
 
-        // Above 1: a 4:3 area on a 16:9 screen has room left sideways, so it
-        // widens first; only the height, already maxed out, crops the picture.
-        let zoom = Source {
+        // Above 1: the drawn area grows, never past the screen, and the
+        // picture is left alone. Enlarging the picture is the source scale's
+        // job, and the two must not be confused.
+        let bigger = Source {
             display: SourceRect::Aspect(4.0 / 3.0),
-            display_scale: [1.2, 1.2],
+            display_scale: [1.2, 2.0],
             ..Default::default()
         };
-        let (picture, display) = zoom.framing(screen);
+        let (picture, display) = bigger.framing(screen);
         assert_eq!(display.extent, vk::Extent2D { width: 3456, height: 2160 });
-        assert_eq!(picture.extent.width, 3840, "the sides must not be cropped");
-        assert_eq!(picture.extent.height, 1800);
+        assert_eq!(picture.extent, screen, "the drawn area moved, the picture did not");
 
-        // Far enough and the drawn area fills the screen, cropping vertically.
-        let full = Source {
-            display: SourceRect::Aspect(4.0 / 3.0),
-            display_scale: [2.0, 2.0],
-            ..Default::default()
-        };
-        let (picture, display) = full.framing(screen);
-        assert_eq!(display.offset, vk::Offset2D { x: 0, y: 0 });
+        // Source scale reads a smaller region, so the picture fills more of
+        // the same area: twice as tall means half the lines read. The preset
+        // still draws into the same area with the same number of pixels.
+        let taller = Source { source_scale: [1.0, 2.0], ..Default::default() };
+        let (picture, display) = taller.framing(screen);
         assert_eq!(display.extent, screen);
-        assert_eq!(picture.extent, vk::Extent2D { width: 2560, height: 1080 });
+        assert_eq!(picture.extent, vk::Extent2D { width: 3840, height: 1080 });
+        assert_eq!(picture.offset, vk::Offset2D { x: 0, y: 540 }, "centred");
 
         let src = Source { rect: SourceRect::Aspect(4.0 / 3.0), ..Default::default() };
         let r = src.picture_rect(vk::Extent2D { width: 3840, height: 2160 });
@@ -666,12 +681,20 @@ mod tests {
         assert_eq!(parse_scale("0"), None);
         assert_eq!(parse_scale("5,1"), None);
 
-        // Stretching only one axis: the other keeps the picture whole.
+        // Widening a drawn area that already fills the screen changes
+        // nothing, and never touches the picture.
         let wide = Source { display_scale: [1.5, 1.0], ..Default::default() };
         let screen = vk::Extent2D { width: 1000, height: 1000 };
         let (picture, display) = wide.framing(screen);
         assert_eq!(display.extent, screen, "already full width, cannot grow");
-        assert_eq!(picture.extent, vk::Extent2D { width: 667, height: 1000 });
+        assert_eq!(picture.extent, screen);
+
+        // Source scale on one axis only: the picture is read narrower and so
+        // appears wider, the drawn area is untouched.
+        let stretched = Source { source_scale: [2.0, 1.0], ..Default::default() };
+        let (picture, display) = stretched.framing(screen);
+        assert_eq!(display.extent, screen);
+        assert_eq!(picture.extent, vk::Extent2D { width: 500, height: 1000 });
     }
 
     #[test]

@@ -203,9 +203,15 @@ pub struct SourceSettings {
     pub display: String,
     /// Scales that region around its centre, horizontally and vertically:
     /// below 1 the drawn area shrinks, above 1 it grows to the edges of the
-    /// screen and the picture is cropped by whatever could not grow.
+    /// screen. It moves the preset and the picture together.
     #[serde(default = "no_scaling")]
     pub display_scale: [f32; 2],
+    /// Scales the picture *inside* that area, by reading a smaller region
+    /// (above 1) or a larger one (below 1). The preset is untouched: it still
+    /// receives the same number of pixels and draws into the same area, so
+    /// scanlines and mask keep their size while the picture grows.
+    #[serde(default = "no_scaling")]
+    pub source_scale: [f32; 2],
 }
 
 fn no_duplication() -> [u32; 2] {
@@ -229,6 +235,7 @@ impl Default for SourceSettings {
             rect: "full".into(),
             display: "full".into(),
             display_scale: [1.0, 1.0],
+            source_scale: [1.0, 1.0],
         }
     }
 }
