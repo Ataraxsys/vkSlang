@@ -72,7 +72,7 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | Variable / key | Example | Purpose |
 |---|---|---|
 | `ENABLE_VKSLANG` | `1` | Enables the implicit layer (`DISABLE_VKSLANG=1` forces it off). |
-| `VKSLANG_PRESET` / `preset` | `/…/crt-royale.slangp` | Preset to load. Without one, the layer passes everything through. |
+| `VKSLANG_PRESET` / `preset` | `/…/crt-royale.slangp` | Preset to load, or several separated by commas to chain them. Without one, the layer passes everything through. |
 | `VKSLANG_SOURCE_RES` / `source_res` | `320x240`, `/3`, `50%`, `native` | Logical source resolution: fixed, the picture divided by N, or untouched (see below). |
 | `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
 | `VKSLANG_SOURCE_RECT` / `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the swapchain image that holds the picture (for gamescope pillarboxing). |
@@ -174,7 +174,7 @@ vkslang-ui                                                           # in a sepa
 
 The external app (egui, OpenGL, so it never loads the layer itself) connects to the running process and lets you:
 
-- **switch presets** from a searchable browser of the `shaders_slang` folder (compiled in the background, then swapped in with no stutter);
+- **switch presets** from a searchable browser of the `shaders_slang` folder (compiled in the background, then swapped in with no stutter), or **tick several** to chain them: the passes of the second run on the output of the first, with the order adjustable before applying;
 - **adjust parameters** with sliders (min/max/step from `#pragma parameter`, declaration order, section headers, ↺ to restore the preset value);
 - change the **source resolution**, the **filter** and the **picture area** live;
 - turn the shader **on/off** (bypass);

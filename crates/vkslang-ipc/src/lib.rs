@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -22,8 +22,10 @@ pub enum Request {
     SetParam { name: String, value: f32 },
     /// Drop every parameter override, back to the preset's values.
     ResetParams,
-    /// Compile and switch to another preset (in the background).
-    LoadPreset { path: String },
+    /// Compile and switch to another chain (in the background). Several
+    /// presets are concatenated: the passes of the second run on the output
+    /// of the first, and so on.
+    LoadPresets { paths: Vec<String> },
     /// Bypass the filter chain without unloading it.
     SetEnabled { enabled: bool },
     SetSource { source: SourceSettings },
@@ -245,8 +247,8 @@ pub struct State {
     pub pid: u32,
     pub process: String,
     pub enabled: bool,
-    /// Preset currently running.
-    pub preset: Option<String>,
+    /// Presets currently running, in order.
+    pub presets: Vec<String>,
     /// A preset is being compiled.
     pub loading: bool,
     /// Last load error, if any.

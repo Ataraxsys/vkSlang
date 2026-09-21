@@ -129,6 +129,8 @@ struct App {
     tree: Tree,
     scanned_root: Option<String>,
     preset_filter: String,
+    /// Presets ticked in the browser, in the order they will run.
+    chain: Vec<PathBuf>,
 
     param_filter: String,
     /// Pixel grid assistant.
@@ -253,6 +255,7 @@ impl App {
             tree: Tree::default(),
             scanned_root: None,
             preset_filter: String::new(),
+            chain: Vec::new(),
             param_filter: String::new(),
             grid_open: false,
             grid_texture: None,
@@ -348,8 +351,13 @@ impl App {
                 if self.source.is_none() {
                     self.source = Some(SourceEdit::from(&state.source));
                 }
-                if self.save_path.is_empty() || self.state.as_ref().map(|s| &s.preset) != Some(&state.preset) {
-                    self.save_path = save::default_preset_path(state.preset.as_deref()).display().to_string();
+                if self.save_path.is_empty()
+                    || self.state.as_ref().map(|s| &s.presets) != Some(&state.presets)
+                {
+                    self.save_path =
+                        save::default_preset_path(state.presets.first().map(String::as_str))
+                            .display()
+                            .to_string();
                 }
                 self.state = Some(state);
             }
@@ -467,19 +475,62 @@ impl App {
         let words: Vec<String> = self.preset_filter.to_lowercase().split_whitespace().map(String::from).collect();
         ui.weak(format!("{} presets", self.tree.count()));
 
-        let running = self.state.as_ref().and_then(|s| s.preset.clone());
+        let running: Vec<String> = self.state.as_ref().map(|s| s.presets.clone()).unwrap_or_default();
         let root = PathBuf::from(&self.shader_root);
         let mut clicked = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            draw_tree(ui, &self.tree, &words, &root, running.as_deref(), &mut clicked);
-        });
+        let mut chain = std::mem::take(&mut self.chain);
+        let mut apply_chain = false;
 
-        if let Some(path) = clicked {
-            if self.client.is_some() {
-                self.send(Request::LoadPreset { path: path.display().to_string() });
-            } else {
-                self.error("no process connected");
+        if !chain.is_empty() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.strong(format!("Chain ({})", chain.len()));
+                apply_chain = ui.button("Apply").clicked();
+                if ui.button("Clear").clicked() {
+                    chain.clear();
+                }
+            });
+            let mut swap = None;
+            let mut remove = None;
+            for (i, path) in chain.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    ui.weak(format!("{}.", i + 1));
+                    if ui.small_button("↑").clicked() && i > 0 {
+                        swap = Some((i - 1, i));
+                    }
+                    if ui.small_button("↓").clicked() {
+                        swap = Some((i, i + 1));
+                    }
+                    if ui.small_button("✕").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.label(name).on_hover_text(path.display().to_string());
+                });
             }
+            if let Some((a, b)) = swap.filter(|(_, b)| *b < chain.len()) {
+                chain.swap(a, b);
+            }
+            if let Some(i) = remove {
+                chain.remove(i);
+            }
+            ui.separator();
+        }
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            draw_tree(ui, &self.tree, &words, &root, &running, &mut clicked, &mut chain);
+        });
+        self.chain = chain;
+
+        if self.client.is_none() && (clicked.is_some() || apply_chain) {
+            self.error("no process connected");
+        } else if let Some(path) = clicked {
+            // A plain click runs that preset on its own.
+            self.chain.clear();
+            self.send(Request::LoadPresets { paths: vec![path.display().to_string()] });
+        } else if apply_chain {
+            let paths = self.chain.iter().map(|p| p.display().to_string()).collect();
+            self.send(Request::LoadPresets { paths });
         }
     }
 
@@ -765,7 +816,16 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Preset");
             ui.add(egui::TextEdit::singleline(&mut self.save_path).desired_width((ui.available_width() - 260.0).max(120.0)));
-            if ui.button("Save .slangp").on_hover_text("#reference + changed parameters (RetroArch compatible)").clicked() {
+            let single = state.presets.len() == 1;
+            if ui
+                .add_enabled(single, egui::Button::new("Save .slangp"))
+                .on_hover_text(if single {
+                    "#reference + changed parameters (RetroArch compatible)"
+                } else {
+                    "A .slangp references a single preset; use \"Save as default\" for a chain"
+                })
+                .clicked()
+            {
                 let path = PathBuf::from(&self.save_path);
                 match save::save_slangp(&state, &path) {
                     Ok(()) => self.info(format!("saved {}", path.display())),
@@ -784,13 +844,15 @@ impl App {
 
 /// Draws one level of the tree; folders are collapsed unless a search is
 /// running, in which case only matching branches are shown, opened.
+#[allow(clippy::too_many_arguments)]
 fn draw_tree(
     ui: &mut egui::Ui,
     tree: &Tree,
     words: &[String],
     root: &Path,
-    running: Option<&str>,
+    running: &[String],
     clicked: &mut Option<PathBuf>,
+    chain: &mut Vec<PathBuf>,
 ) {
     let searching = !words.is_empty();
     for (name, folder) in &tree.folders {
@@ -801,7 +863,7 @@ fn draw_tree(
             .id_salt(name)
             .default_open(searching)
             .open(searching.then_some(true))
-            .show(ui, |ui| draw_tree(ui, folder, words, root, running, clicked));
+            .show(ui, |ui| draw_tree(ui, folder, words, root, running, clicked, chain));
     }
     for (name, rel) in &tree.presets {
         if searching {
@@ -811,10 +873,21 @@ fn draw_tree(
             }
         }
         let abs = root.join(rel);
-        let is_running = running == Some(abs.to_string_lossy().as_ref());
-        if ui.selectable_label(is_running, name.as_str()).clicked() {
-            *clicked = Some(abs);
-        }
+        let is_running = running.iter().any(|p| p == abs.to_string_lossy().as_ref());
+        ui.horizontal(|ui| {
+            // Ticking several presets chains them, in ticking order.
+            let mut ticked = chain.contains(&abs);
+            if ui.checkbox(&mut ticked, "").on_hover_text("Add to the chain").changed() {
+                if ticked {
+                    chain.push(abs.clone());
+                } else {
+                    chain.retain(|p| p != &abs);
+                }
+            }
+            if ui.selectable_label(is_running, name.as_str()).clicked() {
+                *clicked = Some(abs.clone());
+            }
+        });
     }
 }
 
@@ -1065,8 +1138,9 @@ impl eframe::App for App {
                 ui.weak(format!("Sockets: {}", vkslang_ipc::socket_dir().display()));
                 return;
             }
-            if let Some(preset) = self.state.as_ref().and_then(|s| s.preset.clone()) {
-                ui.label(egui::RichText::new(preset).monospace());
+            let running: Vec<String> = self.state.as_ref().map(|s| s.presets.clone()).unwrap_or_default();
+            if !running.is_empty() {
+                ui.label(egui::RichText::new(running.join("  +  ")).monospace());
             }
             self.source_panel(ui);
             ui.separator();
