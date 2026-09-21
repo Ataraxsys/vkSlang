@@ -37,8 +37,10 @@ fn changed_params(state: &State) -> impl Iterator<Item = (&str, f32)> {
         .map(|p| (p.name.as_str(), p.value))
 }
 
+/// Only a single preset can be written as a `.slangp`: the format references
+/// one preset, not a chain.
 pub fn slangp_text(state: &State) -> Option<String> {
-    let preset = state.preset.as_ref()?;
+    let [preset] = state.presets.as_slice() else { return None };
     let mut text = format!("#reference \"{preset}\"\n");
     for (name, value) in changed_params(state) {
         text.push_str(&format!("{name} = \"{value}\"\n"));
@@ -90,8 +92,8 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
         out.push(String::new());
     }
     out.push("# --- written by vkslang-ui ---".into());
-    if let Some(preset) = &state.preset {
-        out.push(format!("preset = {preset}"));
+    if !state.presets.is_empty() {
+        out.push(format!("preset = {}", state.presets.join(", ")));
     }
     let src = &state.source;
     out.push(format!("source_res = {}", src.res.to_config()));
@@ -145,7 +147,7 @@ mod tests {
             value,
         };
         State {
-            preset: Some("/s/crt.slangp".into()),
+            presets: vec!["/s/crt.slangp".into()],
             source: SourceSettings {
                 res: vkslang_ipc::SourceSize::Fixed { size: [320, 240] },
                 filter: Filter::Nearest,

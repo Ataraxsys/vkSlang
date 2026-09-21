@@ -136,7 +136,7 @@ pub unsafe extern "system" fn create_device(
     };
 
     let cfg = config::get();
-    let wanted = cfg.preset.is_some() && cfg.active_for_process();
+    let wanted = !cfg.preset.is_empty() && cfg.active_for_process();
 
     // The layer renders on a graphics-capable queue the app asked for.
     let families = inst.fns.get_physical_device_queue_family_properties(physical_device);
