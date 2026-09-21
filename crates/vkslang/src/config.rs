@@ -466,7 +466,8 @@ impl Source {
         }
     }
 
-    fn base_size_for(&self, picture: vk::Extent2D) -> vk::Extent2D {
+    /// Size before duplication: what is actually read from the picture.
+    pub fn base_size_for(&self, picture: vk::Extent2D) -> vk::Extent2D {
         match self.res {
             vkslang_ipc::SourceSize::Native => picture,
             vkslang_ipc::SourceSize::Divide { by } => vk::Extent2D {
