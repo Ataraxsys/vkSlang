@@ -285,9 +285,19 @@ impl App {
             frame_mode: false,
             source: None,
             save_path: String::new(),
-            profiles: profile::list(),
+            profiles: profile::read_dir(&profile::dir()).0,
             profile_name: String::new(),
             pending_params: None,
+        }
+    }
+
+    /// Reloads the profiles, reporting any file that could not be read
+    /// rather than leaving the user wondering where a profile went.
+    fn reload_profiles(&mut self) {
+        let (profiles, failures) = profile::read_dir(&profile::dir());
+        self.profiles = profiles;
+        if !failures.is_empty() {
+            self.error(format!("unreadable profile(s): {}", failures.join("; ")));
         }
     }
 
@@ -899,13 +909,13 @@ impl App {
                 match profile::save(&p) {
                     Ok(path) => {
                         self.info(format!("saved {}", path.display()));
-                        self.profiles = profile::list();
+                        self.reload_profiles();
                     }
                     Err(e) => self.error(format!("save failed: {e}")),
                 }
             }
             if ui.button("⟳").on_hover_text("Rescan profiles").clicked() {
-                self.profiles = profile::list();
+                self.reload_profiles();
             }
         });
 
@@ -963,7 +973,7 @@ impl App {
             match profile::delete(&p) {
                 Ok(()) => {
                     self.info(format!("deleted {}", p.name));
-                    self.profiles = profile::list();
+                    self.reload_profiles();
                 }
                 Err(e) => self.error(format!("delete failed: {e}")),
             }
