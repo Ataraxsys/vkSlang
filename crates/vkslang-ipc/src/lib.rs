@@ -179,25 +179,45 @@ impl SourceSize {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+/// Every field defaults, so a profile saved by an older version keeps
+/// loading when a setting is added here.
 pub struct SourceSettings {
     /// Logical source resolution.
+    #[serde(default)]
     pub res: SourceSize,
     /// Each source pixel repeated this many times, horizontally and
     /// vertically, after `res` is worked out. DOS modes are the reason: at
     /// 320x200 the pixels are taller than wide, and doubling the lines gives
     /// the preset 400 real lines to work with instead of stretching 200.
+    #[serde(default = "no_duplication")]
     pub duplicate: [u32; 2],
+    #[serde(default)]
     pub filter: Filter,
     /// Region read from the swapchain: `full`, `4:3`, or `X,Y,WxH`.
+    #[serde(default = "whole_image")]
     pub rect: String,
     /// Region the preset draws into, same syntax. Different from `rect` it
     /// stretches the picture: a 640x360 source drawn into a 4:3 area gives
     /// the old "non-square pixels" look, scanlines stretched along with it.
+    #[serde(default = "whole_image")]
     pub display: String,
     /// Scales that region around its centre, horizontally and vertically:
     /// below 1 the drawn area shrinks, above 1 it grows to the edges of the
     /// screen and the picture is cropped by whatever could not grow.
+    #[serde(default = "no_scaling")]
     pub display_scale: [f32; 2],
+}
+
+fn no_duplication() -> [u32; 2] {
+    [1, 1]
+}
+
+fn whole_image() -> String {
+    "full".into()
+}
+
+fn no_scaling() -> [f32; 2] {
+    [1.0, 1.0]
 }
 
 impl Default for SourceSettings {
@@ -303,15 +323,27 @@ pub mod profile {
     /// UI can change. Kept here rather than in the UI because the layer loads
     /// them too, to apply a default profile per process.
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    /// Everything but the name defaults, so a profile saved by an older
+    /// version still loads once a setting is added.
     pub struct Profile {
         pub name: String,
+        #[serde(default)]
         pub presets: Vec<String>,
+        #[serde(default)]
         pub source: SourceSettings,
+        #[serde(default)]
         pub hdr: HdrSettings,
+        #[serde(default = "one_presentation")]
         pub subframes: u32,
+        #[serde(default)]
         pub subframe_black: bool,
         /// Only the parameters that differ from the preset's own values.
+        #[serde(default)]
         pub params: BTreeMap<String, f32>,
+    }
+
+    fn one_presentation() -> u32 {
+        1
     }
 
     impl Profile {
@@ -386,15 +418,28 @@ pub mod profile {
     }
 
     pub fn list_in(dir: &Path) -> Vec<Profile> {
-        let mut profiles: Vec<Profile> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .filter_map(|e| load(&e.path()).ok())
-            .collect();
+        read_dir(dir).0
+    }
+
+    /// Profiles in `dir`, and the files that could not be read.
+    ///
+    /// Failures are returned rather than dropped: a profile silently missing
+    /// from the list is impossible to make sense of.
+    pub fn read_dir(dir: &Path) -> (Vec<Profile>, Vec<String>) {
+        let (mut profiles, mut failures) = (Vec::new(), Vec::new());
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "json") {
+                continue;
+            }
+            match load(&path) {
+                Ok(profile) => profiles.push(profile),
+                Err(e) => failures.push(format!("{}: {e}", path.display())),
+            }
+        }
         profiles.sort_by_key(|p| p.name.to_lowercase());
-        profiles
+        failures.sort();
+        (profiles, failures)
     }
 }
 

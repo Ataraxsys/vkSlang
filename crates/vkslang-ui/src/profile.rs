@@ -34,6 +34,38 @@ mod tests {
         }
     }
 
+    /// A profile saved before a setting existed must keep loading: the UI
+    /// dropped such files silently, and they looked lost.
+    #[test]
+    fn a_profile_without_the_newer_fields_still_loads() {
+        let dir = std::env::temp_dir().join(format!("vkslang-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = r#"{
+            "name": "IBM PC LCD",
+            "presets": ["/a.slangp", "/b.slangp"],
+            "source": {
+                "res": {"mode": "fixed", "size": [640, 360]},
+                "filter": "nearest",
+                "rect": "16:9",
+                "display": "full",
+                "display_scale": [1.0, 1.0]
+            },
+            "hdr": {"brightness_nits": 200.0, "expand_gamut": 0},
+            "subframes": 1,
+            "subframe_black": false,
+            "params": {"LUT_Size1": 40.0}
+        }"#;
+        std::fs::write(dir.join("IBM PC LCD.json"), older).unwrap();
+
+        let (profiles, failures) = read_dir(&dir);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "IBM PC LCD");
+        assert_eq!(profiles[0].source.duplicate, [1, 1], "missing settings take their default");
+        assert_eq!(profiles[0].params["LUT_Size1"], 40.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn saved_then_listed_and_deleted() {
         let dir = std::env::temp_dir().join(format!("vkslang-profiles-{}", std::process::id()));
