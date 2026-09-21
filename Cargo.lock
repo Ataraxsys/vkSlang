@@ -3062,6 +3062,8 @@ name = "vkslang-ui"
 version = "0.2.0"
 dependencies = [
  "eframe",
+ "serde",
+ "serde_json",
  "vkslang-ipc",
 ]
 

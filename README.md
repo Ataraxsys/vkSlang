@@ -178,7 +178,8 @@ The external app (egui, OpenGL, so it never loads the layer itself) connects to 
 - **adjust parameters** with sliders (min/max/step from `#pragma parameter`, declaration order, section headers, ↺ to restore the preset value);
 - change the **source resolution**, the **filter** and the **picture area** live;
 - turn the shader **on/off** (bypass);
-- **save**: a RetroArch-compatible `.slangp` (`#reference` + modified parameters) or **as default** in `vkSlang.conf`, leaving your other lines untouched.
+- **save a profile**: a named look kept in `~/.config/vkSlang/profiles/<name>.json`, holding the preset chain, the parameters you changed, the source resolution, the picture and display areas with their scale, the HDR uniforms and the subframes. One click puts it back on a running game, parameters included (they are applied once the chain has finished compiling).
+- **save** also to a RetroArch-compatible `.slangp` (`#reference` + modified parameters, single preset only) or **as default** in `vkSlang.conf`, leaving your other lines untouched.
 
 ### Protocol
 

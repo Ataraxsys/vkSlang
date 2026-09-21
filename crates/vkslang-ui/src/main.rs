@@ -4,6 +4,7 @@
 //! gamescope), and lets you switch presets, tweak parameters and the source
 //! resolution while it runs, then save the result.
 
+mod profile;
 mod save;
 
 use eframe::egui;
@@ -151,6 +152,11 @@ struct App {
     frame_mode: bool,
     source: Option<SourceEdit>,
     save_path: String,
+    /// Named profiles, and the parameters waiting for a chain to finish
+    /// compiling before they can be applied.
+    profiles: Vec<profile::Profile>,
+    profile_name: String,
+    pending_params: Option<std::collections::BTreeMap<String, f32>>,
 }
 
 fn default_shader_root() -> String {
@@ -268,6 +274,9 @@ impl App {
             frame_mode: false,
             source: None,
             save_path: String::new(),
+            profiles: profile::list(),
+            profile_name: String::new(),
+            pending_params: None,
         }
     }
 
@@ -377,6 +386,23 @@ impl App {
         }
     }
 
+    /// Applies a saved profile: the chain first, its parameters once it has
+    /// finished compiling (the layer drops the overrides when it loads).
+    fn apply_profile(&mut self, p: &profile::Profile) {
+        if self.client.is_none() {
+            self.error("no process connected");
+            return;
+        }
+        self.chain = p.presets.iter().map(PathBuf::from).collect();
+        self.send(Request::LoadPresets { paths: p.presets.clone() });
+        self.send(Request::SetSource { source: p.source.clone() });
+        self.send(Request::SetHdr { hdr: p.hdr });
+        self.send(Request::SetSubframes { subframes: p.subframes, black: p.subframe_black });
+        self.source = Some(SourceEdit::from(&p.source));
+        self.pending_params = Some(p.params.clone());
+        self.info(format!("profile \"{}\" applied", p.name));
+    }
+
     fn tick(&mut self) {
         if self.last_scan.elapsed() >= SCAN {
             self.last_scan = Instant::now();
@@ -385,6 +411,14 @@ impl App {
         if self.client.is_some() && self.last_poll.elapsed() >= POLL {
             self.last_poll = Instant::now();
             self.send(Request::GetState);
+        }
+        // The chain has finished compiling: the profile's parameters can go.
+        if self.state.as_ref().is_some_and(|s| !s.loading && !s.params.is_empty()) {
+            if let Some(params) = self.pending_params.take() {
+                for (name, value) in params {
+                    self.send(Request::SetParam { name, value });
+                }
+            }
         }
         if self.scanned_root.as_deref() != Some(self.shader_root.as_str()) {
             self.presets = scan_presets(Path::new(&self.shader_root));
@@ -810,6 +844,77 @@ impl App {
         }
     }
 
+    fn profile_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(state) = self.state.clone() else { return };
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Profile");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.profile_name)
+                    .hint_text("name")
+                    .desired_width(160.0),
+            );
+            let named = !self.profile_name.trim().is_empty();
+            if ui
+                .add_enabled(named, egui::Button::new("Save"))
+                .on_hover_text("Presets, parameters, resolution, areas, HDR and subframes")
+                .clicked()
+            {
+                let p = profile::Profile::from_state(&self.profile_name, &state);
+                match profile::save(&p) {
+                    Ok(path) => {
+                        self.info(format!("saved {}", path.display()));
+                        self.profiles = profile::list();
+                    }
+                    Err(e) => self.error(format!("save failed: {e}")),
+                }
+            }
+            if ui.button("⟳").on_hover_text("Rescan profiles").clicked() {
+                self.profiles = profile::list();
+            }
+        });
+
+        let profiles = self.profiles.clone();
+        let mut apply = None;
+        let mut delete = None;
+        ui.horizontal_wrapped(|ui| {
+            if profiles.is_empty() {
+                ui.weak("No profile saved yet.");
+            }
+            for p in &profiles {
+                let running = state.presets == p.presets;
+                if ui
+                    .selectable_label(running, &p.name)
+                    .on_hover_text(format!(
+                        "{} preset(s), {} parameter(s)",
+                        p.presets.len(),
+                        p.params.len()
+                    ))
+                    .clicked()
+                {
+                    apply = Some(p.clone());
+                }
+                if ui.small_button("✕").on_hover_text(format!("Delete {}", p.name)).clicked() {
+                    delete = Some(p.clone());
+                }
+                ui.separator();
+            }
+        });
+        if let Some(p) = apply {
+            self.profile_name = p.name.clone();
+            self.apply_profile(&p);
+        }
+        if let Some(p) = delete {
+            match profile::delete(&p) {
+                Ok(()) => {
+                    self.info(format!("deleted {}", p.name));
+                    self.profiles = profile::list();
+                }
+                Err(e) => self.error(format!("delete failed: {e}")),
+            }
+        }
+    }
+
     fn save_panel(&mut self, ui: &mut egui::Ui) {
         let Some(state) = self.state.clone() else { return };
         ui.separator();
@@ -1149,6 +1254,7 @@ impl eframe::App for App {
             self.presentation_panel(ui);
             ui.separator();
             self.params_panel(ui);
+            self.profile_panel(ui);
             self.save_panel(ui);
         });
         self.pixel_grid_window(ui.ctx());
