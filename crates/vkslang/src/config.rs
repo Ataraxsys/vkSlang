@@ -185,6 +185,30 @@ fn parse_hdr(kv: &HashMap<String, String>) -> vkslang_ipc::HdrSettings {
     })
 }
 
+/// Profile to start with: `profile.<executable>` first, then `profile`.
+///
+/// It gives the defaults; anything spelled out in the file or in the
+/// environment still wins, so a profile can be tried without editing it.
+fn profile_for(kv: &HashMap<String, String>) -> Option<vkslang_ipc::profile::Profile> {
+    let exe = exe_name().to_lowercase();
+    let name = kv
+        .iter()
+        .find(|(k, _)| k.strip_prefix("profile.").is_some_and(|p| p.to_lowercase() == exe))
+        .map(|(_, v)| v.clone())
+        .or_else(|| kv.get("profile").cloned())?;
+    let path = vkslang_ipc::profile::dir().join(vkslang_ipc::profile::file_name(&name));
+    match vkslang_ipc::profile::load(&resolve_path(&path)) {
+        Ok(profile) => {
+            crate::log_info!("profile '{}' for {exe}", profile.name);
+            Some(profile)
+        }
+        Err(e) => {
+            crate::log_warn!("cannot read the profile '{name}': {e}");
+            None
+        }
+    }
+}
+
 impl Config {
     fn load() -> Config {
         let mut kv = config_path()
@@ -206,6 +230,9 @@ impl Config {
             }
         }
 
+        let profile = profile_for(&kv);
+        let from_profile = |key: &str| profile.is_some() && !kv.contains_key(key);
+
         let source_res = kv
             .get("source_res")
             .map(|spec| {
@@ -218,7 +245,11 @@ impl Config {
 
         let filter = match kv.get("source_filter").map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("linear") => vk::Filter::LINEAR,
-            _ => vk::Filter::NEAREST,
+            Some(_) => vk::Filter::NEAREST,
+            None => match profile.as_ref().map(|p| p.source.filter) {
+                Some(vkslang_ipc::Filter::Linear) => vk::Filter::LINEAR,
+                _ => vk::Filter::NEAREST,
+            },
         };
 
         let (display, display_spec) = match kv.get("display_rect") {
@@ -229,7 +260,10 @@ impl Config {
                     (SourceRect::Full, "full".into())
                 }
             },
-            None => (SourceRect::Full, "full".into()),
+            None => match &profile {
+                Some(p) => (parse_rect(&p.source.display).unwrap_or(SourceRect::Full), p.source.display.clone()),
+                None => (SourceRect::Full, "full".into()),
+            },
         };
 
         let (rect, rect_spec) = match kv.get("source_rect") {
@@ -240,7 +274,10 @@ impl Config {
                     (SourceRect::Full, "full".into())
                 }
             },
-            None => (SourceRect::Full, "full".into()),
+            None => match &profile {
+                Some(p) => (parse_rect(&p.source.rect).unwrap_or(SourceRect::Full), p.source.rect.clone()),
+                None => (SourceRect::Full, "full".into()),
+            },
         };
 
         let process = kv
@@ -248,20 +285,35 @@ impl Config {
             .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
             .unwrap_or_default();
 
-        let params = kv
+        let mut params: Vec<(String, f32)> = profile
+            .as_ref()
+            .map(|p| p.params.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
+        // Parameters spelled out in the file or the environment win.
+        for (name, value) in kv
             .iter()
-            .filter_map(|(k, v)| Some((k.strip_prefix("param.")?.to_string(), v.parse().ok()?)))
-            .collect();
+            .filter_map(|(k, v)| Some((k.strip_prefix("param.")?.to_string(), v.parse::<f32>().ok()?)))
+        {
+            match params.iter_mut().find(|(n, _)| *n == name) {
+                Some(entry) => entry.1 = value,
+                None => params.push((name, value)),
+            }
+        }
 
         Config {
-            preset: kv
-                .get("preset")
-                .map(|v| {
+            preset: match (&profile, kv.get("preset")) {
+                (_, Some(v)) => {
                     v.split(',').map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect()
-                })
-                .unwrap_or_default(),
+                }
+                (Some(p), None) => p.presets.iter().map(PathBuf::from).collect(),
+                (None, None) => Vec::new(),
+            },
             source: Source {
-                res: source_res,
+                res: if from_profile("source_res") {
+                    profile.as_ref().map_or(source_res, |p| p.source.res)
+                } else {
+                    source_res
+                },
                 filter,
                 rect,
                 rect_spec,
@@ -270,16 +322,27 @@ impl Config {
                 display_scale: kv
                     .get("display_scale")
                     .and_then(|v| parse_scale(v))
+                    .or_else(|| profile.as_ref().map(|p| p.source.display_scale))
                     .unwrap_or([1.0, 1.0]),
             },
             process,
             params,
             ipc: kv.get("ipc").is_none_or(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
-            hdr: parse_hdr(&kv),
-            subframes: kv.get("subframes").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 8),
-            subframe_black: kv
-                .get("subframe_mode")
-                .is_some_and(|v| v.eq_ignore_ascii_case("black") || v.eq_ignore_ascii_case("bfi")),
+            hdr: if from_profile("brightness_nits") && from_profile("expand_gamut") {
+                profile.as_ref().map_or_else(|| parse_hdr(&kv), |p| p.hdr)
+            } else {
+                parse_hdr(&kv)
+            },
+            subframes: kv
+                .get("subframes")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| profile.as_ref().map(|p| p.subframes))
+                .unwrap_or(1)
+                .clamp(1, 8),
+            subframe_black: match kv.get("subframe_mode") {
+                Some(v) => v.eq_ignore_ascii_case("black") || v.eq_ignore_ascii_case("bfi"),
+                None => profile.as_ref().is_some_and(|p| p.subframe_black),
+            },
             hdr_output: match kv.get("hdr_output").map(|v| v.to_ascii_lowercase()).as_deref() {
                 Some("off") | Some("0") | Some("false") => HdrOutput::Off,
                 Some("force") | Some("1") | Some("true") => HdrOutput::Force,

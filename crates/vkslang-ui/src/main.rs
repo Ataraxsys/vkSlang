@@ -875,8 +875,10 @@ impl App {
         });
 
         let profiles = self.profiles.clone();
+        let default_profile = save::default_profile_for(&state.process);
         let mut apply = None;
         let mut delete = None;
+        let mut set_default: Option<Option<profile::Profile>> = None;
         ui.horizontal_wrapped(|ui| {
             if profiles.is_empty() {
                 ui.weak("No profile saved yet.");
@@ -894,6 +896,14 @@ impl App {
                 {
                     apply = Some(p.clone());
                 }
+                let is_default = default_profile == Some(p.name.clone());
+                if ui
+                    .small_button(if is_default { "★" } else { "☆" })
+                    .on_hover_text(format!("Load {} automatically for {}", p.name, state.process))
+                    .clicked()
+                {
+                    set_default = Some(if is_default { None } else { Some(p.clone()) });
+                }
                 if ui.small_button("✕").on_hover_text(format!("Delete {}", p.name)).clicked() {
                     delete = Some(p.clone());
                 }
@@ -903,6 +913,16 @@ impl App {
         if let Some(p) = apply {
             self.profile_name = p.name.clone();
             self.apply_profile(&p);
+        }
+        if let Some(choice) = set_default {
+            let name = choice.as_ref().map(|p| p.name.clone());
+            match save::set_default_profile(&state.process, name.as_deref()) {
+                Ok(()) => self.info(match &name {
+                    Some(n) => format!("{n} will load automatically for {}", state.process),
+                    None => format!("no profile loads automatically for {} any more", state.process),
+                }),
+                Err(e) => self.error(format!("could not update vkSlang.conf: {e}")),
+            }
         }
         if let Some(p) = delete {
             match profile::delete(&p) {
