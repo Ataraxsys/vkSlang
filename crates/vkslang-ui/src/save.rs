@@ -112,6 +112,7 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
                 | "source_rect"
                 | "display_rect"
                 | "display_scale"
+                | "source_scale"
                 | "brightness_nits"
                 | "expand_gamut"
                 | "subframes"
@@ -153,12 +154,13 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
     ));
     out.push(format!("source_rect = {}", src.rect));
     out.push(format!("display_rect = {}", src.display));
-    let [sx, sy] = src.display_scale;
-    out.push(if (sx - sy).abs() < 0.001 {
-        format!("display_scale = {sx}")
-    } else {
-        format!("display_scale = {sx},{sy}")
-    });
+    for (key, [x, y]) in [("display_scale", src.display_scale), ("source_scale", src.source_scale)] {
+        out.push(if (x - y).abs() < 0.001 {
+            format!("{key} = {x}")
+        } else {
+            format!("{key} = {x},{y}")
+        });
+    }
     out.push(format!("brightness_nits = {}", state.hdr.brightness_nits));
     out.push(format!("expand_gamut = {}", state.hdr.expand_gamut));
     // 0 only happens with a default-constructed state; 1 is "untouched".
@@ -205,6 +207,7 @@ mod tests {
                 rect: "4:3".into(),
                 display: "full".into(),
                 display_scale: [1.0, 1.0],
+                source_scale: [1.0, 1.0],
             },
             params: vec![
                 p("HEADER", 0.0, 0.0, 0.0, 0.0),

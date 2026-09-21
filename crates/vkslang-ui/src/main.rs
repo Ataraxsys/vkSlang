@@ -82,6 +82,10 @@ struct SourceEdit {
     scale_locked: bool,
     /// That ratio, vertical over horizontal.
     scale_ratio: f32,
+    /// Same, for the picture inside the drawn area.
+    source_scale: [f32; 2],
+    source_locked: bool,
+    source_ratio: f32,
 }
 
 impl SourceEdit {
@@ -96,6 +100,13 @@ impl SourceEdit {
             rect: s.rect.clone(),
             display: s.display.clone(),
             display_scale: s.display_scale,
+            source_scale: s.source_scale,
+            source_locked: true,
+            source_ratio: if s.source_scale[0] > 0.0 {
+                s.source_scale[1] / s.source_scale[0]
+            } else {
+                1.0
+            },
             scale_locked: true,
             scale_ratio: if s.display_scale[0] > 0.0 {
                 s.display_scale[1] / s.display_scale[0]
@@ -119,6 +130,7 @@ impl SourceEdit {
             rect: self.rect.trim().to_string(),
             display: self.display.trim().to_string(),
             display_scale: self.display_scale,
+            source_scale: self.source_scale,
         }
     }
 }
@@ -654,6 +666,55 @@ impl App {
             }
         });
         ui.horizontal_wrapped(|ui| {
+            ui.label("Picture scale").on_hover_text(
+                "Size of the picture inside that area: a smaller region is read, so the picture grows \
+                 while the preset keeps the same scanlines and mask (×2 vertically, for instance)",
+            );
+            let mut moved: Option<usize> = None;
+            for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
+                if ui
+                    .add(
+                        egui::Slider::new(&mut edit.source_scale[axis], 0.25..=4.0)
+                            .step_by(0.01)
+                            .fixed_decimals(2)
+                            .text(label),
+                    )
+                    .changed()
+                {
+                    moved = Some(axis);
+                }
+            }
+            if let Some(axis) = moved {
+                if edit.source_locked {
+                    let ratio = edit.source_ratio.max(0.01);
+                    let other = if axis == 0 {
+                        edit.source_scale[0] * ratio
+                    } else {
+                        edit.source_scale[1] / ratio
+                    };
+                    edit.source_scale[1 - axis] = other.clamp(0.25, 4.0);
+                }
+                changed = true;
+            }
+            if ui
+                .checkbox(&mut edit.source_locked, "lock")
+                .on_hover_text("Keep the current ratio between the two axes")
+                .changed()
+                && edit.source_locked
+            {
+                edit.source_ratio = if edit.source_scale[0] > 0.0 {
+                    edit.source_scale[1] / edit.source_scale[0]
+                } else {
+                    1.0
+                };
+            }
+            if ui.small_button("1:1").clicked() {
+                edit.source_scale = [1.0, 1.0];
+                edit.source_ratio = 1.0;
+                changed = true;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
             ui.label("Duplicate pixels")
                 .on_hover_text("Repeat each source pixel, for modes whose pixels are not square (DOS 320×200: ↕ 2 gives the preset 400 real lines)");
             for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
@@ -692,7 +753,12 @@ impl App {
                 }
             }
             ui.separator();
-            ui.label("Scale");
+            // Two different things, kept apart on purpose: one moves the
+            // drawn area (preset and picture together), the other moves the
+            // picture inside it (the preset keeps its geometry).
+            ui.label("Area scale").on_hover_text(
+                "Size of the area the preset draws into: it carries the preset and the picture together",
+            );
             let mut moved: Option<usize> = None;
             for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
                 if ui
@@ -701,10 +767,6 @@ impl App {
                             .step_by(0.01)
                             .fixed_decimals(2)
                             .text(label),
-                    )
-                    .on_hover_text(
-                        "Below 1 the drawn area shrinks; above 1 it grows to the edges of the \
-                         screen first, then crops the picture on the axis that cannot grow",
                     )
                     .changed()
                 {

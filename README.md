@@ -79,7 +79,8 @@ Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkS
 | `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
 | `VKSLANG_SOURCE_RECT` / `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the swapchain image that holds the picture (for gamescope pillarboxing). |
 | `VKSLANG_DISPLAY_RECT` / `display_rect` | `full`, `4:3`, `5:4` | Region the preset draws into; stretches the picture when it differs from `source_rect`. |
-| `VKSLANG_DISPLAY_SCALE` / `display_scale` | `1.2`, `1.2,1.0` | Scales the drawn area, both axes or each one; below 1 shrinks it, above 1 grows it to the screen then crops what cannot grow. |
+| `VKSLANG_DISPLAY_SCALE` / `display_scale` | `1.2`, `1.2,1.0` | Scales the area the preset draws into, carrying the preset and the picture together (never past the screen). |
+| `VKSLANG_SOURCE_SCALE` / `source_scale` | `1.2`, `1,2` | Scales the picture inside that area by reading a smaller region; the preset keeps its scanlines and mask. |
 | `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
 | `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
 | `VKSLANG_LOG` | `debug` | Log level. |
@@ -119,7 +120,9 @@ Old PC and console modes are displayed stretched: 640×360 or 320×200 in memory
 - `source_rect` says what to **read**, and `source_res` the size of the input, so the grid stays aligned on the real pixels (640×360).
 - `pixel_duplicate` repeats each source pixel. A DOS 320×200 mode with `1,2` hands the preset 400 real lines rather than 200 stretched ones, which keeps scanlines and masks working on actual lines. The picture is first reduced to the real pixel grid, then copied into the source image with a nearest blit between exact multiples, so every pixel really is duplicated rather than resampled.
 - `display_rect` says where the preset **draws**. Set to `4:3`, the picture is stretched into that area, **and the shader is stretched with it**: scanlines and mask follow the display geometry, exactly like a CRT fed a 200-line signal.
-- `display_scale` resizes the result, per axis in the UI with a lock that keeps the ratio the two axes currently have. Below 1 the drawn area shrinks. Above 1 it grows until it reaches the edges of the screen, and only then is the picture cropped, on the axis that could not grow: a 4:3 area on a 16:9 screen widens first and loses its top and bottom, never its sides. It never overflows the screen, because librashader uses the viewport as its scissor and a scissor reaching outside draws nothing.
+- Two scales, deliberately separate:
+  - **`display_scale`** resizes the drawn area, so the preset and the picture grow **together**. It never overflows the screen, because librashader uses the viewport as its scissor and a scissor reaching outside draws nothing.
+  - **`source_scale`** resizes the picture **inside** that area, by reading a smaller region. The preset is untouched: same number of pixels in, same area out, so scanlines and mask keep their size. `1,2` makes the picture twice as tall without changing the preset's geometry, which is what an old DOS mode needs.
 
 ### Pixel grid assistant
 
