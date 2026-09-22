@@ -54,6 +54,12 @@ fn load_capture(path: &Path) -> Option<(egui::ColorImage, [u32; 2])> {
     Some((egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], pixels), [width, height]))
 }
 
+#[derive(Clone, PartialEq)]
+struct ChainEntry {
+    path: PathBuf,
+    enabled: bool,
+}
+
 struct Target {
     pid: u32,
     path: PathBuf,
@@ -153,8 +159,10 @@ struct App {
     tree: Tree,
     scanned_root: Option<String>,
     preset_filter: String,
-    /// Presets ticked in the browser, in the order they will run.
-    chain: Vec<PathBuf>,
+    /// Presets ticked in the browser, in the order they will run. A
+    /// disabled entry stays in the list but is left out of the chain, so it
+    /// can be switched off without losing its place or anyone's settings.
+    chain: Vec<ChainEntry>,
 
     param_filter: String,
     /// Pixel grid assistant.
@@ -426,7 +434,8 @@ impl App {
             self.error("no process connected");
             return;
         }
-        self.chain = p.presets.iter().map(PathBuf::from).collect();
+        self.chain =
+            p.presets.iter().map(|s| ChainEntry { path: PathBuf::from(s), enabled: true }).collect();
         self.send(Request::LoadPresets { paths: p.presets.clone() });
         self.send(Request::SetSource { source: p.source.clone() });
         self.send(Request::SetHdr { hdr: p.hdr });
@@ -559,10 +568,18 @@ impl App {
             });
             let mut swap = None;
             let mut remove = None;
-            for (i, path) in chain.iter().enumerate() {
+            let mut toggled = false;
+            for (i, entry) in chain.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    let name =
+                        entry.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                     ui.weak(format!("{}.", i + 1));
+                    // Switching one off leaves the others, and their
+                    // parameters, exactly as they are.
+                    toggled |= ui
+                        .checkbox(&mut entry.enabled, "")
+                        .on_hover_text("Run this one in the chain")
+                        .changed();
                     if ui.small_button("↑").clicked() && i > 0 {
                         swap = Some((i - 1, i));
                     }
@@ -572,9 +589,17 @@ impl App {
                     if ui.small_button("✕").clicked() {
                         remove = Some(i);
                     }
-                    ui.label(name).on_hover_text(path.display().to_string());
+                    let label = if entry.enabled {
+                        egui::RichText::new(name)
+                    } else {
+                        egui::RichText::new(name).weak().strikethrough()
+                    };
+                    ui.label(label).on_hover_text(entry.path.display().to_string());
                 });
             }
+            // A change to the chain applies straight away: waiting for
+            // Apply after unticking would be surprising.
+            apply_chain |= toggled || swap.is_some() || remove.is_some();
             if let Some((a, b)) = swap.filter(|(_, b)| *b < chain.len()) {
                 chain.swap(a, b);
             }
@@ -593,11 +618,22 @@ impl App {
             self.error("no process connected");
         } else if let Some(path) = clicked {
             // A plain click runs that preset on its own.
-            self.chain.clear();
+            self.chain = vec![ChainEntry { path: path.clone(), enabled: true }];
             self.send(Request::LoadPresets { paths: vec![path.display().to_string()] });
         } else if apply_chain {
-            let paths = self.chain.iter().map(|p| p.display().to_string()).collect();
-            self.send(Request::LoadPresets { paths });
+            let paths: Vec<String> = self
+                .chain
+                .iter()
+                .filter(|e| e.enabled)
+                .map(|e| e.path.display().to_string())
+                .collect();
+            if paths.is_empty() {
+                // Nothing left to run: bypass rather than fail.
+                self.send(Request::SetEnabled { enabled: false });
+            } else {
+                self.send(Request::SetEnabled { enabled: true });
+                self.send(Request::LoadPresets { paths });
+            }
         }
     }
 
@@ -1084,7 +1120,7 @@ fn draw_tree(
     root: &Path,
     running: &[String],
     clicked: &mut Option<PathBuf>,
-    chain: &mut Vec<PathBuf>,
+    chain: &mut Vec<ChainEntry>,
 ) {
     let searching = !words.is_empty();
     for (name, folder) in &tree.folders {
@@ -1108,12 +1144,12 @@ fn draw_tree(
         let is_running = running.iter().any(|p| p == abs.to_string_lossy().as_ref());
         ui.horizontal(|ui| {
             // Ticking several presets chains them, in ticking order.
-            let mut ticked = chain.contains(&abs);
+            let mut ticked = chain.iter().any(|e| e.path == abs);
             if ui.checkbox(&mut ticked, "").on_hover_text("Add to the chain").changed() {
                 if ticked {
-                    chain.push(abs.clone());
+                    chain.push(ChainEntry { path: abs.clone(), enabled: true });
                 } else {
-                    chain.retain(|p| p != &abs);
+                    chain.retain(|e| e.path != abs);
                 }
             }
             if ui.selectable_label(is_running, name.as_str()).clicked() {

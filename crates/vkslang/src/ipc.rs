@@ -97,7 +97,9 @@ pub fn handle(request: Request) -> Response {
                 return Response::Error { message: format!("{} does not exist", missing.display()) };
             }
             ctl.presets = paths;
-            ctl.overrides.clear();
+            // Parameter tweaks are kept: removing or disabling one preset of
+            // a chain must not reset the others. Overrides that no longer
+            // match anything sit unused, and come back if their preset does.
             ctl.preset_gen += 1;
             ctl.loading = true;
             ctl.error = None;
