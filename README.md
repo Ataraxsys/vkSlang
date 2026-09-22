@@ -180,7 +180,7 @@ vkslang-ui                                                           # in a sepa
 
 The external app (egui, OpenGL, so it never loads the layer itself) connects to the running process and lets you:
 
-- **switch presets** from a searchable browser of the `shaders_slang` folder (compiled in the background, then swapped in with no stutter), or **tick several** to chain them: the passes of the second run on the output of the first, with the order adjustable before applying;
+- **switch presets** from a searchable browser of the `shaders_slang` folder (compiled in the background, then swapped in with no stutter), or **tick several** to chain them: the passes of the second run on the output of the first, with the order adjustable. Each entry in the chain has its own checkbox, so one preset can be switched off without touching the others, and **parameter tweaks are kept**: removing or disabling a preset never resets the rest, and its own settings come back if it does;
 - **adjust parameters** with sliders (min/max/step from `#pragma parameter`, declaration order, section headers, ↺ to restore the preset value);
 - change the **source resolution**, the **filter** and the **picture area** live;
 - turn the shader **on/off** (bypass);
