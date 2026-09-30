@@ -40,6 +40,9 @@ pub struct DeviceData {
     /// queue of another family).
     pub queue: vk::Queue,
     pub queue_family: u32,
+    /// Queue families the application created queues in, plus the layer's.
+    /// Swapchain images are shared between all of them.
+    pub shared_families: Vec<u32>,
     /// Whether VK_KHR_swapchain_mutable_format was enabled on the device.
     pub mutable_format: bool,
     /// False when the preset is missing, the process is filtered out, or no

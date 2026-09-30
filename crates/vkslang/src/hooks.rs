@@ -149,6 +149,13 @@ pub unsafe extern "system" fn create_device(
                 .is_some_and(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
         });
 
+    // Every family the application asked queues in: the swapchain images are
+    // shared with all of them below.
+    let mut app_families: Vec<u32> =
+        slice(ci.p_queue_create_infos, ci.queue_create_info_count).iter().map(|q| q.queue_family_index).collect();
+    app_families.sort_unstable();
+    app_families.dedup();
+
     // Mutable swapchain format lets us render through a UNORM view of an sRGB
     // swapchain (no double gamma), as vkBasalt does.
     let mut extensions: Vec<*const c_char> =
@@ -217,6 +224,15 @@ pub unsafe extern "system" fn create_device(
         set_loader_data,
         queue,
         queue_family: graphics_family.unwrap_or(0),
+        shared_families: {
+            let mut f = app_families;
+            if let Some(g) = graphics_family {
+                if !f.contains(&g) {
+                    f.push(g);
+                }
+            }
+            f
+        },
         mutable_format,
         active,
         queue_families: Mutex::new(HashMap::new()),
@@ -430,6 +446,20 @@ pub unsafe extern "system" fn create_swapchain(
     let mut modified = *ci;
     modified.image_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC;
 
+    // The application may composite and present on a queue family the layer
+    // cannot render on: gamescope presents from the asynchronous compute
+    // family while librashader needs graphics. An EXCLUSIVE image handed from
+    // one family to another without an ownership transfer has undefined
+    // contents, and on AMD the unresolved compression metadata shows up as
+    // mismatched square tiles. Sharing the images between every family in
+    // play removes the transfer, at the cost of compression on the swapchain
+    // images alone.
+    if dev.shared_families.len() > 1 {
+        modified.image_sharing_mode = vk::SharingMode::CONCURRENT;
+        modified.queue_family_index_count = dev.shared_families.len() as u32;
+        modified.p_queue_family_indices = dev.shared_families.as_ptr();
+    }
+
     // Note: the layer does NOT ask for extra swapchain images for subframes.
     // They are presented one at a time, so a free image is enough, and
     // raising the count breaks applications that size their own swapchain
@@ -464,8 +494,15 @@ pub unsafe extern "system" fn create_swapchain(
     if result != vk::Result::SUCCESS {
         if promoted {
             log_error!("HDR10 swapchain refused ({result}), retrying as the application asked");
+            // Only the HDR promotion is given up: the usage flags and the
+            // shared families are what let the layer touch the images at all.
+            let mut fallback = modified;
+            fallback.image_format = ci.image_format;
+            fallback.image_color_space = ci.image_color_space;
+            fallback.flags = ci.flags;
+            fallback.p_next = ci.p_next;
             drop(guard);
-            return next(device, p_create_info, p_allocator, p_swapchain);
+            return next(device, &fallback, p_allocator, p_swapchain);
         }
         drop(guard);
         return result;
