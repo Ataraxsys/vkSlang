@@ -596,7 +596,8 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
     for (&swapchain, &index) in swapchains.iter().zip(indices) {
         // The application's semaphores are consumed by our first submission.
         let wait: &[vk::Semaphore] = if waits.is_empty() { app_waits } else { &[] };
-        match rt.render(&dev, submit_queue, swapchain, index, wait, None) {
+        let app_queue = (!same_family).then_some(queue);
+        match rt.render(&dev, submit_queue, swapchain, index, wait, app_queue, None) {
             Ok(Some(sem)) => {
                 waits.push(sem);
                 processed.push(swapchain);

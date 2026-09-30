@@ -688,6 +688,10 @@ struct FrameSlot {
     /// Signalled by our own vkAcquireNextImageKHR for a subframe; safe to
     /// reuse once this slot's fence has been waited on.
     acquire: vk::Semaphore,
+    /// Signalled on the application's queue when it presents from another
+    /// family than ours; our submission waits on it. Free again once this
+    /// slot's fence has been waited on.
+    bridge: vk::Semaphore,
     /// Preset upload submitted with this slot; its pool is destroyed once the
     /// fence signals.
     init: Option<(vk::CommandPool, vk::CommandBuffer)>,
@@ -777,7 +781,8 @@ impl Runtime {
                     None,
                 )?;
                 let acquire = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-                Ok(FrameSlot { cmd, fence, init: None, acquire })
+                let bridge = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+                Ok(FrameSlot { cmd, fence, init: None, acquire, bridge })
             });
             match slot {
                 Ok(slot) => rt.slots.push(slot),
@@ -1007,6 +1012,7 @@ impl Runtime {
             }
             dev.fns.destroy_fence(slot.fence, None);
             dev.fns.destroy_semaphore(slot.acquire, None);
+            dev.fns.destroy_semaphore(slot.bridge, None);
         }
         // Destroying the pool frees every command buffer allocated from it.
         dev.fns.destroy_command_pool(self.pool, None);
@@ -1059,7 +1065,7 @@ impl Runtime {
             let done = if black {
                 self.present_black(dev, queue, swapchain, index, acquire)
             } else {
-                self.render(dev, queue, swapchain, index, &[acquire], Some((current, total)))
+                self.render(dev, queue, swapchain, index, &[acquire], None, Some((current, total)))
                     .unwrap_or(None)
             };
             let Some(done) = done else { return };
@@ -1172,6 +1178,7 @@ impl Runtime {
     /// Records and submits the filter chain for one presented image. Returns
     /// the semaphore the present must wait on, or `None` to leave this
     /// swapchain untouched.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn render(
         &mut self,
         dev: &DeviceData,
@@ -1179,6 +1186,8 @@ impl Runtime {
         swapchain: vk::SwapchainKHR,
         image_index: u32,
         wait_semaphores: &[vk::Semaphore],
+        // The queue the application presents from, when it is not `queue`.
+        app_queue: Option<vk::Queue>,
         // `(current, total)` when rendering an extra presentation of the
         // same application frame.
         subframe: Option<(u32, u32)>,
@@ -1737,6 +1746,27 @@ impl Runtime {
             slot.init = Some(init);
         }
         cmds.push(cmd);
+
+        // Presenting from another queue: nothing orders our work after the
+        // application's. gamescope presents from its compute queue with no
+        // wait semaphore at all, relying on that queue's submission order, so
+        // we read the image while its compositing shader is still writing it
+        // and whole workgroup tiles come out of an older frame. A signal
+        // submitted on the application's queue covers every command submitted
+        // there before it; our submission waits on that instead.
+        let bridged = [slot.bridge];
+        let wait_semaphores = match app_queue {
+            Some(app_queue) => {
+                let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; wait_semaphores.len()];
+                let bridge = vk::SubmitInfo::default()
+                    .wait_semaphores(wait_semaphores)
+                    .wait_dst_stage_mask(&stages)
+                    .signal_semaphores(&bridged);
+                d.queue_submit(app_queue, &[bridge], vk::Fence::null())?;
+                &bridged[..]
+            }
+            None => wait_semaphores,
+        };
         let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; wait_semaphores.len()];
         let signal = [state.semaphores[image_index as usize]];
         let submit = vk::SubmitInfo::default()
