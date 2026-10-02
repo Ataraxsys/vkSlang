@@ -86,10 +86,7 @@ unsafe extern "system" fn get_instance_proc_addr(
     (data.next_gipa)(instance, p_name)
 }
 
-unsafe extern "system" fn get_device_proc_addr(
-    device: vk::Device,
-    p_name: *const c_char,
-) -> vk::PFN_vkVoidFunction {
+unsafe extern "system" fn get_device_proc_addr(device: vk::Device, p_name: *const c_char) -> vk::PFN_vkVoidFunction {
     let name = CStr::from_ptr(p_name);
     if let Some(f) = device_hook(name) {
         return Some(f);

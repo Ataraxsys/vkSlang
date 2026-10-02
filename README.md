@@ -7,217 +7,296 @@ I couldn't find any way to use RetroArch's Slang shaders in PC games on Linux, s
 
 ---
 
-Vulkan layer for Linux that runs **libretro `.slangp` multi-pass presets** (CRT, scanlines, masks, NTSC…) on any Vulkan swapchain through [librashader](https://github.com/SnowflakePowered/librashader). It follows the approach of [vkBasalt](https://github.com/DadSchoorse/vkBasalt), but runs librashader directly instead of ReShade `.fx`.
+Vulkan layer for Linux that runs **libretro `.slangp` multi-pass presets** (CRT, scanlines, masks, NTSC…) on any Vulkan swapchain through [librashader](https://github.com/SnowflakePowered/librashader), with **`vkslang-ui`**, a control panel to change presets and parameters while the game runs.
+
+- Works with native Vulkan games, Proton/DXVK/VKD3D, and through gamescope with anything else (OpenGL, SDL, Wine GDI…).
+- Logical source resolution, so scanlines follow the game's 240 lines rather than the 2160 of a 4K screen.
+- Picture and display areas, non-square pixels, exact pixel duplication.
+- Several presets chained, subframes for interlacing and black frame insertion, real HDR output for SDR games.
+- Named profiles, loaded automatically per game.
+
+## Contents
+
+1. [Install](#install)
+2. [First run](#first-run)
+3. [Recipes](#recipes): native games, Steam and Proton, gamescope, non-Vulkan programs
+4. [The control panel](#the-control-panel-vkslang-ui)
+5. [Configuration](#configuration)
+6. [Concepts](#concepts): source resolution, areas and scales, non-square pixels, subframes, HDR
+7. [Troubleshooting](#troubleshooting)
+8. [How it works](#how-it-works)
+9. [Limitations](#limitations)
+10. [Building and development](#building-and-development)
+
+## Install
+
+### From a release
+
+Download `vkslang-<version>-x86_64-linux.tar.gz` from the [releases](https://github.com/Ataraxsys/vkSlang/releases), then:
 
 ```sh
-ENABLE_VKSLANG=1 VKSLANG_PRESET=~/shaders/crt/crt-royale.slangp VKSLANG_SOURCE_RES=320x240 gamescope -W 3840 -H 2160 -w 320 -h 240 -S integer -F nearest -- %command%
+tar xf vkslang-*-x86_64-linux.tar.gz
+cd vkslang-*-x86_64-linux
+VKSLANG_NO_BUILD=1 ./scripts/install.sh          # into ~/.local
 ```
 
-## 1. Rust (`ash` + `librashader`) or C++ (Vulkan SDK + `librashader-capi`)
+The release binaries are built on Ubuntu 24.04 and need glibc 2.39 or newer. On an older system, build from source.
 
-| Criterion | Rust: `ash` + `librashader` | C++20: Vulkan SDK + `librashader-capi` |
-|---|---|---|
-| librashader integration | Native. `FilterChain`, `FrameOptions`, `Viewport` are ordinary Rust types, and errors come back as `Result`. | Goes through the C ABI (`libra_vk_filter_chain_create`, …). `librashader.h` loads `librashader.so` at runtime with dlopen, so there are two `.so` files to ship and keep at the same ABI version. |
-| Build | One `cargo build`, and librashader is statically linked into `libvkslang.so`. | CMake/Meson plus a Cargo build of the capi, or a system package. |
-| Layer plumbing (`vk_layer.h`) | About 100 lines of `#[repr(C)]` structs, because ash does not provide them. | Available as-is (`vk_layer.h`, `vk_layer_dispatch_table.h`). |
-| Dispatch tables | `ash::Instance::load_with` and `ash::Device::load_with` take the *next* layer's GIPA/GDPA directly, and librashader accepts those same `ash` objects. | You write the dispatch table by hand (vkBasalt's `vkdispatch.cpp`), then convert it to `libra_device_vk_t`. |
-| Memory safety | The unsafe code is limited to the FFI boundary. | Everything is unsafe. |
-| Panic / exceptions | `panic = "abort"`, so nothing unwinds into the application. | Exceptions must be disabled or caught at every hook. |
+### From source
 
-**Recommendation: Rust.** Most of the work is in the librashader integration (the frame contract, the deferred init command buffer, per-frame resources, parameters), and Rust lets you use it with no C ABI and no second library. The one advantage of C++ is `vk_layer.h`, and that is only about a hundred lines to replicate once (`src/loader.rs`). The librashader VK runtime is built on `ash` 0.38, so the `ash::Instance`/`ash::Device` objects the layer builds on the next layer's pointers go straight into `FilterChain::load_from_preset_deferred`.
-
-## 2. Project layout
-
-```
-vkSlang/
-├── Cargo.toml                  # workspace
-├── crates/
-│   ├── vkslang/                # cdylib -> libvkslang.so (ash 0.38 + librashader 0.12, runtime-vk)
-│   │   └── src/                # lib.rs, loader.rs, state.rs, hooks.rs, render.rs, config.rs,
-│   │                           # control.rs (live state), ipc.rs (socket), log.rs
-│   ├── vkslang-ipc/            # JSON protocol + client, shared by the layer and the UI
-│   └── vkslang-ui/             # egui control panel (main.rs, save.rs)
-├── layer/
-│   └── vkslang.json            # implicit layer manifest (ENABLE_VKSLANG=1 / DISABLE_VKSLANG=1)
-├── config/
-│   └── vkSlang.conf            # sample configuration
-├── scripts/
-│   └── install.sh              # installs .so + manifest into ~/.local (or PREFIX)
-└── .github/workflows/ci.yml    # build, test, clippy, exported symbol check
-```
-
-## 3. Build and install
+Requirements: Rust 1.95 or newer, a C/C++ compiler (librashader builds SPIRV-Cross and glslang), and the Vulkan loader.
 
 ```sh
-cargo build --release --workspace          # -> target/release/libvkslang.so + vkslang-ui
-./scripts/install.sh                       # ~/.local/{lib/vkslang,bin,share/vulkan/implicit_layer.d}
+git clone https://github.com/Ataraxsys/vkSlang && cd vkSlang
+./scripts/install.sh                              # builds, then installs into ~/.local
 ```
 
-For Steam/Proton, install **system-wide** as well, because the container imports the layers it finds in `/usr`. Build as your user first, then install without rebuilding, so root never writes into `target/`:
+This installs `~/.local/lib/vkslang/libvkslang.so`, the layer manifest in `~/.local/share/vulkan/implicit_layer.d/`, `~/.local/bin/vkslang-ui`, and a sample `~/.config/vkSlang/vkSlang.conf` (only if you have none, and it sets nothing).
+
+### System-wide (Steam)
+
+The Steam container (pressure-vessel) only imports the layers it finds in `/usr`. Build as your user, then install without rebuilding so root never writes into `target/`:
 
 ```sh
+./scripts/install.sh                              # or take the binaries from a release
 sudo VKSLANG_NO_BUILD=1 PREFIX=/usr ./scripts/install.sh
 ```
 
-> A layer installed in `~/.local` takes **priority** over the one in `/usr`. Keeping both means updating both, otherwise a game silently runs the older one. Installing only in `/usr` covers every case.
+> A copy in `~/.local` **takes priority** over the one in `/usr`. Keep only one, or update both: otherwise a game silently runs the older one. The script warns when it sees both.
 
-Without a Rust toolchain, take `libvkslang.so` and `vkslang-ui` from the CI artifact, put them in `target/release/`, and install with `VKSLANG_NO_BUILD=1 ./scripts/install.sh`. The script otherwise always rebuilds, so a stale binary is never installed under a fresh manifest.
-
-Requirements: Rust ≥ 1.95 (for `vkslang-ui`; the layer alone builds with 1.82), a C/C++ compiler (librashader builds SPIRV-Cross and glslang), and the Vulkan loader.
-
-## 4. Configuration
-
-Settings are read from `$VKSLANG_CONFIG`, falling back to `~/.config/vkSlang/vkSlang.conf`. Each key can be overridden by an environment variable `VKSLANG_<KEY>`:
-
-| Variable / key | Example | Purpose |
-|---|---|---|
-| `ENABLE_VKSLANG` | `1` | Enables the implicit layer (`DISABLE_VKSLANG=1` forces it off). |
-| `profile.<executable>` / `profile` | `Amiga 4:3` | Profile loaded automatically for that process, or for everything (file only). |
-| `VKSLANG_PRESET` / `preset` | `/…/crt-royale.slangp` | Preset to load, or several separated by commas to chain them. Without one, the layer passes everything through. |
-| `VKSLANG_SOURCE_RES` / `source_res` | `320x240`, `/3`, `50%`, `native` | Logical source resolution: fixed, the picture divided by N, or untouched (see below). |
-| `VKSLANG_PIXEL_DUPLICATE` / `pixel_duplicate` | `2`, `1,2` | Repeat each source pixel per axis (DOS modes: `1,2` doubles the lines). |
-| `VKSLANG_SOURCE_FILTER` / `source_filter` | `nearest` \| `linear` | Filter for the downsample blit. |
-| `VKSLANG_SOURCE_RECT` / `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the swapchain image that holds the picture (for gamescope pillarboxing). |
-| `VKSLANG_DISPLAY_RECT` / `display_rect` | `full`, `4:3`, `5:4` | Region the preset draws into; stretches the picture when it differs from `source_rect`. |
-| `VKSLANG_DISPLAY_SCALE` / `display_scale` | `1.2`, `1.2,1.0` | Scales the area the preset draws into, carrying the preset and the picture together (never past the screen). |
-| `VKSLANG_SOURCE_SCALE` / `source_scale` | `1.2`, `1,2` | Scales the picture inside that area by reading a smaller region; the preset keeps its scanlines and mask. |
-| `VKSLANG_PROCESS` / `process` | `gamescope` | Restricts the layer to these executables. |
-| `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Overrides preset parameters (file only). |
-| `VKSLANG_LOG` | `debug` | Log level. |
-| `VKSLANG_LOG_FILE` | `~/vkslang.log` | Also write the log to this file (Steam/Proton, where stderr is out of reach). |
-| `VKSLANG_IPC` / `ipc` | `0` | Disables the socket for `vkslang-ui`. |
-| `VKSLANG_BRIGHTNESS_NITS` / `brightness_nits` | `200` | HDR reference white (`BrightnessNits`). |
-| `VKSLANG_EXPAND_GAMUT` / `expand_gamut` | `0`–`3` | HDR colour boost (`ExpandGamut`): Accurate, Expanded, Wide, Super. |
-| `VKSLANG_HDR_OUTPUT` / `hdr_output` | `auto` \| `force` \| `off` | Promote the swapchain to HDR10 (see the HDR section). |
-| `VKSLANG_SUBFRAMES` / `subframes` | `1`–`8` | Presentations per application frame (see below). |
-| `VKSLANG_SUBFRAME_MODE` / `subframe_mode` | `shader` \| `black` | Run the preset again for each subframe, or insert black frames. |
-
-### Logical resolution (`VKSLANG_SOURCE_RES`)
-
-librashader's `FrameOptions` has no "source resolution" field: the shaders get `OriginalSize`/`SourceSize` from the size of the **input image**. On every present, vkSlang therefore:
-
-1. blits the picture region of the swapchain image (4K, say) into a `source_res` image with a `nearest` filter. That size is either fixed (`320x240`), the picture divided by a factor (`/3`, or `50%`, which keeps the output's aspect ratio whatever the resolution), or `native` for no downscale;
-2. passes that image to `FilterChain::frame` as `Original`, with the viewport set to the 4K region.
-
-As a result, scanlines, masks and curvature line up with the 240 original lines rather than the 2160 output lines. With `gamescope -w 320 -h 240 -S integer -F nearest`, the nearest downsample recovers the original pixels exactly.
-
-### Subframes (interlacing, BFI)
-
-CRT presets that simulate interlacing alternate fields on every frame, which at 60 Hz means 30 Hz per field and visible flicker. On a high refresh display, `subframes` makes the layer present the same application frame several times:
+### Uninstall
 
 ```sh
-VKSLANG_SUBFRAMES=3   # 60 Hz game on a 240 Hz display -> 180 presentations per second
+./scripts/install.sh --uninstall                  # ~/.local
+sudo PREFIX=/usr ./scripts/install.sh --uninstall # /usr
 ```
 
-Each subframe advances `FrameCount` and binds `CurrentSubFrame`/`TotalSubFrames`, so presets that alternate fields on `FrameCount` (guest-advanced and friends) interlace at the presentation rate. `subframe_mode = black` inserts black frames instead of running the preset, which costs almost nothing. Both are adjustable live from `vkslang-ui` ("Presentations per frame"), which also shows the measured rates: what the application draws, and what reaches the display. The source line shows the whole chain of sizes: base (swapchain), picture area, input given to the preset, and output.
+Your configuration and profiles in `~/.config/vkSlang` are left alone.
 
-The layer acquires images of its own for this, one at a time, and never asks the swapchain for extras: raising the image count crashes applications that size their swapchain arrays statically (Qt's QVulkanWindow does). If no image is free within 50 ms, the remaining subframes of that frame are simply skipped. In FIFO the application is naturally limited to `refresh / subframes`, which is why 3 subframes suit a 60 Hz game on a 240 Hz display. Note that a compositor that recomposites (gamescope on its Wayland backend) collapses the subframes; with `gamescope --backend sdl` the layer drives gamescope's own swapchain and they survive.
+## First run
+
+The layer is off unless `ENABLE_VKSLANG=1` is set, and does nothing until it has a preset. Try it on `vkcube`:
+
+```sh
+ENABLE_VKSLANG=1 VKSLANG_PRESET=/usr/share/libretro/shaders/shaders_slang/crt/crt-easymode.slangp vkcube &
+vkslang-ui
+```
+
+The panel connects to `vkcube` on its own. Pick another preset in the tree, move the sliders, set the source resolution: everything applies on the next frame. Presets come from the `shaders_slang` collection (`libretro-shaders-slang` on Arch, or RetroArch's own download in `~/.config/retroarch/shaders`).
+
+## Recipes
+
+### A native Vulkan game
+
+```sh
+ENABLE_VKSLANG=1 VKSLANG_PRESET=/path/to/crt-royale.slangp %command%
+```
+
+as Steam launch options, or the same in front of the command in a terminal or launcher. Then open `vkslang-ui`, tune, and save a **profile** with the ☆ set: next time the game picks it up by itself, and `VKSLANG_PRESET` can go.
+
+### Steam and Proton (DXVK, VKD3D)
+
+The same launch options work for Windows games, as long as the layer is installed **in `/usr`** (see [System-wide](#system-wide-steam)). Inside the container:
+
+- `/usr` is the container's own. A path such as `/usr/share/libretro/...` is retried under `/run/host`, where the host is mounted, so it keeps working. Presets in your home directory work as they are.
+- `$XDG_RUNTIME_DIR` is private, so the control socket goes to `~/.local/state/vkslang`; `vkslang-ui` looks there too.
+- To read the log: `VKSLANG_LOG_FILE=$HOME/vkslang.log`.
+
+32-bit games are out of reach of the layer itself (it is built for x86-64 only): go through gamescope, below.
+
+### Through gamescope
+
+Running the shader on **gamescope's output** works for any game, 32-bit, OpenGL or not, and lets gamescope do the integer scaling first:
+
+```sh
+ENABLE_VKSLANG=1 VKSLANG_PROCESS=gamescope gamescope --backend sdl -f -W 3840 -H 2160 -w 640 -h 480 -S integer -F nearest -- %command%
+```
+
+- **`--backend sdl` is required.** Only then does gamescope present through a Vulkan swapchain of its own; its default Wayland backend has none, and the layer would have nothing to process.
+- **`VKSLANG_PROCESS=gamescope`** keeps the layer out of the game: `ENABLE_VKSLANG=1` is inherited by every child process.
+- The preset comes from a profile starred for `gamescope`, from `preset =` in `vkSlang.conf`, or from `VKSLANG_PRESET`.
+- With integer scaling, set the source resolution to **divide** and use **Find the divisor** in the panel: give it the game's resolution and it computes how many screen pixels each game pixel covers (640×480 on a 4K screen: ÷4).
+
+### Programs that do not use Vulkan
+
+OpenGL games, SDL programs and Wine applications drawing with GDI (AppleWin, for instance) never create a Vulkan swapchain. Put gamescope in front, exactly as above, and the shader runs on its output:
+
+```sh
+ENABLE_VKSLANG=1 VKSLANG_PROCESS=gamescope gamescope --backend sdl -f -w 560 -h 384 -S integer -F nearest -- wine AppleWin.exe
+```
+
+## The control panel: `vkslang-ui`
+
+An ordinary window (egui on OpenGL, so it never loads the layer itself) that connects to any running process with the layer, and lets you:
+
+- **switch presets** from a searchable folder tree; a plain click runs one, ticking several **chains** them in the order shown. Each entry of the chain can be switched off on its own, and parameter tweaks are kept when the chain changes;
+- **adjust parameters** live, in the preset's declaration order, with section headers and ↺ to restore a value;
+- set the **source resolution** (native, divided, fixed, with the divisor calculator), the **picture and display areas** and their scales, **pixel duplication**, the downscale **filter**;
+- measure a game's resolution with the **pixel grid**, and frame its picture with a rectangle on a capture;
+- set the **HDR** paper white and gamut, and the **presentations per frame** (subframes), with the measured source and presentation rates;
+- **save a profile**: the whole look under a name, in `~/.config/vkSlang/profiles/<name>.json` (chain, changed parameters, source and areas, HDR, subframes). One click applies it to a running game. The **☆** makes it load **automatically for that executable**, by writing `profile.<executable>` into `vkSlang.conf`;
+- export a RetroArch-compatible **`.slangp`** (`#reference` plus changed parameters, single preset only), or **save for all games** into `vkSlang.conf`. That last one applies to every process the layer runs in, gamescope included: for one game, prefer a starred profile.
+
+Processes that load the layer but present nothing (gamescope on its Wayland backend, launchers) are hidden behind "+N idle".
+
+## Configuration
+
+Settings are read from `$VKSLANG_CONFIG`, else `$XDG_CONFIG_HOME/vkSlang/vkSlang.conf` (`~/.config/vkSlang/vkSlang.conf`). Every key can be overridden by an environment variable `VKSLANG_<KEY>`, which is the easiest way to give one game its own settings from a launcher. Precedence, strongest first: environment, `vkSlang.conf`, the profile for the executable, defaults.
+
+| Key / variable | Example | Purpose |
+|---|---|---|
+| `ENABLE_VKSLANG` | `1` | Enables the layer (`DISABLE_VKSLANG=1` forces it off). |
+| `profile.<executable>`, `profile` | `Amiga 4:3` | Profile loaded for that executable (case-insensitive), or for every process. File only. |
+| `preset` | `/…/crt-royale.slangp` | Preset, or several separated by commas to chain them. Without one the layer stays out of the way. |
+| `param.<NAME>` | `param.CRT_GAMMA = 2.4` | Preset parameter override. File only. |
+| `process` | `gamescope` | Executables the layer runs in (comma separated, case-insensitive). Empty: all. |
+| `source_res` | `native`, `/3`, `50%`, `320x240` | Logical source resolution. |
+| `source_filter` | `nearest`, `linear` | Filter of the reduction to that resolution. |
+| `pixel_duplicate` | `2`, `1,2` | Repeat each source pixel per axis. |
+| `source_rect` | `full`, `4:3`, `480,0,2880x2160` | Region of the image holding the picture. |
+| `display_rect` | `full`, `4:3`, `5:4` | Region the preset draws into. |
+| `display_scale` | `1.2`, `1.2,1.0` | Scales the drawn area (preset and picture together). |
+| `source_scale` | `1.2`, `1,2` | Scales the picture inside it (the preset keeps its geometry). |
+| `subframes` | `1`–`8` | Presentations per application frame. |
+| `subframe_mode` | `shader`, `black` | Run the preset again for each subframe, or insert black frames. |
+| `hdr_output` | `auto`, `force`, `off` | Promote the swapchain to HDR10. |
+| `brightness_nits` | `200` | HDR paper white (`BrightnessNits`). |
+| `expand_gamut` | `0`–`3` | HDR gamut (`ExpandGamut`): Accurate, Expanded, Wide, Super. |
+| `ipc` | `0` | Disables the control socket. |
+| `VKSLANG_LOG` | `debug` | Log level: `error`, `warn`, `info` (default), `debug`. |
+| `VKSLANG_LOG_FILE` | `~/vkslang.log` | Also write the log to this file. |
+| `VKSLANG_SOCKET_DIR` | `/tmp/vkslang` | Where control sockets go. |
+| `VKSLANG_CONFIG` | `~/vkslang-test.conf` | Another configuration file. |
+
+`config/vkSlang.conf` documents every key in place.
+
+## Concepts
+
+### Source resolution
+
+The shaders get `OriginalSize` and `SourceSize` from the size of their input image, and librashader has no other way to tell them the game's resolution. So on every frame vkSlang reduces the picture to the **source resolution** before handing it over, and the preset draws back at full size:
+
+1. the picture region of the swapchain image (4K, say) is copied into a `source_res` image: fixed (`320x240`), the picture divided by a factor (`/3`, or `50%`, which keeps the aspect ratio at any output resolution), or `native` for no reduction;
+2. that image is the preset's `Original`, and the viewport is the full-size display area.
+
+Scanlines, masks and curvature then line up with the game's 240 lines rather than the 2160 of the screen. With gamescope's integer scaling and a nearest filter, the reduction recovers the original pixels exactly; **Find the divisor** gives the factor.
+
+### Areas and scales
+
+- **`source_rect`** is what is read: the picture, without gamescope's black bars (`4:3` on a 16:9 screen) or a game's own borders (frame it with the pixel grid's rectangle).
+- **`display_rect`** is where the preset draws. Different from `source_rect`, it stretches the picture, **and the shader with it**: scanlines and mask follow the display geometry, like a CRT fed that signal.
+- **`display_scale`** resizes the drawn area: preset and picture grow **together**, never past the screen.
+- **`source_scale`** resizes the picture **inside** that area by reading a smaller region. The preset gets the same number of pixels into the same area, so scanlines and mask keep their size: `1,2` makes the picture twice as tall without touching the preset.
 
 ### Non-square pixels
 
-Old PC and console modes are displayed stretched: 640×360 or 320×200 in memory, shown at 4:3. Reproducing that takes two settings:
+Old PC and console modes were displayed stretched: 640×360 or 320×200 in memory, shown at 4:3.
 
-- `source_rect` says what to **read**, and `source_res` the size of the input, so the grid stays aligned on the real pixels (640×360).
-- `pixel_duplicate` repeats each source pixel. A DOS 320×200 mode with `1,2` hands the preset 400 real lines rather than 200 stretched ones, which keeps scanlines and masks working on actual lines. The picture is first reduced to the real pixel grid, then copied into the source image with a nearest blit between exact multiples, so every pixel really is duplicated rather than resampled.
-- `display_rect` says where the preset **draws**. Set to `4:3`, the picture is stretched into that area, **and the shader is stretched with it**: scanlines and mask follow the display geometry, exactly like a CRT fed a 200-line signal.
-- Two scales, deliberately separate:
-  - **`display_scale`** resizes the drawn area, so the preset and the picture grow **together**. It never overflows the screen, because librashader uses the viewport as its scissor and a scissor reaching outside draws nothing.
-  - **`source_scale`** resizes the picture **inside** that area, by reading a smaller region. The preset is untouched: same number of pixels in, same area out, so scanlines and mask keep their size. `1,2` makes the picture twice as tall without changing the preset's geometry, which is what an old DOS mode needs.
+- Set `source_res` to the real size (640×360) so the grid stays on the real pixels, and `display_rect = 4:3` to stretch it.
+- **`pixel_duplicate`** repeats each pixel. A DOS 320×200 mode with `1,2` hands the preset 400 real lines rather than 200 stretched ones, so scanlines work on actual lines. The picture is reduced to the real grid first, then copied with a nearest blit between exact multiples: every pixel really is duplicated, not resampled.
 
-### Pixel grid assistant
+### Subframes
 
-When you do not know a game's internal resolution, open **Pixel grid…** next to the source settings. The layer grabs the whole image as the application drew it, before the preset, and the window offers two tools:
-
-- **measure**: an adjustable grid. Line it up with the game's pixel blocks and it reads off the pixel size and the resulting resolution, applied as a fixed resolution or a division factor.
-- **frame the picture**: a rectangle to drag over the image, inside to move it, near an edge to resize. It sets the picture area (`source_rect`) without typing coordinates, which matters when the game leaves black borders of its own.
-
-The capture is written next to the control socket as raw RGBA (magic `VKSC`, width, height, pixels), downscaled to the requested width, and costs one frame wait only when asked for.
-
-### Steam and Proton
-
-- Install **system-wide** (`PREFIX=/usr sudo -E ./scripts/install.sh`): the Steam container (pressure-vessel) imports the layers it finds in `/usr`.
-- Inside the container, `/usr` is the container's own, so **a preset in `/usr/share/libretro` is not visible**. Either keep your presets in your home directory (shared with the container), or let vkSlang find them: a path that does not exist is retried under `/run/host`, where the host filesystem is mounted.
-- To see the log of a Steam game, use `VKSLANG_LOG_FILE=$HOME/vkslang.log`.
-- The container has its own `$XDG_RUNTIME_DIR`, so the control socket goes to `~/.local/state/vkslang` there, and `vkslang-ui` looks in both directories. `VKSLANG_SOCKET_DIR` overrides the location.
-- Games rendering with OpenGL (some ports, even under Proton) are out of reach: the layer only sees Vulkan, including DXVK/VKD3D.
-
-### Gamescope
-
-- `ENABLE_VKSLANG=1` placed before `gamescope` is **inherited by the game**. Set `VKSLANG_PROCESS=gamescope` so only gamescope's output is processed, or leave the variable off to process the game itself.
-- vkSlang only hooks **Vulkan swapchains**. Gamescope's nested Wayland backend presents through Wayland subsurfaces, not through a `VkSwapchainKHR`, so use `--backend sdl`, or process the game (`VKSLANG_PROCESS=<game>`) and let gamescope do the scaling.
-- If gamescope pillarboxes a 4:3 game on a 16:9 output, set `VKSLANG_SOURCE_RECT=4:3`.
-
-## HDR
-
-vkSlang can give an **SDR game real HDR output**, the way RetroArch does: the layer creates the swapchain in HDR10 while the game keeps rendering 8-bit SDR into it (through a view in its own format), then an HDR-aware preset such as `hdr/crt-sony-megatron-v2-default.slangp` reads those SDR pixels and writes PQ.
+CRT presets that simulate interlacing alternate fields on every frame, which at 60 Hz means visible 30 Hz flicker. On a high refresh display, `subframes` presents each application frame several times:
 
 ```sh
-ENABLE_VKSLANG=1 VKSLANG_PRESET=/…/hdr/crt-sony-megatron-v2-default.slangp VKSLANG_SOURCE_RES=640x480 gamescope -W 3840 -H 2160 -f --hdr-enabled -- %command%
+VKSLANG_SUBFRAMES=3   # 60 Hz game on a 240 Hz display: 180 presentations per second
 ```
 
-`hdr_output` (or `VKSLANG_HDR_OUTPUT`) controls this:
+Each subframe advances `FrameCount` and binds `CurrentSubFrame`/`TotalSubFrames`, so presets that alternate fields interlace at the presentation rate. `subframe_mode = black` inserts black frames instead (BFI), which costs almost nothing. The panel shows both rates.
 
-| Value | Behaviour |
+The layer acquires its own images one at a time and never asks for extra ones (that crashes applications that size their swapchain arrays statically, such as Qt's). In FIFO the application is limited to `refresh / subframes`. A compositor that recomposites collapses subframes: through gamescope, use `--backend sdl`.
+
+### HDR
+
+vkSlang can give an **SDR game real HDR output**, the way RetroArch does: the swapchain is created in HDR10 while the game keeps rendering 8-bit SDR into it through a view in its own format, and an HDR preset such as `hdr/crt-sony-megatron-v2-default.slangp` reads those pixels and writes PQ.
+
+```sh
+ENABLE_VKSLANG=1 VKSLANG_PRESET=/…/hdr/crt-sony-megatron-v2-default.slangp %command%
+```
+
+| `hdr_output` | Behaviour |
 |---|---|
-| `auto` (default) | Promote to HDR10 when the preset writes HDR and the surface supports it. |
-| `force` | Promote whenever the surface supports HDR10. |
+| `auto` (default) | Promote to HDR10 when the preset writes HDR and the display supports it. |
+| `force` | Promote whenever the display supports HDR10. |
 | `off` | Never touch the swapchain's format. |
 
-The layer enables `VK_EXT_swapchain_colorspace` by itself, so HDR10 formats are visible even when the game never asks for them. `BrightnessNits` (paper white) and `ExpandGamut` are set in the config or live in `vkslang-ui`, which shows the output's and the preset's color spaces.
+The layer enables `VK_EXT_swapchain_colorspace` itself, so the HDR10 formats are visible even when the game never asks for them. On KDE with HDR enabled this works without gamescope. Paper white and gamut are set in the panel, which also warns when the preset and the output disagree.
 
-Remaining limitations:
+- A game that outputs HDR itself (`DXVK_HDR=1`) hands the preset PQ-encoded pixels while presets expect SDR: colors will be off.
+- An SDR preset on a promoted output looks wrong. Switching presets live does not un-promote the swapchain; that happens when the game restarts.
+- Without an HDR preset, gamescope's own conversion is a good option: `--hdr-enabled --hdr-itm-enabled` with any SDR preset.
 
-- **A game that outputs HDR itself** (`DXVK_HDR=1` plus in-game support): its picture reaches the layer already PQ-encoded, while presets expect SDR, so colors will be off. Input conversion is not implemented.
-- **An SDR preset on a promoted output** looks wrong: either pick an HDR preset or set `hdr_output = off`. Switching presets live does not un-promote the swapchain, which only happens when the game restarts.
-- Without an HDR preset, gamescope's own conversion remains a good option: `--hdr-enabled --hdr-itm-enabled` with any CRT preset in SDR.
+## Troubleshooting
 
-## Live control: `vkslang-ui`
+**`vkslang-ui` lists nothing.** The layer only starts its control socket in a process that has a preset at startup: set one in the launch options, in `vkSlang.conf`, or star a profile for that executable. Also check that the layer loads at all:
 
 ```sh
-ENABLE_VKSLANG=1 VKSLANG_PRESET=/…/crt-easymode.slangp %command%   # the game
-vkslang-ui                                                           # in a separate window
+ENABLE_VKSLANG=1 VK_LOADER_DEBUG=layer vkcube 2>&1 | grep -i vkslang
 ```
 
-The external app (egui, OpenGL, so it never loads the layer itself) connects to the running process and lets you:
+**The process shows as idle ("no swapchain").** It loaded the layer but presents nothing the layer can process: gamescope without `--backend sdl`, or a launcher. With gamescope, add `--backend sdl` and `VKSLANG_PROCESS=gamescope`.
 
-- **switch presets** from a searchable browser of the `shaders_slang` folder (compiled in the background, then swapped in with no stutter), or **tick several** to chain them: the passes of the second run on the output of the first, with the order adjustable. Each entry in the chain has its own checkbox, so one preset can be switched off without touching the others, and **parameter tweaks are kept**: removing or disabling a preset never resets the rest, and its own settings come back if it does;
-- **adjust parameters** with sliders (min/max/step from `#pragma parameter`, declaration order, section headers, ↺ to restore the preset value);
-- change the **source resolution**, the **filter** and the **picture area** live;
-- turn the shader **on/off** (bypass);
-- **save a profile**: a named look kept in `~/.config/vkSlang/profiles/<name>.json`, holding the preset chain, the parameters you changed, the source resolution, the picture and display areas with their scale, the HDR uniforms and the subframes. One click puts it back on a running game, parameters included (they are applied once the chain has finished compiling). The ☆ next to a profile makes the layer load it **automatically for that process**, by writing `profile.<executable>` into `vkSlang.conf`; anything spelled out in the file or the environment still wins.
-- **save** also to a RetroArch-compatible `.slangp` (`#reference` + modified parameters, single preset only) or **as default** in `vkSlang.conf`, leaving your other lines untouched.
+**The shader applies under gamescope but not to the game you meant**, or to everything. `ENABLE_VKSLANG=1` is inherited by every child: use `VKSLANG_PROCESS`, and keep looks out of the global `vkSlang.conf` (prefer starred profiles).
 
-### Protocol
+**An update changed nothing.** Two copies are installed and `~/.local` wins over `/usr`. `VK_LOADER_DEBUG=layer` shows which library is loaded; remove one with `install.sh --uninstall`.
 
-One Unix socket per process: `$XDG_RUNTIME_DIR/vkslang/<pid>.sock` (or `~/.local/state/vkslang/` inside a Steam container), one JSON object per line, one response per request (`crates/vkslang-ipc`). Easy to script:
+**The panel says the layer speaks another protocol.** The game still runs the previous version of the layer: restart it.
+
+**Steam game, no effect.** Install in `/usr`, keep presets in your home directory or under `/usr` (retried under `/run/host`), and read `VKSLANG_LOG_FILE`.
+
+## How it works
+
+| Hook | Role |
+|---|---|
+| `vkNegotiateLoaderLayerInterfaceVersion` | Loader interface v2; hands over the layer's GIPA and GDPA. |
+| `vkCreateInstance` / `vkCreateDevice` | Walk the loader's link info, call down, load `ash` tables on the next layer's pointers. Enable `VK_EXT_swapchain_colorspace` and `VK_KHR_swapchain_mutable_format` when useful, pick a graphics queue for the layer. |
+| `vkGetDeviceQueue(2)` | Map each queue to its family. |
+| `vkCreateSwapchainKHR` | Add `COLOR_ATTACHMENT \| TRANSFER_SRC` usage, a UNORM view format for sRGB swapchains, HDR10 promotion, and share the images between every queue family in play. Load the preset (`FilterChain::load_from_preset_deferred`) and create the source images. |
+| `vkQueuePresentKHR` | Order the layer's work after the application's queue, copy the picture into the source image, run the chain into the swapchain image, repaint the bars opaque black, then present waiting on the layer's semaphore. Subframes follow. |
+| `vkDestroySwapchainKHR` / `vkDestroyDevice` | Wait for the frames in flight and free everything, the chain before the device. |
+
+Applications may present from a queue the layer cannot render on: gamescope composites with a compute shader and presents from its compute queue, **with no wait semaphore**, relying on that queue's order. The layer therefore submits an empty batch on the application's queue that signals a semaphore (a signal covers everything submitted before it on that queue) and waits on it, and creates the swapchain images `CONCURRENT` across the families so no ownership transfer is needed. Without this, the picture was read while gamescope was still writing it, and showed square tiles of an older frame.
+
+The control socket is served by a thread that only writes a desired state with generation counters; everything is applied by `vkQueuePresentKHR` on the presenting thread. Parameters are uniforms, source settings rebuild the source images, and a new preset compiles on a separate thread with its own command pool, then swaps in.
+
+### Control protocol
+
+One Unix socket per process, `$XDG_RUNTIME_DIR/vkslang/<pid>.sock` (`~/.local/state/vkslang/` inside a Steam container), one JSON object per line, one response per request with the full state. Easy to script:
 
 ```sh
 echo '{"cmd":"set_param","name":"MASK_STRENGTH","value":0.5}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/vkslang/<pid>.sock
 ```
 
-Commands: `get_state`, `set_param`, `reset_params`, `load_preset`, `set_enabled`, `set_source`, `set_hdr`. `VKSLANG_IPC=0` (or `ipc = 0`) disables the socket.
+Commands: `get_state`, `set_param`, `reset_params`, `load_presets`, `set_enabled`, `set_source`, `set_hdr`, `set_subframes`, `capture`. See `crates/vkslang-ipc` for the exact messages. The protocol has a version number; the panel refuses a layer that speaks another one and says so.
 
-Inside the layer, the IPC thread only writes a desired state (with generation counters). Changes are applied by `vkQueuePresentKHR` on the presenting thread: parameters are uniforms (cost: nothing), source settings rebuild the low-resolution image, and a new preset is compiled on a separate thread with its own command pool.
+## Limitations
 
-## 5. How it works
+- **x86-64 only.** 32-bit Vulkan games (DXVK for 32-bit Windows games) cannot load the layer; run them through gamescope.
+- **Vulkan only.** OpenGL and GDI programs need gamescope in front.
+- The layer's graphics queue is not externally synchronized with the application's other threads when the application presents from another queue family (vkBasalt has the same limitation).
+- No conversion from an HDR game's output to the SDR input presets expect.
+- The shader cache (`librashader-cache`) is on: the first load of a large preset takes a few seconds, later ones are fast.
 
-| Hook | Role |
-|---|---|
-| `vkNegotiateLoaderLayerInterfaceVersion` | Loader interface v2. Hands over the layer's GIPA and GDPA. |
-| `vkCreateInstance` / `vkCreateDevice` | Walk `VkLayer*CreateInfo` (`VK_LAYER_LINK_INFO`), advance the chain, and load `ash::Instance`/`ash::Device` on the next layer's pointers. Record `pfnSetDeviceLoaderData`, pick a graphics queue, and enable `VK_KHR_swapchain_mutable_format` when it is available. |
-| `vkGetDeviceQueue(2)` | Build a queue → family map, so the layer can submit on the present queue whenever that queue's family allows it. |
-| `vkCreateSwapchainKHR` | Add `COLOR_ATTACHMENT \| TRANSFER_SRC` usage (and `MUTABLE_FORMAT` plus a UNORM/sRGB format list for sRGB swapchains). Load the preset with `FilterChain::load_from_preset_deferred`, which compiles shaders now and runs the GPU upload with the first present. Create the source image and the semaphores. |
-| `vkQueuePresentKHR` | For each image: `PRESENT_SRC → TRANSFER_SRC`, blit to the source image (`→ SHADER_READ_ONLY`), `TRANSFER_SRC → COLOR_ATTACHMENT`, `filter_chain.frame(...)`, then `COLOR_ATTACHMENT → PRESENT_SRC`. The submit waits on the application's semaphores and signals a per-image semaphore, which the real present then waits on. |
-| `vkDestroySwapchainKHR` / `vkDestroyDevice` | Wait on the frame fences, then free everything (the chain is dropped before the device). |
+## Building and development
 
-For sRGB swapchains, librashader samples the source and writes the output through **UNORM** views, the same way a RetroArch framebuffer works, so gamma is never applied twice.
+```sh
+cargo build --release --workspace     # target/release/libvkslang.so and vkslang-ui
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+```
 
-## Known limitations
+```
+crates/vkslang/       the layer (cdylib): hooks, render path, configuration, control socket
+crates/vkslang-ipc/   protocol, client and profiles, shared by the layer and the panel
+crates/vkslang-ui/    the control panel (egui)
+layer/vkslang.json    implicit layer manifest
+config/vkSlang.conf   documented sample configuration
+scripts/install.sh    install and uninstall
+```
 
-- Queues with `EXCLUSIVE` ownership across families (rendering on a different family than the present queue) are not transferred.
-- The fallback graphics queue is not externally synchronized with the application's other threads (vkBasalt has the same limitation).
-- There is no x86 (32-bit) build in CI yet. For that, use `cargo build --target i686-unknown-linux-gnu` together with a second manifest.
-- The shader cache (`librashader-cache`) is enabled: the first load of a large preset takes several seconds, and later loads are fast.
+The layer is written in Rust with `ash` and librashader: librashader's Vulkan runtime is built on `ash` 0.38, so the `ash::Instance` and `ash::Device` the layer loads on the next layer's pointers go straight into the filter chain, with no C ABI and no second library to ship. The library is linked with `-Bsymbolic` and every pointer handed to the loader targets a private function, so the layer also works in applications that link libvulkan directly. Releases are published by pushing a `v*` tag matching the crate version (see `CHANGELOG.md`).
 
 ## License
 

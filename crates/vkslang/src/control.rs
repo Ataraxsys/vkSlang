@@ -28,8 +28,6 @@ pub struct Control {
     pub hdr: HdrSettings,
     pub subframes: u32,
     pub subframe_black: bool,
-    /// Kept for the protocol; the layer no longer reserves images.
-    pub subframes_max: u32,
 
     // ---- published (written by the runtime) ----
     pub running_presets: Vec<PathBuf>,
@@ -58,7 +56,6 @@ static CONTROL: LazyLock<Mutex<Control>> = LazyLock::new(|| {
         hdr: cfg.hdr,
         subframes: cfg.subframes,
         subframe_black: cfg.subframe_black,
-        subframes_max: 8,
         running_presets: Vec::new(),
         loading: false,
         error: None,
@@ -94,7 +91,6 @@ impl Control {
             present_fps: self.present_fps,
             subframes: self.subframes,
             subframe_black: self.subframe_black,
-            subframes_max: self.subframes_max,
             params: self.params.clone(),
             capture: self.capture.clone(),
         }

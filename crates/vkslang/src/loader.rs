@@ -110,10 +110,7 @@ pub unsafe fn device_chain_info(
     info: &vk::DeviceCreateInfo,
     function: LayerFunction,
 ) -> Option<*mut LayerDeviceCreateInfo> {
-    find_in_chain::<LayerDeviceCreateInfo>(
-        info.p_next,
-        vk::StructureType::LOADER_DEVICE_CREATE_INFO,
-        function,
-        |p| ((*p).s_type, (*p).function),
-    )
+    find_in_chain::<LayerDeviceCreateInfo>(info.p_next, vk::StructureType::LOADER_DEVICE_CREATE_INFO, function, |p| {
+        ((*p).s_type, (*p).function)
+    })
 }

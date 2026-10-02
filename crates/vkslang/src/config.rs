@@ -148,7 +148,8 @@ pub fn parse_source_size(spec: &str) -> Option<vkslang_ipc::SourceSize> {
         let percent: f32 = percent.trim().parse().ok()?;
         return (percent > 0.0).then_some(vkslang_ipc::SourceSize::Divide { by: 100.0 / percent });
     }
-    // "/2", "1/2" and plain "2" all mean "half the picture".
+    // "/2" and "1/2" both mean "half the picture". A bare number is refused:
+    // it reads as a size as easily as a divisor.
     let divisor = spec.strip_prefix('/').or_else(|| spec.strip_prefix("1/"));
     if let Some(by) = divisor {
         let by: f32 = by.trim().parse().ok()?;
@@ -196,10 +197,7 @@ pub fn sanitize_hdr(hdr: vkslang_ipc::HdrSettings) -> vkslang_ipc::HdrSettings {
 fn parse_hdr(kv: &HashMap<String, String>) -> vkslang_ipc::HdrSettings {
     let default = vkslang_ipc::HdrSettings::default();
     sanitize_hdr(vkslang_ipc::HdrSettings {
-        brightness_nits: kv
-            .get("brightness_nits")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default.brightness_nits),
+        brightness_nits: kv.get("brightness_nits").and_then(|v| v.parse().ok()).unwrap_or(default.brightness_nits),
         expand_gamut: kv.get("expand_gamut").and_then(|v| v.parse().ok()).unwrap_or(default.expand_gamut),
     })
 }
@@ -304,14 +302,11 @@ impl Config {
             .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
             .unwrap_or_default();
 
-        let mut params: Vec<(String, f32)> = profile
-            .as_ref()
-            .map(|p| p.params.iter().map(|(k, v)| (k.clone(), *v)).collect())
-            .unwrap_or_default();
+        let mut params: Vec<(String, f32)> =
+            profile.as_ref().map(|p| p.params.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
         // Parameters spelled out in the file or the environment win.
-        for (name, value) in kv
-            .iter()
-            .filter_map(|(k, v)| Some((k.strip_prefix("param.")?.to_string(), v.parse::<f32>().ok()?)))
+        for (name, value) in
+            kv.iter().filter_map(|(k, v)| Some((k.strip_prefix("param.")?.to_string(), v.parse::<f32>().ok()?)))
         {
             match params.iter_mut().find(|(n, _)| *n == name) {
                 Some(entry) => entry.1 = value,
@@ -321,9 +316,7 @@ impl Config {
 
         Config {
             preset: match (&profile, kv.get("preset")) {
-                (_, Some(v)) => {
-                    v.split(',').map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect()
-                }
+                (_, Some(v)) => v.split(',').map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from).collect(),
                 (Some(p), None) => p.presets.iter().map(PathBuf::from).collect(),
                 (None, None) => Vec::new(),
             },
@@ -385,7 +378,10 @@ impl Config {
         if self.process.is_empty() {
             return true;
         }
-        self.process.contains(&exe_name())
+        // Case-insensitive, like profile.<executable>: Windows executables
+        // come with whatever case their authors gave them.
+        let exe = exe_name();
+        self.process.iter().any(|p| p.eq_ignore_ascii_case(&exe))
     }
 }
 
@@ -432,8 +428,7 @@ impl Source {
             vkslang_ipc::Filter::Nearest => vk::Filter::NEAREST,
             vkslang_ipc::Filter::Linear => vk::Filter::LINEAR,
         };
-        let display =
-            parse_rect(&s.display).ok_or_else(|| format!("invalid display area '{}'", s.display))?;
+        let display = parse_rect(&s.display).ok_or_else(|| format!("invalid display area '{}'", s.display))?;
         for scale in [s.display_scale, s.source_scale] {
             if !scale.iter().all(|v| v.is_finite() && (0.1..=4.0).contains(v)) {
                 return Err("scales must be between 0.1 and 4".into());
@@ -529,8 +524,7 @@ impl Source {
         let (pw, ph) = (picture.extent.width as f32, picture.extent.height as f32);
         let read_w = (pw / zoom_x.max(0.01)).clamp(1.0, screen_w);
         let read_h = (ph / zoom_y.max(0.01)).clamp(1.0, screen_h);
-        let picture_centre =
-            (picture.offset.x as f32 + pw / 2.0, picture.offset.y as f32 + ph / 2.0);
+        let picture_centre = (picture.offset.x as f32 + pw / 2.0, picture.offset.y as f32 + ph / 2.0);
         let picture = vk::Rect2D {
             offset: vk::Offset2D {
                 x: (picture_centre.0 - read_w / 2.0).clamp(0.0, screen_w - read_w).round() as i32,
@@ -574,10 +568,7 @@ impl Source {
                 let (rw, rh) = if w / h > ratio { (h * ratio, h) } else { (w, w / ratio) };
                 let (rw, rh) = (rw.round().max(1.0) as u32, rh.round().max(1.0) as u32);
                 vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: ((extent.width - rw) / 2) as i32,
-                        y: ((extent.height - rh) / 2) as i32,
-                    },
+                    offset: vk::Offset2D { x: ((extent.width - rw) / 2) as i32, y: ((extent.height - rh) / 2) as i32 },
                     extent: vk::Extent2D { width: rw, height: rh },
                 }
             }
@@ -606,10 +597,7 @@ mod tests {
         assert_eq!(parse_source_size("/0.5"), None);
 
         let src = Source { res: SourceSize::Divide { by: 3.0 }, ..Default::default() };
-        assert_eq!(
-            src.size_for(vk::Extent2D { width: 3840, height: 2160 }),
-            vk::Extent2D { width: 1280, height: 720 }
-        );
+        assert_eq!(src.size_for(vk::Extent2D { width: 3840, height: 2160 }), vk::Extent2D { width: 1280, height: 720 });
     }
 
     #[test]
@@ -619,11 +607,7 @@ mod tests {
         let screen = vk::Extent2D { width: 3840, height: 2160 };
 
         // Below 1: the drawn area shrinks, the picture stays whole.
-        let small = Source {
-            display: SourceRect::Aspect(4.0 / 3.0),
-            display_scale: [0.5, 0.5],
-            ..Default::default()
-        };
+        let small = Source { display: SourceRect::Aspect(4.0 / 3.0), display_scale: [0.5, 0.5], ..Default::default() };
         let (picture, display) = small.framing(screen);
         assert_eq!(display.extent, vk::Extent2D { width: 1440, height: 1080 });
         assert_eq!((display.offset.x, display.offset.y), (480 + 720, 540));
@@ -632,11 +616,7 @@ mod tests {
         // Above 1: the drawn area grows, never past the screen, and the
         // picture is left alone. Enlarging the picture is the source scale's
         // job, and the two must not be confused.
-        let bigger = Source {
-            display: SourceRect::Aspect(4.0 / 3.0),
-            display_scale: [1.2, 2.0],
-            ..Default::default()
-        };
+        let bigger = Source { display: SourceRect::Aspect(4.0 / 3.0), display_scale: [1.2, 2.0], ..Default::default() };
         let (picture, display) = bigger.framing(screen);
         assert_eq!(display.extent, vk::Extent2D { width: 3456, height: 2160 });
         assert_eq!(picture.extent, screen, "the drawn area moved, the picture did not");
@@ -667,10 +647,7 @@ mod tests {
             duplicate: [1, 2],
             ..Default::default()
         };
-        assert_eq!(
-            dos.size_for(vk::Extent2D { width: 1920, height: 1080 }),
-            vk::Extent2D { width: 320, height: 400 }
-        );
+        assert_eq!(dos.size_for(vk::Extent2D { width: 1920, height: 1080 }), vk::Extent2D { width: 320, height: 400 });
     }
 
     #[test]
@@ -704,6 +681,14 @@ mod tests {
         assert_eq!((hdr.brightness_nits, hdr.expand_gamut), (400.0, 3));
         let hdr = parse_hdr(&HashMap::new());
         assert_eq!((hdr.brightness_nits, hdr.expand_gamut), (200.0, 0));
+    }
+
+    /// The sample installed for new users must not set anything: whatever it
+    /// sets applies to every process, gamescope included.
+    #[test]
+    fn sample_config_is_neutral() {
+        let kv = parse_file(include_str!("../../../config/vkSlang.conf"));
+        assert!(kv.is_empty(), "the sample sets {:?}", kv.keys().collect::<Vec<_>>());
     }
 
     #[test]

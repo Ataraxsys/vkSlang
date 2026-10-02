@@ -12,31 +12,47 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     GetState,
     /// Change one preset parameter (applied on the next frame).
-    SetParam { name: String, value: f32 },
+    SetParam {
+        name: String,
+        value: f32,
+    },
     /// Drop every parameter override, back to the preset's values.
     ResetParams,
     /// Compile and switch to another chain (in the background). Several
     /// presets are concatenated: the passes of the second run on the output
     /// of the first, and so on.
-    LoadPresets { paths: Vec<String> },
+    LoadPresets {
+        paths: Vec<String>,
+    },
     /// Bypass the filter chain without unloading it.
-    SetEnabled { enabled: bool },
-    SetSource { source: SourceSettings },
+    SetEnabled {
+        enabled: bool,
+    },
+    SetSource {
+        source: SourceSettings,
+    },
     /// HDR uniforms (`BrightnessNits`, `ExpandGamut`) for HDR-aware presets.
-    SetHdr { hdr: HdrSettings },
+    SetHdr {
+        hdr: HdrSettings,
+    },
     /// Presentations per application frame (interlacing, BFI).
-    SetSubframes { subframes: u32, black: bool },
+    SetSubframes {
+        subframes: u32,
+        black: bool,
+    },
     /// Grab the picture as the application drew it, before the preset, so the
     /// UI can measure its pixel size. Answered immediately; the capture shows
     /// up in `State::capture` once a frame has been presented.
-    Capture { max_width: u32 },
+    Capture {
+        max_width: u32,
+    },
 }
 
 /// A picture grabbed by the layer, written next to the control socket.
@@ -87,14 +103,10 @@ impl ColorSpace {
 /// color space `output`, if any.
 ///
 /// HDR10 vs scRGB is not a problem: HDR-aware presets (e.g. Sony Megatron v2)
-/// adapt their encoding to `HDRMode`. What does not work yet is converting
-/// between SDR and HDR, on the input or the output side.
-pub fn color_space_mismatch(preset: ColorSpace, output: ColorSpace) -> Option<&'static str> {
-    color_space_warning(preset, output, false)
-}
-
-/// Same, for an output the layer promoted to HDR: the application still
-/// renders SDR, so an HDR preset is exactly what is wanted there.
+/// adapt their encoding to `HDRMode`. What does not work is converting
+/// between SDR and HDR, on the input or the output side. On an output the
+/// layer `promoted` to HDR the application still renders SDR, so an HDR
+/// preset is exactly what is wanted there.
 pub fn color_space_warning(preset: ColorSpace, output: ColorSpace, promoted: bool) -> Option<&'static str> {
     if promoted {
         return (!preset.is_hdr())
@@ -300,9 +312,6 @@ pub struct State {
     pub subframes: u32,
     /// Extra subframes are black instead of running the preset.
     pub subframe_black: bool,
-    /// Subframes the swapchain was created with room for; asking for more
-    /// only takes effect after the application restarts.
-    pub subframes_max: u32,
     /// Parameters in declaration order.
     pub params: Vec<Param>,
     /// Last picture grabbed by [`Request::Capture`].
@@ -373,7 +382,6 @@ pub mod profile {
         }
     }
 
-
     pub fn dir() -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -385,11 +393,8 @@ pub mod profile {
     /// Keeps a name usable as a file name, without surprising the user with a
     /// path of their own making.
     pub fn file_name(name: &str) -> String {
-        let cleaned: String = name
-            .trim()
-            .chars()
-            .map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' })
-            .collect();
+        let cleaned: String =
+            name.trim().chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).collect();
         format!("{}.json", cleaned.trim())
     }
 
@@ -417,11 +422,6 @@ pub mod profile {
 
     pub fn delete(profile: &Profile) -> std::io::Result<()> {
         delete_in(&dir(), profile)
-    }
-
-    /// Every saved profile, by name.
-    pub fn list() -> Vec<Profile> {
-        list_in(&dir())
     }
 
     pub fn list_in(dir: &Path) -> Vec<Profile> {
@@ -495,6 +495,31 @@ pub fn socket_dirs() -> Vec<PathBuf> {
 
 pub fn socket_path(pid: u32) -> PathBuf {
     socket_dir().join(format!("{pid}.sock"))
+}
+
+/// Where the layer of process `pid` writes its captures (next to its socket).
+pub fn capture_path(pid: u32) -> PathBuf {
+    socket_dir().join(format!("{pid}-capture.bin"))
+}
+
+/// Removes the socket and capture files left by processes that are gone.
+/// Captures are several megabytes each, and nothing else ever deletes them.
+pub fn remove_stale_files() {
+    remove_stale_files_in(&socket_dirs());
+}
+
+fn remove_stale_files_in(dirs: &[PathBuf]) {
+    let alive = |pid: u32| Path::new(&format!("/proc/{pid}")).exists();
+    for dir in dirs {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let pid = name.strip_suffix(".sock").or_else(|| name.strip_suffix("-capture.bin"));
+            if pid.and_then(|p| p.parse().ok()).is_some_and(|pid| !alive(pid)) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
 }
 
 /// Sockets currently present, as `(pid, path)`, across every candidate
@@ -579,10 +604,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(s, r#"{"cmd":"set_param","name":"GAMMA","value":2.4}"#);
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
-        assert_eq!(
-            serde_json::from_str::<Request>(r#"{"cmd":"get_state"}"#).unwrap(),
-            Request::GetState
-        );
+        assert_eq!(serde_json::from_str::<Request>(r#"{"cmd":"get_state"}"#).unwrap(), Request::GetState);
         assert_eq!(
             serde_json::to_string(&Request::SetHdr { hdr: HdrSettings::default() }).unwrap(),
             r#"{"cmd":"set_hdr","hdr":{"brightness_nits":200.0,"expand_gamut":0}}"#
@@ -614,11 +636,34 @@ mod tests {
     #[test]
     fn mismatch() {
         use ColorSpace::*;
-        assert!(color_space_mismatch(Sdr, Sdr).is_none());
-        assert!(color_space_mismatch(Hdr10, Sdr).is_some());
-        assert!(color_space_mismatch(Sdr, Hdr10).is_some());
+        assert!(color_space_warning(Sdr, Sdr, false).is_none());
+        assert!(color_space_warning(Hdr10, Sdr, false).is_some());
+        assert!(color_space_warning(Sdr, Hdr10, false).is_some());
         // HDR10 vs scRGB is fine, only the input caveat remains.
-        assert_eq!(color_space_mismatch(ScRgb, Hdr10), color_space_mismatch(Hdr10, Hdr10));
+        assert_eq!(color_space_warning(ScRgb, Hdr10, false), color_space_warning(Hdr10, Hdr10, false));
+    }
+
+    #[test]
+    fn stale_files_are_swept() {
+        let dir = std::env::temp_dir().join(format!("vkslang-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+        let gone = u32::MAX - 1; // above any pid_max
+        for name in [
+            format!("{me}.sock"),
+            format!("{me}-capture.bin"),
+            format!("{gone}.sock"),
+            format!("{gone}-capture.bin"),
+            "notes.txt".into(),
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        remove_stale_files_in(std::slice::from_ref(&dir));
+        let mut left: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec![format!("{me}-capture.bin"), format!("{me}.sock"), "notes.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

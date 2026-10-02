@@ -30,8 +30,6 @@ struct GridImage {
     area: [i32; 4],
 }
 
-/// Converts a frame drawn on the capture into a picture area in output
-/// pixels, as `source_rect` spells it.
 /// How many screen pixels one game pixel covers: the divisor that brings the
 /// screen back to the game's own grid. Integer scaling keeps whole screen
 /// pixels per game pixel; otherwise the picture is fitted to the screen.
@@ -44,9 +42,10 @@ fn game_scale(screen: [u32; 2], game: [u32; 2], integer: bool) -> f32 {
     }
 }
 
+/// Converts a frame drawn on the capture into a picture area in output
+/// pixels, as `source_rect` spells it.
 fn frame_to_area(frame: egui::Rect, capture: [u32; 2], base: [u32; 2]) -> String {
-    let to_output =
-        egui::vec2(base[0] as f32 / capture[0] as f32, base[1] as f32 / capture[1] as f32);
+    let to_output = egui::vec2(base[0] as f32 / capture[0] as f32, base[1] as f32 / capture[1] as f32);
     let x = (frame.min.x * to_output.x).round().max(0.0);
     let y = (frame.min.y * to_output.y).round().max(0.0);
     let w = (frame.width() * to_output.x).round().max(1.0).min(base[0] as f32 - x);
@@ -125,17 +124,9 @@ impl SourceEdit {
             display_scale: s.display_scale,
             source_scale: s.source_scale,
             source_locked: true,
-            source_ratio: if s.source_scale[0] > 0.0 {
-                s.source_scale[1] / s.source_scale[0]
-            } else {
-                1.0
-            },
+            source_ratio: if s.source_scale[0] > 0.0 { s.source_scale[1] / s.source_scale[0] } else { 1.0 },
             scale_locked: true,
-            scale_ratio: if s.display_scale[0] > 0.0 {
-                s.display_scale[1] / s.display_scale[0]
-            } else {
-                1.0
-            },
+            scale_ratio: if s.display_scale[0] > 0.0 { s.display_scale[1] / s.display_scale[0] } else { 1.0 },
             calc_screen: None,
             calc_game: [640, 480],
             calc_integer: true,
@@ -208,6 +199,11 @@ struct App {
     profiles: Vec<profile::Profile>,
     profile_name: String,
     pending_params: Option<std::collections::BTreeMap<String, f32>>,
+    /// Profile whose 🗙 was clicked, waiting for a second click.
+    confirm_delete: Option<String>,
+    /// Default profile of a process as read from vkSlang.conf, kept rather
+    /// than reading the file on every repaint. `None` until read.
+    default_profile: Option<(String, Option<String>)>,
 }
 
 fn default_shader_root() -> String {
@@ -328,6 +324,8 @@ impl App {
             profiles: profile::read_dir(&profile::dir()).0,
             profile_name: String::new(),
             pending_params: None,
+            confirm_delete: None,
+            default_profile: None,
         }
     }
 
@@ -336,6 +334,8 @@ impl App {
     fn reload_profiles(&mut self) {
         let (profiles, failures) = profile::read_dir(&profile::dir());
         self.profiles = profiles;
+        // vkSlang.conf may have been edited by hand too.
+        self.default_profile = None;
         if !failures.is_empty() {
             self.error(format!("unreadable profile(s): {}", failures.join("; ")));
         }
@@ -350,16 +350,15 @@ impl App {
     }
 
     fn scan_targets(&mut self) {
+        vkslang_ipc::remove_stale_files();
         let connected = self.selected;
         let active_now = self.state.as_ref().is_some_and(|s| !s.outputs.is_empty());
         self.targets = vkslang_ipc::list_sockets()
             .into_iter()
             .filter_map(|(pid, path)| {
-                let Some(name) = process_name(pid) else {
-                    // Process gone: clean the stale socket.
-                    let _ = std::fs::remove_file(&path);
-                    return None;
-                };
+                // Process gone between the sweep and now: skip it, the next
+                // sweep removes its files.
+                let name = process_name(pid)?;
                 // Ask the others whether they have a swapchain; the connected
                 // one is already known from its state.
                 let active = if Some(pid) == connected {
@@ -421,13 +420,9 @@ impl App {
                 if self.source.is_none() {
                     self.source = Some(SourceEdit::from(&state.source));
                 }
-                if self.save_path.is_empty()
-                    || self.state.as_ref().map(|s| &s.presets) != Some(&state.presets)
-                {
+                if self.save_path.is_empty() || self.state.as_ref().map(|s| &s.presets) != Some(&state.presets) {
                     self.save_path =
-                        save::default_preset_path(state.presets.first().map(String::as_str))
-                            .display()
-                            .to_string();
+                        save::default_preset_path(state.presets.first().map(String::as_str)).display().to_string();
                 }
                 self.state = Some(state);
             }
@@ -448,14 +443,19 @@ impl App {
     }
 
     /// Applies a saved profile: the chain first, its parameters once it has
-    /// finished compiling (the layer drops the overrides when it loads).
+    /// finished compiling.
+    ///
+    /// The layer keeps parameter tweaks across chain changes, so they are
+    /// reset first: a profile holds only the parameters it changed, and the
+    /// previous look's tweaks would otherwise leak into it.
     fn apply_profile(&mut self, p: &profile::Profile) {
         if self.client.is_none() {
             self.error("no process connected");
             return;
         }
-        self.chain =
-            p.presets.iter().map(|s| ChainEntry { path: PathBuf::from(s), enabled: true }).collect();
+        self.chain = p.presets.iter().map(|s| ChainEntry { path: PathBuf::from(s), enabled: true }).collect();
+        self.send(Request::ResetParams);
+        self.send(Request::SetEnabled { enabled: true });
         self.send(Request::LoadPresets { paths: p.presets.clone() });
         self.send(Request::SetSource { source: p.source.clone() });
         self.send(Request::SetHdr { hdr: p.hdr });
@@ -502,8 +502,7 @@ impl App {
             let show_all = self.show_all;
             egui::ComboBox::from_id_salt("target").selected_text(current).width(220.0).show_ui(ui, |ui| {
                 for t in self.targets.iter().filter(|t| t.active || show_all) {
-                    let label =
-                        if t.active { t.label.clone() } else { format!("{} (no swapchain)", t.label) };
+                    let label = if t.active { t.label.clone() } else { format!("{} (no swapchain)", t.label) };
                     ui.selectable_value(&mut choice, Some(t.pid), label);
                 }
             });
@@ -548,7 +547,7 @@ impl App {
             let dismiss = ui
                 .horizontal(|ui| {
                     ui.colored_label(color, msg.as_str());
-                    ui.small_button("✕").clicked()
+                    ui.small_button("🗙").clicked()
                 })
                 .inner;
             if dismiss {
@@ -591,22 +590,18 @@ impl App {
             let mut toggled = false;
             for (i, entry) in chain.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    let name =
-                        entry.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    let name = entry.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                     ui.weak(format!("{}.", i + 1));
                     // Switching one off leaves the others, and their
                     // parameters, exactly as they are.
-                    toggled |= ui
-                        .checkbox(&mut entry.enabled, "")
-                        .on_hover_text("Run this one in the chain")
-                        .changed();
+                    toggled |= ui.checkbox(&mut entry.enabled, "").on_hover_text("Run this one in the chain").changed();
                     if ui.small_button("↑").clicked() && i > 0 {
                         swap = Some((i - 1, i));
                     }
                     if ui.small_button("↓").clicked() {
                         swap = Some((i, i + 1));
                     }
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button("🗙").clicked() {
                         remove = Some(i);
                     }
                     let label = if entry.enabled {
@@ -641,12 +636,8 @@ impl App {
             self.chain = vec![ChainEntry { path: path.clone(), enabled: true }];
             self.send(Request::LoadPresets { paths: vec![path.display().to_string()] });
         } else if apply_chain {
-            let paths: Vec<String> = self
-                .chain
-                .iter()
-                .filter(|e| e.enabled)
-                .map(|e| e.path.display().to_string())
-                .collect();
+            let paths: Vec<String> =
+                self.chain.iter().filter(|e| e.enabled).map(|e| e.path.display().to_string()).collect();
             if paths.is_empty() {
                 // Nothing left to run: bypass rather than fail.
                 self.send(Request::SetEnabled { enabled: false });
@@ -675,9 +666,7 @@ impl App {
                 edit.mode = SourceSize::Native;
                 changed = true;
             }
-            if ui.selectable_label(divide, "divide").on_hover_text("Native size divided by N").clicked()
-                && !divide
-            {
+            if ui.selectable_label(divide, "divide").on_hover_text("Native size divided by N").clicked() && !divide {
                 edit.mode = SourceSize::Divide { by: edit.divisor };
                 changed = true;
             }
@@ -748,10 +737,8 @@ impl App {
                 ui.add(egui::DragValue::new(&mut edit.calc_game[1]).range(1..=4320));
                 ui.checkbox(&mut edit.calc_integer, "integer scale");
                 let by = game_scale(screen, edit.calc_game, edit.calc_integer);
-                let shown = [
-                    (edit.calc_game[0] as f32 * by).round() as u32,
-                    (edit.calc_game[1] as f32 * by).round() as u32,
-                ];
+                let shown =
+                    [(edit.calc_game[0] as f32 * by).round() as u32, (edit.calc_game[1] as f32 * by).round() as u32];
                 if ui
                     .button(format!("use ÷{}", (by * 100.0).round() / 100.0))
                     .on_hover_text(format!("The game is shown {}×{} on the screen", shown[0], shown[1]))
@@ -785,11 +772,7 @@ impl App {
             if let Some(axis) = moved {
                 if edit.source_locked {
                     let ratio = edit.source_ratio.max(0.01);
-                    let other = if axis == 0 {
-                        edit.source_scale[0] * ratio
-                    } else {
-                        edit.source_scale[1] / ratio
-                    };
+                    let other = if axis == 0 { edit.source_scale[0] * ratio } else { edit.source_scale[1] / ratio };
                     edit.source_scale[1 - axis] = other.clamp(0.25, 4.0);
                 }
                 changed = true;
@@ -800,11 +783,8 @@ impl App {
                 .changed()
                 && edit.source_locked
             {
-                edit.source_ratio = if edit.source_scale[0] > 0.0 {
-                    edit.source_scale[1] / edit.source_scale[0]
-                } else {
-                    1.0
-                };
+                edit.source_ratio =
+                    if edit.source_scale[0] > 0.0 { edit.source_scale[1] / edit.source_scale[0] } else { 1.0 };
             }
             if ui.small_button("1:1").clicked() {
                 edit.source_scale = [1.0, 1.0];
@@ -850,7 +830,10 @@ impl App {
                     changed = true;
                 }
             }
-            ui.separator();
+        });
+        // A row of its own: egui cannot wrap a slider, and sharing the row
+        // pushed the second one past the window, widening the whole panel.
+        ui.horizontal_wrapped(|ui| {
             // Two different things, kept apart on purpose: one moves the
             // drawn area (preset and picture together), the other moves the
             // picture inside it (the preset keeps its geometry).
@@ -875,11 +858,7 @@ impl App {
                 if edit.scale_locked {
                     // Follow the ratio rather than forcing both to be equal.
                     let ratio = edit.scale_ratio.max(0.01);
-                    let other = if axis == 0 {
-                        edit.display_scale[0] * ratio
-                    } else {
-                        edit.display_scale[1] / ratio
-                    };
+                    let other = if axis == 0 { edit.display_scale[0] * ratio } else { edit.display_scale[1] / ratio };
                     edit.display_scale[1 - axis] = other.clamp(0.25, 2.0);
                 }
                 changed = true;
@@ -890,11 +869,8 @@ impl App {
                 .changed()
                 && edit.scale_locked
             {
-                edit.scale_ratio = if edit.display_scale[0] > 0.0 {
-                    edit.display_scale[1] / edit.display_scale[0]
-                } else {
-                    1.0
-                };
+                edit.scale_ratio =
+                    if edit.display_scale[0] > 0.0 { edit.display_scale[1] / edit.display_scale[0] } else { 1.0 };
             }
             if ui.small_button("1:1").on_hover_text("Back to full size, square").clicked() {
                 edit.display_scale = [1.0, 1.0];
@@ -1001,9 +977,14 @@ impl App {
         if ui.button("Reset all").clicked() {
             requests.push(Request::ResetParams);
         }
-        egui::ScrollArea::vertical().auto_shrink([false, false]).max_height((ui.available_height() - 90.0).max(120.0)).show(
-            ui,
-            |ui| {
+        // A vertical-only scroll area grows to its widest row, and a long
+        // parameter description used to widen the whole panel past the
+        // window: the width is capped and descriptions are truncated.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_width(ui.available_width())
+            .max_height(ui.available_height().max(120.0))
+            .show(ui, |ui| {
                 if state.params.is_empty() {
                     ui.weak("This preset has no parameters.");
                 }
@@ -1025,8 +1006,7 @@ impl App {
                         let before = p.value;
                         let slider = egui::Slider::new(&mut p.value, p.minimum..=p.maximum)
                             .step_by(p.step.max(0.0001) as f64)
-                            .max_decimals(4)
-                            .text(p.description.trim());
+                            .max_decimals(4);
                         let slider = ui.add(slider).on_hover_text(p.name.as_str());
                         if slider.changed() {
                             if (p.value - before).abs() > p.epsilon() {
@@ -1040,10 +1020,12 @@ impl App {
                             p.value = p.initial;
                             requests.push(Request::SetParam { name: p.name.clone(), value: p.initial });
                         }
+                        let description = p.description.trim();
+                        ui.add(egui::Label::new(description).truncate())
+                            .on_hover_text(format!("{description}\n{}", p.name));
                     });
                 }
-            },
-        );
+            });
         for r in requests {
             self.send(r);
         }
@@ -1051,14 +1033,9 @@ impl App {
 
     fn profile_panel(&mut self, ui: &mut egui::Ui) {
         let Some(state) = self.state.clone() else { return };
-        ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.label("Profile");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.profile_name)
-                    .hint_text("name")
-                    .desired_width(160.0),
-            );
+            ui.add(egui::TextEdit::singleline(&mut self.profile_name).hint_text("name").desired_width(160.0));
             let named = !self.profile_name.trim().is_empty();
             if ui
                 .add_enabled(named, egui::Button::new("Save"))
@@ -1080,9 +1057,19 @@ impl App {
         });
 
         let profiles = self.profiles.clone();
-        let default_profile = save::default_profile_for(&state.process);
+        let default_profile = match &self.default_profile {
+            Some((process, name)) if *process == state.process => name.clone(),
+            _ => {
+                let name = save::default_profile_for(&state.process);
+                self.default_profile = Some((state.process.clone(), name.clone()));
+                name
+            }
+        };
+        let confirm_delete = self.confirm_delete.clone();
         let mut apply = None;
         let mut delete = None;
+        let mut ask_delete = None;
+        let mut keep = false;
         let mut set_default: Option<Option<profile::Profile>> = None;
         ui.horizontal_wrapped(|ui| {
             if profiles.is_empty() {
@@ -1092,11 +1079,7 @@ impl App {
                 let running = state.presets == p.presets;
                 if ui
                     .selectable_label(running, &p.name)
-                    .on_hover_text(format!(
-                        "{} preset(s), {} parameter(s)",
-                        p.presets.len(),
-                        p.params.len()
-                    ))
+                    .on_hover_text(format!("{} preset(s), {} parameter(s)", p.presets.len(), p.params.len()))
                     .clicked()
                 {
                     apply = Some(p.clone());
@@ -1109,18 +1092,30 @@ impl App {
                 {
                     set_default = Some(if is_default { None } else { Some(p.clone()) });
                 }
-                if ui.small_button("✕").on_hover_text(format!("Delete {}", p.name)).clicked() {
-                    delete = Some(p.clone());
+                if confirm_delete.as_deref() == Some(p.name.as_str()) {
+                    if ui.small_button("delete").on_hover_text(format!("Delete {} for good", p.name)).clicked() {
+                        delete = Some(p.clone());
+                    }
+                    keep |= ui.small_button("keep").clicked();
+                } else if ui.small_button("🗙").on_hover_text(format!("Delete {}", p.name)).clicked() {
+                    ask_delete = Some(p.name.clone());
                 }
                 ui.separator();
             }
         });
+        if let Some(name) = ask_delete {
+            self.confirm_delete = Some(name);
+        }
+        if keep {
+            self.confirm_delete = None;
+        }
         if let Some(p) = apply {
             self.profile_name = p.name.clone();
             self.apply_profile(&p);
         }
         if let Some(choice) = set_default {
             let name = choice.as_ref().map(|p| p.name.clone());
+            self.default_profile = None;
             match save::set_default_profile(&state.process, name.as_deref()) {
                 Ok(()) => self.info(match &name {
                     Some(n) => format!("{n} will load automatically for {}", state.process),
@@ -1130,6 +1125,7 @@ impl App {
             }
         }
         if let Some(p) = delete {
+            self.confirm_delete = None;
             match profile::delete(&p) {
                 Ok(()) => {
                     self.info(format!("deleted {}", p.name));
@@ -1145,14 +1141,17 @@ impl App {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Preset");
-            ui.add(egui::TextEdit::singleline(&mut self.save_path).desired_width((ui.available_width() - 260.0).max(120.0)));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.save_path)
+                    .desired_width((ui.available_width() - 260.0).max(120.0)),
+            );
             let single = state.presets.len() == 1;
             if ui
                 .add_enabled(single, egui::Button::new("Save .slangp"))
                 .on_hover_text(if single {
                     "#reference + changed parameters (RetroArch compatible)"
                 } else {
-                    "A .slangp references a single preset; use \"Save as default\" for a chain"
+                    "A .slangp references a single preset; save a profile to keep a chain"
                 })
                 .clicked()
             {
@@ -1162,7 +1161,12 @@ impl App {
                     Err(e) => self.error(format!("save failed: {e}")),
                 }
             }
-            if ui.button("Save as default").on_hover_text(save::config_path().display().to_string()).clicked() {
+            let global = format!(
+                "Writes this look into {}, where it applies to every game the layer runs in. \
+                 For one game, save a profile and star it instead.",
+                save::config_path().display()
+            );
+            if ui.button("Save for all games").on_hover_text(global).clicked() {
                 match save::save_config(&state) {
                     Ok(path) => self.info(format!("updated {}", path.display())),
                     Err(e) => self.error(format!("save failed: {e}")),
@@ -1238,13 +1242,8 @@ impl App {
                     let scale = size[0] as f32 / capture.base[0] as f32;
                     let [ax, ay, aw, ah] = capture.area.map(|v| v as f32 * scale);
                     self.frame_rect = egui::Rect::from_min_size(egui::pos2(ax, ay), egui::vec2(aw, ah));
-                    self.grid_texture = Some(GridImage {
-                        id: capture.id,
-                        texture,
-                        size,
-                        base: capture.base,
-                        area: capture.area,
-                    });
+                    self.grid_texture =
+                        Some(GridImage { id: capture.id, texture, size, base: capture.base, area: capture.area });
                 }
             }
         }
@@ -1461,6 +1460,14 @@ impl eframe::App for App {
         self.tick();
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::left("presets").resizable(true).default_size(340.0).show(ui, |ui| self.preset_browser(ui));
+        // Profiles and saving stay pinned at the bottom: in the central panel
+        // a long profile list pushed the save buttons out of the window.
+        if self.client.is_some() {
+            egui::Panel::bottom("profiles").show(ui, |ui| {
+                self.profile_panel(ui);
+                self.save_panel(ui);
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             if self.client.is_none() {
                 ui.heading("No process connected");
@@ -1479,8 +1486,6 @@ impl eframe::App for App {
             self.presentation_panel(ui);
             ui.separator();
             self.params_panel(ui);
-            self.profile_panel(ui);
-            self.save_panel(ui);
         });
         self.pixel_grid_window(ui.ctx());
         ui.ctx().request_repaint_after(POLL);

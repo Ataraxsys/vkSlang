@@ -54,10 +54,8 @@ pub struct DeviceData {
     pub runtime: Mutex<Option<Runtime>>,
 }
 
-pub static INSTANCES: LazyLock<Mutex<HashMap<DispatchKey, Arc<InstanceData>>>> =
-    LazyLock::new(Default::default);
-pub static DEVICES: LazyLock<Mutex<HashMap<DispatchKey, Arc<DeviceData>>>> =
-    LazyLock::new(Default::default);
+pub static INSTANCES: LazyLock<Mutex<HashMap<DispatchKey, Arc<InstanceData>>>> = LazyLock::new(Default::default);
+pub static DEVICES: LazyLock<Mutex<HashMap<DispatchKey, Arc<DeviceData>>>> = LazyLock::new(Default::default);
 
 pub fn instance<H: vk::Handle>(handle: H) -> Option<Arc<InstanceData>> {
     let key = unsafe { dispatch_key(handle) };

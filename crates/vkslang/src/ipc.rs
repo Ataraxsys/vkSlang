@@ -36,9 +36,7 @@ fn serve() -> std::io::Result<()> {
     let listener = UnixListener::bind(&path)?;
     log_info!("control socket {}", path.display());
     for stream in listener.incoming().flatten() {
-        let _ = std::thread::Builder::new()
-            .name("vkslang-ipc-client".into())
-            .spawn(move || client(stream));
+        let _ = std::thread::Builder::new().name("vkslang-ipc-client".into()).spawn(move || client(stream));
     }
     Ok(())
 }

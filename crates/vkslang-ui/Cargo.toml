@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# eframe 0.36
+rust-version = "1.95"
 publish = false
 
 [dependencies]
