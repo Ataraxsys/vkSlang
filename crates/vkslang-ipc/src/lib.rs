@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -103,14 +103,10 @@ impl ColorSpace {
 /// color space `output`, if any.
 ///
 /// HDR10 vs scRGB is not a problem: HDR-aware presets (e.g. Sony Megatron v2)
-/// adapt their encoding to `HDRMode`. What does not work yet is converting
-/// between SDR and HDR, on the input or the output side.
-pub fn color_space_mismatch(preset: ColorSpace, output: ColorSpace) -> Option<&'static str> {
-    color_space_warning(preset, output, false)
-}
-
-/// Same, for an output the layer promoted to HDR: the application still
-/// renders SDR, so an HDR preset is exactly what is wanted there.
+/// adapt their encoding to `HDRMode`. What does not work is converting
+/// between SDR and HDR, on the input or the output side. On an output the
+/// layer `promoted` to HDR the application still renders SDR, so an HDR
+/// preset is exactly what is wanted there.
 pub fn color_space_warning(preset: ColorSpace, output: ColorSpace, promoted: bool) -> Option<&'static str> {
     if promoted {
         return (!preset.is_hdr())
@@ -316,9 +312,6 @@ pub struct State {
     pub subframes: u32,
     /// Extra subframes are black instead of running the preset.
     pub subframe_black: bool,
-    /// Subframes the swapchain was created with room for; asking for more
-    /// only takes effect after the application restarts.
-    pub subframes_max: u32,
     /// Parameters in declaration order.
     pub params: Vec<Param>,
     /// Last picture grabbed by [`Request::Capture`].
@@ -429,11 +422,6 @@ pub mod profile {
 
     pub fn delete(profile: &Profile) -> std::io::Result<()> {
         delete_in(&dir(), profile)
-    }
-
-    /// Every saved profile, by name.
-    pub fn list() -> Vec<Profile> {
-        list_in(&dir())
     }
 
     pub fn list_in(dir: &Path) -> Vec<Profile> {
@@ -648,11 +636,11 @@ mod tests {
     #[test]
     fn mismatch() {
         use ColorSpace::*;
-        assert!(color_space_mismatch(Sdr, Sdr).is_none());
-        assert!(color_space_mismatch(Hdr10, Sdr).is_some());
-        assert!(color_space_mismatch(Sdr, Hdr10).is_some());
+        assert!(color_space_warning(Sdr, Sdr, false).is_none());
+        assert!(color_space_warning(Hdr10, Sdr, false).is_some());
+        assert!(color_space_warning(Sdr, Hdr10, false).is_some());
         // HDR10 vs scRGB is fine, only the input caveat remains.
-        assert_eq!(color_space_mismatch(ScRgb, Hdr10), color_space_mismatch(Hdr10, Hdr10));
+        assert_eq!(color_space_warning(ScRgb, Hdr10, false), color_space_warning(Hdr10, Hdr10, false));
     }
 
     #[test]

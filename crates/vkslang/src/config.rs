@@ -148,7 +148,8 @@ pub fn parse_source_size(spec: &str) -> Option<vkslang_ipc::SourceSize> {
         let percent: f32 = percent.trim().parse().ok()?;
         return (percent > 0.0).then_some(vkslang_ipc::SourceSize::Divide { by: 100.0 / percent });
     }
-    // "/2", "1/2" and plain "2" all mean "half the picture".
+    // "/2" and "1/2" both mean "half the picture". A bare number is refused:
+    // it reads as a size as easily as a divisor.
     let divisor = spec.strip_prefix('/').or_else(|| spec.strip_prefix("1/"));
     if let Some(by) = divisor {
         let by: f32 = by.trim().parse().ok()?;
@@ -377,7 +378,10 @@ impl Config {
         if self.process.is_empty() {
             return true;
         }
-        self.process.contains(&exe_name())
+        // Case-insensitive, like profile.<executable>: Windows executables
+        // come with whatever case their authors gave them.
+        let exe = exe_name();
+        self.process.iter().any(|p| p.eq_ignore_ascii_case(&exe))
     }
 }
 
