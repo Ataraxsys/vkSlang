@@ -608,7 +608,7 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
     };
     if subframes > 1 && matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR) {
         for swapchain in processed {
-            rt.present_subframes(&dev, submit_queue, swapchain, subframes, black);
+            rt.present_subframes(&dev, submit_queue, queue, swapchain, subframes, black);
         }
     }
     drop(guard);

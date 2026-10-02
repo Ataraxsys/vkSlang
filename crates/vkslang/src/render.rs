@@ -990,13 +990,18 @@ impl Runtime {
     /// presets can alternate fields (interlacing) or insert black frames
     /// faster than the application's frame rate.
     ///
-    /// The layer acquires images of its own, which is why the swapchain was
-    /// created with extras. Anything unexpected (no image available in time,
-    /// a resize) simply ends the extra presentations for this frame.
+    /// The layer acquires images of its own, one at a time. Anything
+    /// unexpected (no image available in time, a resize) simply ends the
+    /// extra presentations for this frame.
+    ///
+    /// Work is submitted on `queue`, the layer's, and presented on
+    /// `present_queue`, the application's: the only queue known to be able to
+    /// present to this surface.
     pub unsafe fn present_subframes(
         &mut self,
         dev: &DeviceData,
         queue: vk::Queue,
+        present_queue: vk::Queue,
         swapchain: vk::SwapchainKHR,
         total: u32,
         black: bool,
@@ -1034,16 +1039,24 @@ impl Runtime {
             } else {
                 self.render(dev, queue, swapchain, index, &[acquire], None, Some((current, total))).unwrap_or(None)
             };
-            let Some(done) = done else { return };
-
-            let wait = [done];
+            // Nothing was submitted: the image still has to go back to the
+            // swapchain, or the application would run out of images. It is
+            // presented as it is, waiting on the acquire semaphore no
+            // submission consumed.
+            let (wait, finished) = match done {
+                Some(done) => ([done], false),
+                None => ([acquire], true),
+            };
             let swapchains = [swapchain];
             let indices = [index];
             let info =
                 vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&indices);
-            let r = (dev.swapchain_fn.queue_present_khr)(queue, &info);
+            let r = (dev.swapchain_fn.queue_present_khr)(present_queue, &info);
             if r != vk::Result::SUCCESS && r != vk::Result::SUBOPTIMAL_KHR {
                 log_debug!("subframe present failed ({r})");
+                return;
+            }
+            if finished {
                 return;
             }
         }
