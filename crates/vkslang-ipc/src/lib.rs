@@ -19,24 +19,40 @@ pub const PROTOCOL_VERSION: u32 = 14;
 pub enum Request {
     GetState,
     /// Change one preset parameter (applied on the next frame).
-    SetParam { name: String, value: f32 },
+    SetParam {
+        name: String,
+        value: f32,
+    },
     /// Drop every parameter override, back to the preset's values.
     ResetParams,
     /// Compile and switch to another chain (in the background). Several
     /// presets are concatenated: the passes of the second run on the output
     /// of the first, and so on.
-    LoadPresets { paths: Vec<String> },
+    LoadPresets {
+        paths: Vec<String>,
+    },
     /// Bypass the filter chain without unloading it.
-    SetEnabled { enabled: bool },
-    SetSource { source: SourceSettings },
+    SetEnabled {
+        enabled: bool,
+    },
+    SetSource {
+        source: SourceSettings,
+    },
     /// HDR uniforms (`BrightnessNits`, `ExpandGamut`) for HDR-aware presets.
-    SetHdr { hdr: HdrSettings },
+    SetHdr {
+        hdr: HdrSettings,
+    },
     /// Presentations per application frame (interlacing, BFI).
-    SetSubframes { subframes: u32, black: bool },
+    SetSubframes {
+        subframes: u32,
+        black: bool,
+    },
     /// Grab the picture as the application drew it, before the preset, so the
     /// UI can measure its pixel size. Answered immediately; the capture shows
     /// up in `State::capture` once a frame has been presented.
-    Capture { max_width: u32 },
+    Capture {
+        max_width: u32,
+    },
 }
 
 /// A picture grabbed by the layer, written next to the control socket.
@@ -373,7 +389,6 @@ pub mod profile {
         }
     }
 
-
     pub fn dir() -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -385,11 +400,8 @@ pub mod profile {
     /// Keeps a name usable as a file name, without surprising the user with a
     /// path of their own making.
     pub fn file_name(name: &str) -> String {
-        let cleaned: String = name
-            .trim()
-            .chars()
-            .map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' })
-            .collect();
+        let cleaned: String =
+            name.trim().chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).collect();
         format!("{}.json", cleaned.trim())
     }
 
@@ -579,10 +591,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(s, r#"{"cmd":"set_param","name":"GAMMA","value":2.4}"#);
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
-        assert_eq!(
-            serde_json::from_str::<Request>(r#"{"cmd":"get_state"}"#).unwrap(),
-            Request::GetState
-        );
+        assert_eq!(serde_json::from_str::<Request>(r#"{"cmd":"get_state"}"#).unwrap(), Request::GetState);
         assert_eq!(
             serde_json::to_string(&Request::SetHdr { hdr: HdrSettings::default() }).unwrap(),
             r#"{"cmd":"set_hdr","hdr":{"brightness_nits":200.0,"expand_gamut":0}}"#

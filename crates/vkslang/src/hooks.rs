@@ -57,8 +57,7 @@ pub unsafe extern "system" fn create_instance(
         .any(|&e| CStr::from_ptr(e) == colorspace_ext);
     let add_colorspace = config::get().hdr_output != HdrOutput::Off && !already_enabled;
 
-    let mut extensions: Vec<*const c_char> =
-        slice(ci.pp_enabled_extension_names, ci.enabled_extension_count).to_vec();
+    let mut extensions: Vec<*const c_char> = slice(ci.pp_enabled_extension_names, ci.enabled_extension_count).to_vec();
     let mut modified = *ci;
     if add_colorspace {
         extensions.push(colorspace_ext.as_ptr());
@@ -130,8 +129,7 @@ pub unsafe extern "system" fn create_device(
     else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
-    let Some(next_create): Option<vk::PFN_vkCreateDevice> = load_pfn(next_gipa, inst.handle, c"vkCreateDevice")
-    else {
+    let Some(next_create): Option<vk::PFN_vkCreateDevice> = load_pfn(next_gipa, inst.handle, c"vkCreateDevice") else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
 
@@ -143,11 +141,7 @@ pub unsafe extern "system" fn create_device(
     let graphics_family = slice(ci.p_queue_create_infos, ci.queue_create_info_count)
         .iter()
         .map(|q| q.queue_family_index)
-        .find(|&f| {
-            families
-                .get(f as usize)
-                .is_some_and(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-        });
+        .find(|&f| families.get(f as usize).is_some_and(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS)));
 
     // Every family the application asked queues in: the swapchain images are
     // shared with all of them below.
@@ -158,19 +152,12 @@ pub unsafe extern "system" fn create_device(
 
     // Mutable swapchain format lets us render through a UNORM view of an sRGB
     // swapchain (no double gamma), as vkBasalt does.
-    let mut extensions: Vec<*const c_char> =
-        slice(ci.pp_enabled_extension_names, ci.enabled_extension_count).to_vec();
+    let mut extensions: Vec<*const c_char> = slice(ci.pp_enabled_extension_names, ci.enabled_extension_count).to_vec();
     let mut mutable_format = false;
     if wanted {
-        let available = inst
-            .fns
-            .enumerate_device_extension_properties(physical_device)
-            .unwrap_or_default();
-        let needed = [
-            ash::khr::swapchain_mutable_format::NAME,
-            ash::khr::image_format_list::NAME,
-            ash::khr::maintenance2::NAME,
-        ];
+        let available = inst.fns.enumerate_device_extension_properties(physical_device).unwrap_or_default();
+        let needed =
+            [ash::khr::swapchain_mutable_format::NAME, ash::khr::image_format_list::NAME, ash::khr::maintenance2::NAME];
         if needed.iter().all(|n| has_ext(&available, n)) {
             for n in needed {
                 if !extensions.iter().any(|&e| CStr::from_ptr(e) == n) {
@@ -254,12 +241,7 @@ pub unsafe extern "system" fn destroy_device(device: vk::Device, p_allocator: *c
     dev.fns.destroy_device(p_allocator.as_ref());
 }
 
-pub unsafe extern "system" fn get_device_queue(
-    device: vk::Device,
-    family: u32,
-    index: u32,
-    p_queue: *mut vk::Queue,
-) {
+pub unsafe extern "system" fn get_device_queue(device: vk::Device, family: u32, index: u32, p_queue: *mut vk::Queue) {
     let Some(dev) = state::device(device) else { return };
     (dev.fns.fp_v1_0().get_device_queue)(device, family, index, p_queue);
     dev.queue_families.lock().unwrap().insert(*p_queue, family);
@@ -341,9 +323,8 @@ unsafe fn promote_to_hdr10(dev: &DeviceData, ci: &vk::SwapchainCreateInfoKHR) ->
     for f in &formats {
         log_debug!("surface offers {:?} / {:?}", f.format, f.color_space);
     }
-    let supported = formats
-        .iter()
-        .any(|f| f.format == HDR10_FORMAT && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT);
+    let supported =
+        formats.iter().any(|f| f.format == HDR10_FORMAT && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT);
     if !supported {
         log_warn!("the surface does not offer HDR10, keeping the SDR swapchain");
     }
@@ -374,10 +355,7 @@ unsafe fn plan_swapchain(dev: &DeviceData, ci: &vk::SwapchainCreateInfoKHR) -> O
         return None;
     }
 
-    let props = dev
-        .instance
-        .fns
-        .get_physical_device_format_properties(dev.physical_device, ci.image_format);
+    let props = dev.instance.fns.get_physical_device_format_properties(dev.physical_device, ci.image_format);
     let features = vk::FormatFeatureFlags::BLIT_SRC
         | vk::FormatFeatureFlags::BLIT_DST
         | vk::FormatFeatureFlags::SAMPLED_IMAGE

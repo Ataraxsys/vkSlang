@@ -30,11 +30,7 @@ pub fn default_preset_path(preset: Option<&str>) -> PathBuf {
 
 /// Parameters the user changed (value differs from the preset's).
 fn changed_params(state: &State) -> impl Iterator<Item = (&str, f32)> {
-    state
-        .params
-        .iter()
-        .filter(|p| !p.is_header() && p.is_modified())
-        .map(|p| (p.name.as_str(), p.value))
+    state.params.iter().filter(|p| !p.is_header() && p.is_modified()).map(|p| (p.name.as_str(), p.value))
 }
 
 /// Only a single preset can be written as a `.slangp`: the format references
@@ -143,23 +139,12 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
     let src = &state.source;
     out.push(format!("source_res = {}", src.res.to_config()));
     let [dx, dy] = src.duplicate;
-    out.push(if dx == dy {
-        format!("pixel_duplicate = {dx}")
-    } else {
-        format!("pixel_duplicate = {dx},{dy}")
-    });
-    out.push(format!(
-        "source_filter = {}",
-        if src.filter == Filter::Linear { "linear" } else { "nearest" }
-    ));
+    out.push(if dx == dy { format!("pixel_duplicate = {dx}") } else { format!("pixel_duplicate = {dx},{dy}") });
+    out.push(format!("source_filter = {}", if src.filter == Filter::Linear { "linear" } else { "nearest" }));
     out.push(format!("source_rect = {}", src.rect));
     out.push(format!("display_rect = {}", src.display));
     for (key, [x, y]) in [("display_scale", src.display_scale), ("source_scale", src.source_scale)] {
-        out.push(if (x - y).abs() < 0.001 {
-            format!("{key} = {x}")
-        } else {
-            format!("{key} = {x},{y}")
-        });
+        out.push(if (x - y).abs() < 0.001 { format!("{key} = {x}") } else { format!("{key} = {x},{y}") });
     }
     out.push(format!("brightness_nits = {}", state.hdr.brightness_nits));
     out.push(format!("expand_gamut = {}", state.hdr.expand_gamut));
@@ -229,9 +214,12 @@ mod tests {
         let kept: Vec<&str> = old
             .lines()
             .filter(|line| {
-                !line.split('#').next().unwrap_or("").split_once('=').is_some_and(|(k, _)| {
-                    k.trim().eq_ignore_ascii_case(&profile_key("soh.exe"))
-                })
+                !line
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .split_once('=')
+                    .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(&profile_key("soh.exe")))
             })
             .collect();
         assert_eq!(kept, vec!["# mine", "process = gamescope"]);

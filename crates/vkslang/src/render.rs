@@ -265,8 +265,8 @@ unsafe fn load_chain(dev: &DeviceData, paths: &[PathBuf]) -> Result<Loaded, Stri
         disable_cache: false,
     };
     let vulkan = (dev.physical_device, dev.instance.fns.clone(), dev.fns.clone(), dev.queue);
-    let chain = FilterChain::load_from_preset_deferred(preset, vulkan, cmd, Some(&options))
-        .map_err(|e| fail(e.to_string()))?;
+    let chain =
+        FilterChain::load_from_preset_deferred(preset, vulkan, cmd, Some(&options)).map_err(|e| fail(e.to_string()))?;
     d.end_command_buffer(cmd).map_err(|e| fail(e.to_string()))?;
     log_info!("compiled {} in {:.2?}", describe(paths), started.elapsed());
     Ok(Loaded { paths: paths.to_vec(), chain, params, color_space, pool, cmd })
@@ -302,9 +302,7 @@ unsafe fn create_image(
     let props = dev.instance.fns.get_physical_device_memory_properties(dev.physical_device);
     let type_index = (0..props.memory_type_count).find(|&i| {
         reqs.memory_type_bits & (1 << i) != 0
-            && props.memory_types[i as usize]
-                .property_flags
-                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
     });
     let Some(type_index) = type_index else {
         d.destroy_image(image, None);
@@ -369,9 +367,8 @@ impl SourceImage {
             flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
         }
         // TRANSFER_SRC: librashader copies Original into its history.
-        let usage = vk::ImageUsageFlags::TRANSFER_DST
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::SAMPLED;
+        let usage =
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED;
         let (image, memory) = create_image(dev, format, extent, flags, usage)?;
         let base = if base_extent == extent {
             None
@@ -385,11 +382,8 @@ impl SourceImage {
                 }
             }
         };
-        let duplicated = if base.is_some() {
-            format!(" duplicated to {}x{}", extent.width, extent.height)
-        } else {
-            String::new()
-        };
+        let duplicated =
+            if base.is_some() { format!(" duplicated to {}x{}", extent.width, extent.height) } else { String::new() };
         log_debug!(
             "source {}x{}{duplicated} {format:?} from picture {rect:?}, drawn into {display:?} of {}x{}",
             base_extent.width,
@@ -483,8 +477,7 @@ impl CaptureTarget {
         let props = dev.instance.fns.get_physical_device_memory_properties(dev.physical_device);
         let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let type_index = (0..props.memory_type_count).find(|&i| {
-            reqs.memory_type_bits & (1 << i) != 0
-                && props.memory_types[i as usize].property_flags.contains(wanted)
+            reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(wanted)
         });
         let cleanup = |e: vk::Result| {
             d.destroy_buffer(buffer, None);
@@ -502,9 +495,7 @@ impl CaptureTarget {
             )
             .map_err(cleanup)?;
         d.bind_buffer_memory(buffer, buffer_memory, 0).map_err(cleanup)?;
-        let mapped = d
-            .map_memory(buffer_memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(cleanup)? as usize;
+        let mapped = d.map_memory(buffer_memory, 0, size, vk::MemoryMapFlags::empty()).map_err(cleanup)? as usize;
         Ok(CaptureTarget { image, memory, buffer, buffer_memory, mapped, extent })
     }
 
@@ -518,11 +509,7 @@ impl CaptureTarget {
     }
 
     /// Writes the mapped pixels next to the control socket.
-    unsafe fn write(
-        &self,
-        base: vk::Extent2D,
-        area: vk::Rect2D,
-    ) -> std::io::Result<vkslang_ipc::Capture> {
+    unsafe fn write(&self, base: vk::Extent2D, area: vk::Rect2D) -> std::io::Result<vkslang_ipc::Capture> {
         use std::io::Write;
         let dir = vkslang_ipc::socket_dir();
         std::fs::create_dir_all(&dir)?;
@@ -539,12 +526,7 @@ impl CaptureTarget {
             path: path.display().to_string(),
             size: [self.extent.width, self.extent.height],
             base: [base.width, base.height],
-            area: [
-                area.offset.x,
-                area.offset.y,
-                area.extent.width as i32,
-                area.extent.height as i32,
-            ],
+            area: [area.offset.x, area.offset.y, area.extent.width as i32, area.extent.height as i32],
             id: 0,
         })
     }
@@ -584,11 +566,7 @@ struct StagingImage {
 }
 
 impl StagingImage {
-    unsafe fn new(
-        dev: &DeviceData,
-        format: vk::Format,
-        extent: vk::Extent2D,
-    ) -> Result<StagingImage, vk::Result> {
+    unsafe fn new(dev: &DeviceData, format: vk::Format, extent: vk::Extent2D) -> Result<StagingImage, vk::Result> {
         let (image, memory) = create_image(
             dev,
             format,
@@ -776,10 +754,8 @@ impl Runtime {
         };
         for _ in 0..RING {
             let slot = allocate_cmd(dev, pool).and_then(|cmd| {
-                let fence = d.create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )?;
+                let fence =
+                    d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?;
                 let acquire = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
                 let bridge = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
                 Ok(FrameSlot { cmd, fence, init: None, acquire, bridge })
@@ -838,22 +814,15 @@ impl Runtime {
                 log_warn!("preset has no parameter '{name}'");
             }
         }
-        ctl.params = loaded
-            .params
-            .iter()
-            .map(|p| Param { value: ctl.param_value(&p.name, p.initial), ..p.clone() })
-            .collect();
+        ctl.params =
+            loaded.params.iter().map(|p| Param { value: ctl.param_value(&p.name, p.initial), ..p.clone() }).collect();
         ctl.running_presets = loaded.paths.clone();
         ctl.preset_color_space = Some(to_ipc(loaded.color_space));
         ctl.error = None;
         for state in self.swapchains.values() {
             warn_mismatch(loaded.color_space, state);
         }
-        self.chain = Some(ActiveChain {
-            chain: loaded.chain,
-            color_space: loaded.color_space,
-            params: loaded.params,
-        });
+        self.chain = Some(ActiveChain { chain: loaded.chain, color_space: loaded.color_space, params: loaded.params });
         self.pending_init = Some((loaded.pool, loaded.cmd));
         self.failed = false;
         self.applied_params_gen = None;
@@ -938,26 +907,20 @@ impl Runtime {
     }
 
     fn publish_outputs(&self) {
-        control().outputs = self
-            .swapchains
-            .values()
-            .map(|s| Output {
-                size: [s.extent.width, s.extent.height],
-                picture: s
-                    .source
-                    .as_ref()
-                    .map_or([s.extent.width, s.extent.height], |src| {
+        control().outputs =
+            self.swapchains
+                .values()
+                .map(|s| Output {
+                    size: [s.extent.width, s.extent.height],
+                    picture: s.source.as_ref().map_or([s.extent.width, s.extent.height], |src| {
                         [src.rect.extent.width, src.rect.extent.height]
                     }),
-                input: s
-                    .source
-                    .as_ref()
-                    .map_or([0, 0], |src| [src.extent.width, src.extent.height]),
-                format: format!("{:?}", s.format),
-                color_space: to_ipc(s.color_space),
-                promoted: s.promoted,
-            })
-            .collect();
+                    input: s.source.as_ref().map_or([0, 0], |src| [src.extent.width, src.extent.height]),
+                    format: format!("{:?}", s.format),
+                    color_space: to_ipc(s.color_space),
+                    promoted: s.promoted,
+                })
+                .collect();
     }
 
     pub fn track_swapchain(&mut self, swapchain: vk::SwapchainKHR, state: SwapchainState) {
@@ -1065,18 +1028,15 @@ impl Runtime {
             let done = if black {
                 self.present_black(dev, queue, swapchain, index, acquire)
             } else {
-                self.render(dev, queue, swapchain, index, &[acquire], None, Some((current, total)))
-                    .unwrap_or(None)
+                self.render(dev, queue, swapchain, index, &[acquire], None, Some((current, total))).unwrap_or(None)
             };
             let Some(done) = done else { return };
 
             let wait = [done];
             let swapchains = [swapchain];
             let indices = [index];
-            let info = vk::PresentInfoKHR::default()
-                .wait_semaphores(&wait)
-                .swapchains(&swapchains)
-                .image_indices(&indices);
+            let info =
+                vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&indices);
             let r = (dev.swapchain_fn.queue_present_khr)(queue, &info);
             if r != vk::Result::SUCCESS && r != vk::Result::SUBOPTIMAL_KHR {
                 log_debug!("subframe present failed ({r})");
@@ -1110,10 +1070,8 @@ impl Runtime {
             &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )
         .ok()?;
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
+        let range =
+            vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
         let barrier = |old, new, src, dst| {
             vk::ImageMemoryBarrier::default()
                 .image(image)
@@ -1233,10 +1191,8 @@ impl Runtime {
             &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
 
-        let color = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
+        let color =
+            vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
         let barrier = |img, old, new, src_access, dst_access| {
             vk::ImageMemoryBarrier::default()
                 .image(img)
@@ -1249,9 +1205,7 @@ impl Runtime {
                 .subresource_range(color)
         };
 
-        let layers = vk::ImageSubresourceLayers::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .layer_count(1);
+        let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
         let r = source.rect;
         // Set when a capture was recorded into this frame's commands.
         let mut captured = None;
@@ -1308,11 +1262,7 @@ impl Runtime {
                         &[vk::ImageCopy::default()
                             .src_subresource(layers)
                             .dst_subresource(layers)
-                            .extent(vk::Extent3D {
-                                width: state.extent.width,
-                                height: state.extent.height,
-                                depth: 1,
-                            })],
+                            .extent(vk::Extent3D { width: state.extent.width, height: state.extent.height, depth: 1 })],
                     );
                     d.cmd_pipeline_barrier(
                         cmd,
@@ -1335,211 +1285,201 @@ impl Runtime {
             };
 
             // 2a. Capture requested by vkslang-ui: an RGBA8 copy of the picture as
-        //     the application drew it, before the preset touches it.
-        if subframe.is_none() {
-            if let Some(max_width) = control().capture_request {
-                // The whole image, so the UI can also frame a new picture
-                // area outside the current one.
-                let rect = vk::Rect2D { offset: vk::Offset2D::default(), extent: state.extent };
-                let scale = (max_width as f32 / rect.extent.width as f32).min(1.0);
-                let extent = vk::Extent2D {
-                    width: ((rect.extent.width as f32 * scale).round() as u32).max(1),
-                    height: ((rect.extent.height as f32 * scale).round() as u32).max(1),
-                };
-                if capture.as_ref().is_none_or(|c| c.extent != extent) {
-                    if let Some(old) = capture.take() {
-                        old.destroy(dev);
-                    }
-                    match CaptureTarget::new(dev, extent) {
-                        Ok(target) => *capture = Some(target),
-                        Err(e) => log_error!("cannot create the capture target: {e}"),
-                    }
-                }
-                if let Some(target) = capture.as_ref() {
-                    let barrier_capture = |old, new, src, dst| {
-                        vk::ImageMemoryBarrier::default()
-                            .image(target.image)
-                            .old_layout(old)
-                            .new_layout(new)
-                            .src_access_mask(src)
-                            .dst_access_mask(dst)
-                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .subresource_range(color)
+            //     the application drew it, before the preset touches it.
+            if subframe.is_none() {
+                if let Some(max_width) = control().capture_request {
+                    // The whole image, so the UI can also frame a new picture
+                    // area outside the current one.
+                    let rect = vk::Rect2D { offset: vk::Offset2D::default(), extent: state.extent };
+                    let scale = (max_width as f32 / rect.extent.width as f32).min(1.0);
+                    let extent = vk::Extent2D {
+                        width: ((rect.extent.width as f32 * scale).round() as u32).max(1),
+                        height: ((rect.extent.height as f32 * scale).round() as u32).max(1),
                     };
-                    d.cmd_pipeline_barrier(
-                        cmd,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[barrier_capture(
-                            vk::ImageLayout::UNDEFINED,
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                            vk::AccessFlags::empty(),
-                            vk::AccessFlags::TRANSFER_WRITE,
-                        )],
-                    );
-                    d.cmd_blit_image(
-                        cmd,
-                        picture,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        target.image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &[vk::ImageBlit::default()
-                            .src_subresource(layers)
-                            .src_offsets([
-                                vk::Offset3D { x: rect.offset.x, y: rect.offset.y, z: 0 },
-                                vk::Offset3D {
-                                    x: rect.offset.x + rect.extent.width as i32,
-                                    y: rect.offset.y + rect.extent.height as i32,
-                                    z: 1,
-                                },
-                            ])
-                            .dst_subresource(layers)
-                            .dst_offsets([
-                                vk::Offset3D::default(),
-                                vk::Offset3D { x: extent.width as i32, y: extent.height as i32, z: 1 },
-                            ])],
-                        vk::Filter::LINEAR,
-                    );
-                    d.cmd_pipeline_barrier(
-                        cmd,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[barrier_capture(
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    if capture.as_ref().is_none_or(|c| c.extent != extent) {
+                        if let Some(old) = capture.take() {
+                            old.destroy(dev);
+                        }
+                        match CaptureTarget::new(dev, extent) {
+                            Ok(target) => *capture = Some(target),
+                            Err(e) => log_error!("cannot create the capture target: {e}"),
+                        }
+                    }
+                    if let Some(target) = capture.as_ref() {
+                        let barrier_capture = |old, new, src, dst| {
+                            vk::ImageMemoryBarrier::default()
+                                .image(target.image)
+                                .old_layout(old)
+                                .new_layout(new)
+                                .src_access_mask(src)
+                                .dst_access_mask(dst)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .subresource_range(color)
+                        };
+                        d.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[barrier_capture(
+                                vk::ImageLayout::UNDEFINED,
+                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                vk::AccessFlags::empty(),
+                                vk::AccessFlags::TRANSFER_WRITE,
+                            )],
+                        );
+                        d.cmd_blit_image(
+                            cmd,
+                            picture,
                             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                            vk::AccessFlags::TRANSFER_WRITE,
-                            vk::AccessFlags::TRANSFER_READ,
-                        )],
-                    );
-                    d.cmd_copy_image_to_buffer(
-                        cmd,
-                        target.image,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        target.buffer,
-                        &[vk::BufferImageCopy::default()
-                            .image_subresource(layers)
-                            .image_extent(vk::Extent3D {
+                            target.image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &[vk::ImageBlit::default()
+                                .src_subresource(layers)
+                                .src_offsets([
+                                    vk::Offset3D { x: rect.offset.x, y: rect.offset.y, z: 0 },
+                                    vk::Offset3D {
+                                        x: rect.offset.x + rect.extent.width as i32,
+                                        y: rect.offset.y + rect.extent.height as i32,
+                                        z: 1,
+                                    },
+                                ])
+                                .dst_subresource(layers)
+                                .dst_offsets([
+                                    vk::Offset3D::default(),
+                                    vk::Offset3D { x: extent.width as i32, y: extent.height as i32, z: 1 },
+                                ])],
+                            vk::Filter::LINEAR,
+                        );
+                        d.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[barrier_capture(
+                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                                vk::AccessFlags::TRANSFER_WRITE,
+                                vk::AccessFlags::TRANSFER_READ,
+                            )],
+                        );
+                        d.cmd_copy_image_to_buffer(
+                            cmd,
+                            target.image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            target.buffer,
+                            &[vk::BufferImageCopy::default().image_subresource(layers).image_extent(vk::Extent3D {
                                 width: extent.width,
                                 height: extent.height,
                                 depth: 1,
                             })],
-                    );
-                    captured = Some((rect.extent, source.rect));
+                        );
+                        captured = Some((rect.extent, source.rect));
+                    }
                 }
             }
-        }
 
-        // 2b. Reduce the picture region to the real pixel grid, then repeat
-        //     each pixel into the source image when duplication is on. The
-        //     second step is a nearest blit between exact multiples, so every
-        //     pixel comes out as identical copies.
-        let (reduce_into, reduce_extent) = match source.base {
-            Some((image, _, extent)) => (image, extent),
-            None => (source.image, source.extent),
-        };
-        if r.extent == reduce_extent {
-            d.cmd_copy_image(
-                cmd,
-                picture,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                reduce_into,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::ImageCopy::default()
-                    .src_subresource(layers)
-                    .src_offset(vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 })
-                    .dst_subresource(layers)
-                    .extent(vk::Extent3D { width: r.extent.width, height: r.extent.height, depth: 1 })],
-            );
-        } else {
-            d.cmd_blit_image(
-                cmd,
-                picture,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                reduce_into,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::ImageBlit::default()
-                    .src_subresource(layers)
-                    .src_offsets([
-                        vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 },
-                        vk::Offset3D {
-                            x: r.offset.x + r.extent.width as i32,
-                            y: r.offset.y + r.extent.height as i32,
-                            z: 1,
-                        },
-                    ])
-                    .dst_subresource(layers)
-                    .dst_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: reduce_extent.width as i32,
-                            y: reduce_extent.height as i32,
-                            z: 1,
-                        },
-                    ])],
-                source.filter,
-            );
-        }
+            // 2b. Reduce the picture region to the real pixel grid, then repeat
+            //     each pixel into the source image when duplication is on. The
+            //     second step is a nearest blit between exact multiples, so every
+            //     pixel comes out as identical copies.
+            let (reduce_into, reduce_extent) = match source.base {
+                Some((image, _, extent)) => (image, extent),
+                None => (source.image, source.extent),
+            };
+            if r.extent == reduce_extent {
+                d.cmd_copy_image(
+                    cmd,
+                    picture,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    reduce_into,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageCopy::default()
+                        .src_subresource(layers)
+                        .src_offset(vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 })
+                        .dst_subresource(layers)
+                        .extent(vk::Extent3D { width: r.extent.width, height: r.extent.height, depth: 1 })],
+                );
+            } else {
+                d.cmd_blit_image(
+                    cmd,
+                    picture,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    reduce_into,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageBlit::default()
+                        .src_subresource(layers)
+                        .src_offsets([
+                            vk::Offset3D { x: r.offset.x, y: r.offset.y, z: 0 },
+                            vk::Offset3D {
+                                x: r.offset.x + r.extent.width as i32,
+                                y: r.offset.y + r.extent.height as i32,
+                                z: 1,
+                            },
+                        ])
+                        .dst_subresource(layers)
+                        .dst_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D { x: reduce_extent.width as i32, y: reduce_extent.height as i32, z: 1 },
+                        ])],
+                    source.filter,
+                );
+            }
 
-        if let Some((base_image, _, base_extent)) = source.base {
-            d.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[
-                    barrier(
-                        base_image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::AccessFlags::TRANSFER_READ,
-                    ),
-                    barrier(
-                        source.image,
-                        vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::AccessFlags::empty(),
-                        vk::AccessFlags::TRANSFER_WRITE,
-                    ),
-                ],
-            );
-            d.cmd_blit_image(
-                cmd,
-                base_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                source.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::ImageBlit::default()
-                    .src_subresource(layers)
-                    .src_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D { x: base_extent.width as i32, y: base_extent.height as i32, z: 1 },
-                    ])
-                    .dst_subresource(layers)
-                    .dst_offsets([
-                        vk::Offset3D::default(),
-                        vk::Offset3D {
-                            x: source.extent.width as i32,
-                            y: source.extent.height as i32,
-                            z: 1,
-                        },
-                    ])],
-                // Never anything but nearest here: this step exists to copy
-                // pixels, not to interpolate them.
-                vk::Filter::NEAREST,
-            );
-        }
+            if let Some((base_image, _, base_extent)) = source.base {
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[
+                        barrier(
+                            base_image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::TRANSFER_READ,
+                        ),
+                        barrier(
+                            source.image,
+                            vk::ImageLayout::UNDEFINED,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::AccessFlags::empty(),
+                            vk::AccessFlags::TRANSFER_WRITE,
+                        ),
+                    ],
+                );
+                d.cmd_blit_image(
+                    cmd,
+                    base_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    source.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::ImageBlit::default()
+                        .src_subresource(layers)
+                        .src_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D { x: base_extent.width as i32, y: base_extent.height as i32, z: 1 },
+                        ])
+                        .dst_subresource(layers)
+                        .dst_offsets([
+                            vk::Offset3D::default(),
+                            vk::Offset3D { x: source.extent.width as i32, y: source.extent.height as i32, z: 1 },
+                        ])],
+                    // Never anything but nearest here: this step exists to copy
+                    // pixels, not to interpolate them.
+                    vk::Filter::NEAREST,
+                );
+            }
 
-        // 3. source -> SHADER_READ_ONLY (librashader input contract),
+            // 3. source -> SHADER_READ_ONLY (librashader input contract),
             //    swapchain -> COLOR_ATTACHMENT (librashader output contract).
             d.cmd_pipeline_barrier(
                 cmd,
@@ -1567,7 +1507,6 @@ impl Runtime {
                     ),
                 ],
             );
-
         } else {
             // Subframe: the source image still holds this frame's picture and
             // is still in SHADER_READ_ONLY, so only the freshly acquired image
@@ -1696,10 +1635,7 @@ impl Runtime {
                 .map(|bar| {
                     vk::ImageBlit::default()
                         .src_subresource(layers)
-                        .src_offsets([
-                            vk::Offset3D::default(),
-                            vk::Offset3D { x: 1, y: 1, z: 1 },
-                        ])
+                        .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: 1, y: 1, z: 1 }])
                         .dst_subresource(layers)
                         .dst_offsets([
                             vk::Offset3D { x: bar.offset.x, y: bar.offset.y, z: 0 },
@@ -1814,10 +1750,8 @@ mod tests {
     #[test]
     fn bars_around_a_pillarboxed_picture() {
         let total = vk::Extent2D { width: 3840, height: 2160 };
-        let picture = vk::Rect2D {
-            offset: vk::Offset2D { x: 480, y: 0 },
-            extent: vk::Extent2D { width: 2880, height: 2160 },
-        };
+        let picture =
+            vk::Rect2D { offset: vk::Offset2D { x: 480, y: 0 }, extent: vk::Extent2D { width: 2880, height: 2160 } };
         let bars = bar_rects(picture, total);
         assert_eq!(bars.len(), 2);
         assert_eq!(bars[0].extent, vk::Extent2D { width: 480, height: 2160 });

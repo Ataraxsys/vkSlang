@@ -45,8 +45,7 @@ fn game_scale(screen: [u32; 2], game: [u32; 2], integer: bool) -> f32 {
 }
 
 fn frame_to_area(frame: egui::Rect, capture: [u32; 2], base: [u32; 2]) -> String {
-    let to_output =
-        egui::vec2(base[0] as f32 / capture[0] as f32, base[1] as f32 / capture[1] as f32);
+    let to_output = egui::vec2(base[0] as f32 / capture[0] as f32, base[1] as f32 / capture[1] as f32);
     let x = (frame.min.x * to_output.x).round().max(0.0);
     let y = (frame.min.y * to_output.y).round().max(0.0);
     let w = (frame.width() * to_output.x).round().max(1.0).min(base[0] as f32 - x);
@@ -125,17 +124,9 @@ impl SourceEdit {
             display_scale: s.display_scale,
             source_scale: s.source_scale,
             source_locked: true,
-            source_ratio: if s.source_scale[0] > 0.0 {
-                s.source_scale[1] / s.source_scale[0]
-            } else {
-                1.0
-            },
+            source_ratio: if s.source_scale[0] > 0.0 { s.source_scale[1] / s.source_scale[0] } else { 1.0 },
             scale_locked: true,
-            scale_ratio: if s.display_scale[0] > 0.0 {
-                s.display_scale[1] / s.display_scale[0]
-            } else {
-                1.0
-            },
+            scale_ratio: if s.display_scale[0] > 0.0 { s.display_scale[1] / s.display_scale[0] } else { 1.0 },
             calc_screen: None,
             calc_game: [640, 480],
             calc_integer: true,
@@ -421,13 +412,9 @@ impl App {
                 if self.source.is_none() {
                     self.source = Some(SourceEdit::from(&state.source));
                 }
-                if self.save_path.is_empty()
-                    || self.state.as_ref().map(|s| &s.presets) != Some(&state.presets)
-                {
+                if self.save_path.is_empty() || self.state.as_ref().map(|s| &s.presets) != Some(&state.presets) {
                     self.save_path =
-                        save::default_preset_path(state.presets.first().map(String::as_str))
-                            .display()
-                            .to_string();
+                        save::default_preset_path(state.presets.first().map(String::as_str)).display().to_string();
                 }
                 self.state = Some(state);
             }
@@ -454,8 +441,7 @@ impl App {
             self.error("no process connected");
             return;
         }
-        self.chain =
-            p.presets.iter().map(|s| ChainEntry { path: PathBuf::from(s), enabled: true }).collect();
+        self.chain = p.presets.iter().map(|s| ChainEntry { path: PathBuf::from(s), enabled: true }).collect();
         self.send(Request::LoadPresets { paths: p.presets.clone() });
         self.send(Request::SetSource { source: p.source.clone() });
         self.send(Request::SetHdr { hdr: p.hdr });
@@ -502,8 +488,7 @@ impl App {
             let show_all = self.show_all;
             egui::ComboBox::from_id_salt("target").selected_text(current).width(220.0).show_ui(ui, |ui| {
                 for t in self.targets.iter().filter(|t| t.active || show_all) {
-                    let label =
-                        if t.active { t.label.clone() } else { format!("{} (no swapchain)", t.label) };
+                    let label = if t.active { t.label.clone() } else { format!("{} (no swapchain)", t.label) };
                     ui.selectable_value(&mut choice, Some(t.pid), label);
                 }
             });
@@ -591,15 +576,11 @@ impl App {
             let mut toggled = false;
             for (i, entry) in chain.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    let name =
-                        entry.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    let name = entry.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                     ui.weak(format!("{}.", i + 1));
                     // Switching one off leaves the others, and their
                     // parameters, exactly as they are.
-                    toggled |= ui
-                        .checkbox(&mut entry.enabled, "")
-                        .on_hover_text("Run this one in the chain")
-                        .changed();
+                    toggled |= ui.checkbox(&mut entry.enabled, "").on_hover_text("Run this one in the chain").changed();
                     if ui.small_button("↑").clicked() && i > 0 {
                         swap = Some((i - 1, i));
                     }
@@ -641,12 +622,8 @@ impl App {
             self.chain = vec![ChainEntry { path: path.clone(), enabled: true }];
             self.send(Request::LoadPresets { paths: vec![path.display().to_string()] });
         } else if apply_chain {
-            let paths: Vec<String> = self
-                .chain
-                .iter()
-                .filter(|e| e.enabled)
-                .map(|e| e.path.display().to_string())
-                .collect();
+            let paths: Vec<String> =
+                self.chain.iter().filter(|e| e.enabled).map(|e| e.path.display().to_string()).collect();
             if paths.is_empty() {
                 // Nothing left to run: bypass rather than fail.
                 self.send(Request::SetEnabled { enabled: false });
@@ -675,9 +652,7 @@ impl App {
                 edit.mode = SourceSize::Native;
                 changed = true;
             }
-            if ui.selectable_label(divide, "divide").on_hover_text("Native size divided by N").clicked()
-                && !divide
-            {
+            if ui.selectable_label(divide, "divide").on_hover_text("Native size divided by N").clicked() && !divide {
                 edit.mode = SourceSize::Divide { by: edit.divisor };
                 changed = true;
             }
@@ -748,10 +723,8 @@ impl App {
                 ui.add(egui::DragValue::new(&mut edit.calc_game[1]).range(1..=4320));
                 ui.checkbox(&mut edit.calc_integer, "integer scale");
                 let by = game_scale(screen, edit.calc_game, edit.calc_integer);
-                let shown = [
-                    (edit.calc_game[0] as f32 * by).round() as u32,
-                    (edit.calc_game[1] as f32 * by).round() as u32,
-                ];
+                let shown =
+                    [(edit.calc_game[0] as f32 * by).round() as u32, (edit.calc_game[1] as f32 * by).round() as u32];
                 if ui
                     .button(format!("use ÷{}", (by * 100.0).round() / 100.0))
                     .on_hover_text(format!("The game is shown {}×{} on the screen", shown[0], shown[1]))
@@ -785,11 +758,7 @@ impl App {
             if let Some(axis) = moved {
                 if edit.source_locked {
                     let ratio = edit.source_ratio.max(0.01);
-                    let other = if axis == 0 {
-                        edit.source_scale[0] * ratio
-                    } else {
-                        edit.source_scale[1] / ratio
-                    };
+                    let other = if axis == 0 { edit.source_scale[0] * ratio } else { edit.source_scale[1] / ratio };
                     edit.source_scale[1 - axis] = other.clamp(0.25, 4.0);
                 }
                 changed = true;
@@ -800,11 +769,8 @@ impl App {
                 .changed()
                 && edit.source_locked
             {
-                edit.source_ratio = if edit.source_scale[0] > 0.0 {
-                    edit.source_scale[1] / edit.source_scale[0]
-                } else {
-                    1.0
-                };
+                edit.source_ratio =
+                    if edit.source_scale[0] > 0.0 { edit.source_scale[1] / edit.source_scale[0] } else { 1.0 };
             }
             if ui.small_button("1:1").clicked() {
                 edit.source_scale = [1.0, 1.0];
@@ -1001,9 +967,10 @@ impl App {
         if ui.button("Reset all").clicked() {
             requests.push(Request::ResetParams);
         }
-        egui::ScrollArea::vertical().auto_shrink([false, false]).max_height((ui.available_height() - 90.0).max(120.0)).show(
-            ui,
-            |ui| {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height((ui.available_height() - 90.0).max(120.0))
+            .show(ui, |ui| {
                 if state.params.is_empty() {
                     ui.weak("This preset has no parameters.");
                 }
@@ -1042,8 +1009,7 @@ impl App {
                         }
                     });
                 }
-            },
-        );
+            });
         for r in requests {
             self.send(r);
         }
@@ -1054,11 +1020,7 @@ impl App {
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.label("Profile");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.profile_name)
-                    .hint_text("name")
-                    .desired_width(160.0),
-            );
+            ui.add(egui::TextEdit::singleline(&mut self.profile_name).hint_text("name").desired_width(160.0));
             let named = !self.profile_name.trim().is_empty();
             if ui
                 .add_enabled(named, egui::Button::new("Save"))
@@ -1092,11 +1054,7 @@ impl App {
                 let running = state.presets == p.presets;
                 if ui
                     .selectable_label(running, &p.name)
-                    .on_hover_text(format!(
-                        "{} preset(s), {} parameter(s)",
-                        p.presets.len(),
-                        p.params.len()
-                    ))
+                    .on_hover_text(format!("{} preset(s), {} parameter(s)", p.presets.len(), p.params.len()))
                     .clicked()
                 {
                     apply = Some(p.clone());
@@ -1145,7 +1103,10 @@ impl App {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Preset");
-            ui.add(egui::TextEdit::singleline(&mut self.save_path).desired_width((ui.available_width() - 260.0).max(120.0)));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.save_path)
+                    .desired_width((ui.available_width() - 260.0).max(120.0)),
+            );
             let single = state.presets.len() == 1;
             if ui
                 .add_enabled(single, egui::Button::new("Save .slangp"))
@@ -1238,13 +1199,8 @@ impl App {
                     let scale = size[0] as f32 / capture.base[0] as f32;
                     let [ax, ay, aw, ah] = capture.area.map(|v| v as f32 * scale);
                     self.frame_rect = egui::Rect::from_min_size(egui::pos2(ax, ay), egui::vec2(aw, ah));
-                    self.grid_texture = Some(GridImage {
-                        id: capture.id,
-                        texture,
-                        size,
-                        base: capture.base,
-                        area: capture.area,
-                    });
+                    self.grid_texture =
+                        Some(GridImage { id: capture.id, texture, size, base: capture.base, area: capture.area });
                 }
             }
         }
