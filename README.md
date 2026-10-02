@@ -116,6 +116,7 @@ ENABLE_VKSLANG=1 VKSLANG_PROCESS=gamescope gamescope --backend sdl -f -W 3840 -H
 - **`VKSLANG_PROCESS=gamescope`** keeps the layer out of the game: `ENABLE_VKSLANG=1` is inherited by every child process.
 - The preset comes from a profile starred for `gamescope`, from `preset =` in `vkSlang.conf`, or from `VKSLANG_PRESET`.
 - With integer scaling, set the source resolution to **divide** and use **Find the divisor** in the panel: give it the game's resolution and it computes how many screen pixels each game pixel covers (640×480 on a 4K screen: ÷4).
+- **frame the game**, next to it, goes further: the preset reads and draws only where gamescope put the game (2560×1920 at 640,120 for that example), so a 4:3 game keeps its black bars, borders and bezels stay around the game rather than the whole screen, and the preset's grid sits exactly on the game's pixels. The `4:3` buttons of the areas only approximate this: they take the largest 4:3 region of the screen, black bars included.
 
 ### Programs that do not use Vulkan
 
