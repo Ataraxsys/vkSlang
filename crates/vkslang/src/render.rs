@@ -397,6 +397,10 @@ impl SourceImage {
     unsafe fn destroy(self, dev: &DeviceData) {
         dev.fns.destroy_image(self.image, None);
         dev.fns.free_memory(self.memory, None);
+        if let Some((image, memory, _)) = self.base {
+            dev.fns.destroy_image(image, None);
+            dev.fns.free_memory(memory, None);
+        }
     }
 }
 
