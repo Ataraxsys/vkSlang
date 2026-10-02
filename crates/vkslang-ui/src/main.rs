@@ -30,8 +30,6 @@ struct GridImage {
     area: [i32; 4],
 }
 
-/// Converts a frame drawn on the capture into a picture area in output
-/// pixels, as `source_rect` spells it.
 /// How many screen pixels one game pixel covers: the divisor that brings the
 /// screen back to the game's own grid. Integer scaling keeps whole screen
 /// pixels per game pixel; otherwise the picture is fitted to the screen.
@@ -44,6 +42,8 @@ fn game_scale(screen: [u32; 2], game: [u32; 2], integer: bool) -> f32 {
     }
 }
 
+/// Converts a frame drawn on the capture into a picture area in output
+/// pixels, as `source_rect` spells it.
 fn frame_to_area(frame: egui::Rect, capture: [u32; 2], base: [u32; 2]) -> String {
     let to_output = egui::vec2(base[0] as f32 / capture[0] as f32, base[1] as f32 / capture[1] as f32);
     let x = (frame.min.x * to_output.x).round().max(0.0);
@@ -435,13 +435,19 @@ impl App {
     }
 
     /// Applies a saved profile: the chain first, its parameters once it has
-    /// finished compiling (the layer drops the overrides when it loads).
+    /// finished compiling.
+    ///
+    /// The layer keeps parameter tweaks across chain changes, so they are
+    /// reset first: a profile holds only the parameters it changed, and the
+    /// previous look's tweaks would otherwise leak into it.
     fn apply_profile(&mut self, p: &profile::Profile) {
         if self.client.is_none() {
             self.error("no process connected");
             return;
         }
         self.chain = p.presets.iter().map(|s| ChainEntry { path: PathBuf::from(s), enabled: true }).collect();
+        self.send(Request::ResetParams);
+        self.send(Request::SetEnabled { enabled: true });
         self.send(Request::LoadPresets { paths: p.presets.clone() });
         self.send(Request::SetSource { source: p.source.clone() });
         self.send(Request::SetHdr { hdr: p.hdr });
