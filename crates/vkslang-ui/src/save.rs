@@ -72,6 +72,14 @@ pub fn default_profile_for(process: &str) -> Option<String> {
 pub fn set_default_profile(process: &str, name: Option<&str>) -> io::Result<()> {
     let path = config_path();
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, with_default_profile(&existing, process, name))
+}
+
+/// `existing` with the `profile.<process>` line replaced, or removed.
+fn with_default_profile(existing: &str, process: &str, name: Option<&str>) -> String {
     let key = profile_key(process);
     let mut lines: Vec<String> = existing
         .lines()
@@ -87,13 +95,13 @@ pub fn set_default_profile(process: &str, name: Option<&str>) -> io::Result<()> 
     if let Some(name) = name {
         lines.push(format!("{key} = {name}"));
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let mut text = lines.join("\n");
     text.push('\n');
-    std::fs::write(&path, text)
+    text
 }
+
+/// Heads the block of keys written by "Save as default".
+const MARKER: &str = "# --- written by vkslang-ui ---";
 
 /// Rewrites the keys vkSlang manages, keeping the user's other lines and
 /// comments.
@@ -118,6 +126,11 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
     let mut out: Vec<String> = existing
         .lines()
         .filter(|line| {
+            // The marker of a previous save goes too, or every save would
+            // add one more.
+            if line.trim() == MARKER {
+                return false;
+            }
             let content = line.split('#').next().unwrap_or("");
             match content.split_once('=') {
                 Some((key, _)) => !managed(key.trim()),
@@ -132,7 +145,7 @@ pub fn update_config_text(existing: &str, state: &State) -> String {
     if !out.is_empty() {
         out.push(String::new());
     }
-    out.push("# --- written by vkslang-ui ---".into());
+    out.push(MARKER.into());
     if !state.presets.is_empty() {
         out.push(format!("preset = {}", state.presets.join(", ")));
     }
@@ -210,20 +223,20 @@ mod tests {
 
     #[test]
     fn default_profile_line_is_rewritten() {
-        let old = "# mine\nprofile.soh.exe = Old\nprocess = gamescope\n";
-        let kept: Vec<&str> = old
-            .lines()
-            .filter(|line| {
-                !line
-                    .split('#')
-                    .next()
-                    .unwrap_or("")
-                    .split_once('=')
-                    .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(&profile_key("soh.exe")))
-            })
-            .collect();
-        assert_eq!(kept, vec!["# mine", "process = gamescope"]);
-        assert_eq!(profile_key("soh.exe"), "profile.soh.exe");
+        let old = "# mine\nPROFILE.soh.exe = Old\nprocess = gamescope\n";
+        assert_eq!(
+            with_default_profile(old, "soh.exe", Some("New")),
+            "# mine\nprocess = gamescope\nprofile.soh.exe = New\n"
+        );
+        assert_eq!(with_default_profile(old, "soh.exe", None), "# mine\nprocess = gamescope\n");
+    }
+
+    #[test]
+    fn saving_twice_writes_one_block() {
+        let once = update_config_text("process = gamescope\n", &state());
+        let twice = update_config_text(&once, &state());
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches(MARKER).count(), 1);
     }
 
     #[test]

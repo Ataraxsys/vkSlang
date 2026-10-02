@@ -1119,7 +1119,7 @@ impl App {
                 .on_hover_text(if single {
                     "#reference + changed parameters (RetroArch compatible)"
                 } else {
-                    "A .slangp references a single preset; use \"Save as default\" for a chain"
+                    "A .slangp references a single preset; save a profile to keep a chain"
                 })
                 .clicked()
             {
@@ -1129,7 +1129,12 @@ impl App {
                     Err(e) => self.error(format!("save failed: {e}")),
                 }
             }
-            if ui.button("Save as default").on_hover_text(save::config_path().display().to_string()).clicked() {
+            let global = format!(
+                "Writes this look into {}, where it applies to every game the layer runs in. \
+                 For one game, save a profile and star it instead.",
+                save::config_path().display()
+            );
+            if ui.button("Save for all games").on_hover_text(global).clicked() {
                 match save::save_config(&state) {
                     Ok(path) => self.info(format!("updated {}", path.display())),
                     Err(e) => self.error(format!("save failed: {e}")),
