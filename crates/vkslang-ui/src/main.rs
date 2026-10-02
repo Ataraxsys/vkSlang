@@ -199,6 +199,11 @@ struct App {
     profiles: Vec<profile::Profile>,
     profile_name: String,
     pending_params: Option<std::collections::BTreeMap<String, f32>>,
+    /// Profile whose 🗙 was clicked, waiting for a second click.
+    confirm_delete: Option<String>,
+    /// Default profile of a process as read from vkSlang.conf, kept rather
+    /// than reading the file on every repaint. `None` until read.
+    default_profile: Option<(String, Option<String>)>,
 }
 
 fn default_shader_root() -> String {
@@ -319,6 +324,8 @@ impl App {
             profiles: profile::read_dir(&profile::dir()).0,
             profile_name: String::new(),
             pending_params: None,
+            confirm_delete: None,
+            default_profile: None,
         }
     }
 
@@ -327,6 +334,8 @@ impl App {
     fn reload_profiles(&mut self) {
         let (profiles, failures) = profile::read_dir(&profile::dir());
         self.profiles = profiles;
+        // vkSlang.conf may have been edited by hand too.
+        self.default_profile = None;
         if !failures.is_empty() {
             self.error(format!("unreadable profile(s): {}", failures.join("; ")));
         }
@@ -538,7 +547,7 @@ impl App {
             let dismiss = ui
                 .horizontal(|ui| {
                     ui.colored_label(color, msg.as_str());
-                    ui.small_button("✕").clicked()
+                    ui.small_button("🗙").clicked()
                 })
                 .inner;
             if dismiss {
@@ -592,7 +601,7 @@ impl App {
                     if ui.small_button("↓").clicked() {
                         swap = Some((i, i + 1));
                     }
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button("🗙").clicked() {
                         remove = Some(i);
                     }
                     let label = if entry.enabled {
@@ -821,7 +830,10 @@ impl App {
                     changed = true;
                 }
             }
-            ui.separator();
+        });
+        // A row of its own: egui cannot wrap a slider, and sharing the row
+        // pushed the second one past the window, widening the whole panel.
+        ui.horizontal_wrapped(|ui| {
             // Two different things, kept apart on purpose: one moves the
             // drawn area (preset and picture together), the other moves the
             // picture inside it (the preset keeps its geometry).
@@ -846,11 +858,7 @@ impl App {
                 if edit.scale_locked {
                     // Follow the ratio rather than forcing both to be equal.
                     let ratio = edit.scale_ratio.max(0.01);
-                    let other = if axis == 0 {
-                        edit.display_scale[0] * ratio
-                    } else {
-                        edit.display_scale[1] / ratio
-                    };
+                    let other = if axis == 0 { edit.display_scale[0] * ratio } else { edit.display_scale[1] / ratio };
                     edit.display_scale[1 - axis] = other.clamp(0.25, 2.0);
                 }
                 changed = true;
@@ -861,11 +869,8 @@ impl App {
                 .changed()
                 && edit.scale_locked
             {
-                edit.scale_ratio = if edit.display_scale[0] > 0.0 {
-                    edit.display_scale[1] / edit.display_scale[0]
-                } else {
-                    1.0
-                };
+                edit.scale_ratio =
+                    if edit.display_scale[0] > 0.0 { edit.display_scale[1] / edit.display_scale[0] } else { 1.0 };
             }
             if ui.small_button("1:1").on_hover_text("Back to full size, square").clicked() {
                 edit.display_scale = [1.0, 1.0];
@@ -972,9 +977,13 @@ impl App {
         if ui.button("Reset all").clicked() {
             requests.push(Request::ResetParams);
         }
+        // A vertical-only scroll area grows to its widest row, and a long
+        // parameter description used to widen the whole panel past the
+        // window: the width is capped and descriptions are truncated.
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .max_height((ui.available_height() - 90.0).max(120.0))
+            .max_width(ui.available_width())
+            .max_height(ui.available_height().max(120.0))
             .show(ui, |ui| {
                 if state.params.is_empty() {
                     ui.weak("This preset has no parameters.");
@@ -997,8 +1006,7 @@ impl App {
                         let before = p.value;
                         let slider = egui::Slider::new(&mut p.value, p.minimum..=p.maximum)
                             .step_by(p.step.max(0.0001) as f64)
-                            .max_decimals(4)
-                            .text(p.description.trim());
+                            .max_decimals(4);
                         let slider = ui.add(slider).on_hover_text(p.name.as_str());
                         if slider.changed() {
                             if (p.value - before).abs() > p.epsilon() {
@@ -1012,6 +1020,9 @@ impl App {
                             p.value = p.initial;
                             requests.push(Request::SetParam { name: p.name.clone(), value: p.initial });
                         }
+                        let description = p.description.trim();
+                        ui.add(egui::Label::new(description).truncate())
+                            .on_hover_text(format!("{description}\n{}", p.name));
                     });
                 }
             });
@@ -1022,7 +1033,6 @@ impl App {
 
     fn profile_panel(&mut self, ui: &mut egui::Ui) {
         let Some(state) = self.state.clone() else { return };
-        ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.label("Profile");
             ui.add(egui::TextEdit::singleline(&mut self.profile_name).hint_text("name").desired_width(160.0));
@@ -1047,9 +1057,19 @@ impl App {
         });
 
         let profiles = self.profiles.clone();
-        let default_profile = save::default_profile_for(&state.process);
+        let default_profile = match &self.default_profile {
+            Some((process, name)) if *process == state.process => name.clone(),
+            _ => {
+                let name = save::default_profile_for(&state.process);
+                self.default_profile = Some((state.process.clone(), name.clone()));
+                name
+            }
+        };
+        let confirm_delete = self.confirm_delete.clone();
         let mut apply = None;
         let mut delete = None;
+        let mut ask_delete = None;
+        let mut keep = false;
         let mut set_default: Option<Option<profile::Profile>> = None;
         ui.horizontal_wrapped(|ui| {
             if profiles.is_empty() {
@@ -1072,18 +1092,30 @@ impl App {
                 {
                     set_default = Some(if is_default { None } else { Some(p.clone()) });
                 }
-                if ui.small_button("✕").on_hover_text(format!("Delete {}", p.name)).clicked() {
-                    delete = Some(p.clone());
+                if confirm_delete.as_deref() == Some(p.name.as_str()) {
+                    if ui.small_button("delete").on_hover_text(format!("Delete {} for good", p.name)).clicked() {
+                        delete = Some(p.clone());
+                    }
+                    keep |= ui.small_button("keep").clicked();
+                } else if ui.small_button("🗙").on_hover_text(format!("Delete {}", p.name)).clicked() {
+                    ask_delete = Some(p.name.clone());
                 }
                 ui.separator();
             }
         });
+        if let Some(name) = ask_delete {
+            self.confirm_delete = Some(name);
+        }
+        if keep {
+            self.confirm_delete = None;
+        }
         if let Some(p) = apply {
             self.profile_name = p.name.clone();
             self.apply_profile(&p);
         }
         if let Some(choice) = set_default {
             let name = choice.as_ref().map(|p| p.name.clone());
+            self.default_profile = None;
             match save::set_default_profile(&state.process, name.as_deref()) {
                 Ok(()) => self.info(match &name {
                     Some(n) => format!("{n} will load automatically for {}", state.process),
@@ -1093,6 +1125,7 @@ impl App {
             }
         }
         if let Some(p) = delete {
+            self.confirm_delete = None;
             match profile::delete(&p) {
                 Ok(()) => {
                     self.info(format!("deleted {}", p.name));
@@ -1427,6 +1460,14 @@ impl eframe::App for App {
         self.tick();
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::left("presets").resizable(true).default_size(340.0).show(ui, |ui| self.preset_browser(ui));
+        // Profiles and saving stay pinned at the bottom: in the central panel
+        // a long profile list pushed the save buttons out of the window.
+        if self.client.is_some() {
+            egui::Panel::bottom("profiles").show(ui, |ui| {
+                self.profile_panel(ui);
+                self.save_panel(ui);
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             if self.client.is_none() {
                 ui.heading("No process connected");
@@ -1445,8 +1486,6 @@ impl eframe::App for App {
             self.presentation_panel(ui);
             ui.separator();
             self.params_panel(ui);
-            self.profile_panel(ui);
-            self.save_panel(ui);
         });
         self.pixel_grid_window(ui.ctx());
         ui.ctx().request_repaint_after(POLL);
