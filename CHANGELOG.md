@@ -32,7 +32,9 @@ swapchain through librashader, with a live control panel.
 - Pixel grid assistant: measure a game's resolution and frame its picture on a
   capture.
 - Divisor calculator: the source divisor from the screen and game resolutions,
-  integer-scaled or fitted.
+  integer-scaled or fitted, and "frame the game", which sets the picture and
+  display areas to exactly where gamescope draws the game, so a 4:3 game is
+  processed on its own pixels only.
 - Profiles: save, apply, star as a per-process default, delete (with
   confirmation); export a RetroArch-compatible `.slangp`.
 

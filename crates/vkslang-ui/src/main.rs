@@ -42,6 +42,15 @@ fn game_scale(screen: [u32; 2], game: [u32; 2], integer: bool) -> f32 {
     }
 }
 
+/// Where the game sits on the screen, `[x, y, width, height]`: scaled by
+/// [`game_scale`] and centred, as gamescope places it.
+fn game_rect(screen: [u32; 2], game: [u32; 2], integer: bool) -> [u32; 4] {
+    let by = game_scale(screen, game, integer);
+    let w = ((game[0].max(1) as f32 * by).round() as u32).min(screen[0]);
+    let h = ((game[1].max(1) as f32 * by).round() as u32).min(screen[1]);
+    [(screen[0] - w) / 2, (screen[1] - h) / 2, w, h]
+}
+
 /// Converts a frame drawn on the capture into a picture area in output
 /// pixels, as `source_rect` spells it.
 fn frame_to_area(frame: egui::Rect, capture: [u32; 2], base: [u32; 2]) -> String {
@@ -737,15 +746,34 @@ impl App {
                 ui.add(egui::DragValue::new(&mut edit.calc_game[1]).range(1..=4320));
                 ui.checkbox(&mut edit.calc_integer, "integer scale");
                 let by = game_scale(screen, edit.calc_game, edit.calc_integer);
-                let shown =
-                    [(edit.calc_game[0] as f32 * by).round() as u32, (edit.calc_game[1] as f32 * by).round() as u32];
+                let [x, y, w, h] = game_rect(screen, edit.calc_game, edit.calc_integer);
                 if ui
                     .button(format!("use ÷{}", (by * 100.0).round() / 100.0))
-                    .on_hover_text(format!("The game is shown {}×{} on the screen", shown[0], shown[1]))
+                    .on_hover_text(format!("The game is shown {w}×{h} on the screen"))
                     .clicked()
                 {
                     edit.divisor = by;
                     edit.mode = SourceSize::Divide { by };
+                    changed = true;
+                }
+                if ui
+                    .button("frame the game")
+                    .on_hover_text(format!(
+                        "Read and draw only where the game is, {w}×{h} at {x},{y}, divided by {}: the preset sees \
+                         exactly the game's pixels, and leaves the bars around it black. Resets both scales.",
+                        (by * 100.0).round() / 100.0
+                    ))
+                    .clicked()
+                {
+                    let area = format!("{x},{y},{w}x{h}");
+                    edit.rect = area.clone();
+                    edit.display = area;
+                    edit.divisor = by;
+                    edit.mode = SourceSize::Divide { by };
+                    edit.source_scale = [1.0, 1.0];
+                    edit.source_ratio = 1.0;
+                    edit.display_scale = [1.0, 1.0];
+                    edit.scale_ratio = 1.0;
                     changed = true;
                 }
             });
@@ -1517,6 +1545,16 @@ mod tests {
         // Never below 1, even for a game larger than the screen.
         assert_eq!(game_scale([1280, 720], [1920, 1080], true), 1.0);
         assert_eq!(game_scale([1280, 720], [1920, 1080], false), 1.0);
+    }
+
+    #[test]
+    fn game_rect_is_where_gamescope_draws() {
+        // 640×480 ×4 on a 4K screen: 2560×1920, centred.
+        assert_eq!(game_rect([3840, 2160], [640, 480], true), [640, 120, 2560, 1920]);
+        // Fitted: the full height, pillarboxed.
+        assert_eq!(game_rect([3840, 2160], [640, 480], false), [480, 0, 2880, 2160]);
+        // Larger than the screen: clamped, never outside.
+        assert_eq!(game_rect([1280, 720], [1920, 1080], true), [0, 0, 1280, 720]);
     }
 
     #[test]
