@@ -509,6 +509,31 @@ pub fn socket_path(pid: u32) -> PathBuf {
     socket_dir().join(format!("{pid}.sock"))
 }
 
+/// Where the layer of process `pid` writes its captures (next to its socket).
+pub fn capture_path(pid: u32) -> PathBuf {
+    socket_dir().join(format!("{pid}-capture.bin"))
+}
+
+/// Removes the socket and capture files left by processes that are gone.
+/// Captures are several megabytes each, and nothing else ever deletes them.
+pub fn remove_stale_files() {
+    remove_stale_files_in(&socket_dirs());
+}
+
+fn remove_stale_files_in(dirs: &[PathBuf]) {
+    let alive = |pid: u32| Path::new(&format!("/proc/{pid}")).exists();
+    for dir in dirs {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let pid = name.strip_suffix(".sock").or_else(|| name.strip_suffix("-capture.bin"));
+            if pid.and_then(|p| p.parse().ok()).is_some_and(|pid| !alive(pid)) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 /// Sockets currently present, as `(pid, path)`, across every candidate
 /// directory. Some may be stale (process gone); [`Client::connect`] fails on
 /// those and removes them.
@@ -628,6 +653,29 @@ mod tests {
         assert!(color_space_mismatch(Sdr, Hdr10).is_some());
         // HDR10 vs scRGB is fine, only the input caveat remains.
         assert_eq!(color_space_mismatch(ScRgb, Hdr10), color_space_mismatch(Hdr10, Hdr10));
+    }
+
+    #[test]
+    fn stale_files_are_swept() {
+        let dir = std::env::temp_dir().join(format!("vkslang-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+        let gone = u32::MAX - 1; // above any pid_max
+        for name in [
+            format!("{me}.sock"),
+            format!("{me}-capture.bin"),
+            format!("{gone}.sock"),
+            format!("{gone}-capture.bin"),
+            "notes.txt".into(),
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        remove_stale_files_in(std::slice::from_ref(&dir));
+        let mut left: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec![format!("{me}-capture.bin"), format!("{me}.sock"), "notes.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

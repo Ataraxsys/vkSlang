@@ -341,16 +341,15 @@ impl App {
     }
 
     fn scan_targets(&mut self) {
+        vkslang_ipc::remove_stale_files();
         let connected = self.selected;
         let active_now = self.state.as_ref().is_some_and(|s| !s.outputs.is_empty());
         self.targets = vkslang_ipc::list_sockets()
             .into_iter()
             .filter_map(|(pid, path)| {
-                let Some(name) = process_name(pid) else {
-                    // Process gone: clean the stale socket.
-                    let _ = std::fs::remove_file(&path);
-                    return None;
-                };
+                // Process gone between the sweep and now: skip it, the next
+                // sweep removes its files.
+                let name = process_name(pid)?;
                 // Ask the others whether they have a swapchain; the connected
                 // one is already known from its state.
                 let active = if Some(pid) == connected {

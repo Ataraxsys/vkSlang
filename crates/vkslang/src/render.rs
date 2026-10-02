@@ -515,9 +515,10 @@ impl CaptureTarget {
     /// Writes the mapped pixels next to the control socket.
     unsafe fn write(&self, base: vk::Extent2D, area: vk::Rect2D) -> std::io::Result<vkslang_ipc::Capture> {
         use std::io::Write;
-        let dir = vkslang_ipc::socket_dir();
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}-capture.bin", std::process::id()));
+        let path = vkslang_ipc::capture_path(std::process::id());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let len = (self.extent.width * self.extent.height * 4) as usize;
         let pixels = std::slice::from_raw_parts(self.mapped as *const u8, len);
         let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
