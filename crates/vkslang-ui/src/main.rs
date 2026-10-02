@@ -32,6 +32,18 @@ struct GridImage {
 
 /// Converts a frame drawn on the capture into a picture area in output
 /// pixels, as `source_rect` spells it.
+/// How many screen pixels one game pixel covers: the divisor that brings the
+/// screen back to the game's own grid. Integer scaling keeps whole screen
+/// pixels per game pixel; otherwise the picture is fitted to the screen.
+fn game_scale(screen: [u32; 2], game: [u32; 2], integer: bool) -> f32 {
+    let [gw, gh] = [game[0].max(1), game[1].max(1)];
+    if integer {
+        (screen[0] / gw).min(screen[1] / gh).max(1) as f32
+    } else {
+        (screen[0] as f32 / gw as f32).min(screen[1] as f32 / gh as f32).max(1.0)
+    }
+}
+
 fn frame_to_area(frame: egui::Rect, capture: [u32; 2], base: [u32; 2]) -> String {
     let to_output =
         egui::vec2(base[0] as f32 / capture[0] as f32, base[1] as f32 / capture[1] as f32);
@@ -92,6 +104,11 @@ struct SourceEdit {
     source_scale: [f32; 2],
     source_locked: bool,
     source_ratio: f32,
+    /// Divisor calculator: screen size (`None` follows the output), the
+    /// game's resolution, and whether the game is integer-scaled.
+    calc_screen: Option<[u32; 2]>,
+    calc_game: [u32; 2],
+    calc_integer: bool,
 }
 
 impl SourceEdit {
@@ -119,6 +136,9 @@ impl SourceEdit {
             } else {
                 1.0
             },
+            calc_screen: None,
+            calc_game: [640, 480],
+            calc_integer: true,
         };
         match s.res {
             SourceSize::Fixed { size: [w, h] } => (edit.width, edit.height) = (w, h),
@@ -645,6 +665,7 @@ impl App {
             let picture = if [pw, ph] == [w, h] { String::new() } else { format!("picture {pw}×{ph}, ") };
             ui.weak(format!("base {w}×{h}, {picture}input {iw}×{ih}, output {w}×{h}"));
         }
+        let output_size = self.state.as_ref().and_then(|s| s.outputs.first()).map(|o| o.size);
         let Some(edit) = self.source.as_mut() else { return };
         ui.horizontal_wrapped(|ui| {
             ui.label("Source resolution");
@@ -701,6 +722,47 @@ impl App {
                 SourceSize::Native => {}
             }
         });
+        if matches!(edit.mode, SourceSize::Divide { .. }) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Find the divisor:").on_hover_text(
+                    "Screen pixels per game pixel, from the screen and game resolutions. \
+                     With integer scaling each game pixel covers a whole number of screen pixels.",
+                );
+                let mut screen = edit.calc_screen.or(output_size).unwrap_or([3840, 2160]);
+                ui.label("screen");
+                let mut edited = ui.add(egui::DragValue::new(&mut screen[0]).range(1..=7680)).changed();
+                ui.label("×");
+                edited |= ui.add(egui::DragValue::new(&mut screen[1]).range(1..=4320)).changed();
+                if edited {
+                    edit.calc_screen = Some(screen);
+                }
+                if edit.calc_screen.is_some()
+                    && output_size.is_some()
+                    && ui.small_button("↺").on_hover_text("Back to the output size").clicked()
+                {
+                    edit.calc_screen = None;
+                }
+                ui.label("game");
+                ui.add(egui::DragValue::new(&mut edit.calc_game[0]).range(1..=7680));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut edit.calc_game[1]).range(1..=4320));
+                ui.checkbox(&mut edit.calc_integer, "integer scale");
+                let by = game_scale(screen, edit.calc_game, edit.calc_integer);
+                let shown = [
+                    (edit.calc_game[0] as f32 * by).round() as u32,
+                    (edit.calc_game[1] as f32 * by).round() as u32,
+                ];
+                if ui
+                    .button(format!("use ÷{}", (by * 100.0).round() / 100.0))
+                    .on_hover_text(format!("The game is shown {}×{} on the screen", shown[0], shown[1]))
+                    .clicked()
+                {
+                    edit.divisor = by;
+                    edit.mode = SourceSize::Divide { by };
+                    changed = true;
+                }
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label("Picture scale").on_hover_text(
                 "Size of the picture inside that area: a smaller region is read, so the picture grows \
@@ -1439,6 +1501,18 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_scale_matches_gamescope() {
+        // 640×480 on a 4K screen: ×4 when integer-scaled (2560×1920), fitted
+        // to the height otherwise (2880×2160).
+        assert_eq!(game_scale([3840, 2160], [640, 480], true), 4.0);
+        assert_eq!(game_scale([3840, 2160], [640, 480], false), 4.5);
+        assert_eq!(game_scale([2560, 1440], [320, 240], true), 6.0);
+        // Never below 1, even for a game larger than the screen.
+        assert_eq!(game_scale([1280, 720], [1920, 1080], true), 1.0);
+        assert_eq!(game_scale([1280, 720], [1920, 1080], false), 1.0);
+    }
 
     #[test]
     fn frame_maps_to_output_pixels() {
