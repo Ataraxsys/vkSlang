@@ -683,6 +683,14 @@ mod tests {
         assert_eq!((hdr.brightness_nits, hdr.expand_gamut), (200.0, 0));
     }
 
+    /// The sample installed for new users must not set anything: whatever it
+    /// sets applies to every process, gamescope included.
+    #[test]
+    fn sample_config_is_neutral() {
+        let kv = parse_file(include_str!("../../../config/vkSlang.conf"));
+        assert!(kv.is_empty(), "the sample sets {:?}", kv.keys().collect::<Vec<_>>());
+    }
+
     #[test]
     fn file() {
         let kv = parse_file("preset = /a/b.slangp # comment\n# x = y\nparam.GAMMA=2.4\n");
