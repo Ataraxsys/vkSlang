@@ -3041,7 +3041,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vkslang"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "ash",
  "librashader",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "vkslang-ipc"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3059,7 +3059,7 @@ dependencies = [
 
 [[package]]
 name = "vkslang-ui"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "eframe",
  "serde",

@@ -1,0 +1,61 @@
+name: Release
+
+# Pushing a tag such as v1.0.0 builds, checks and publishes a ready-to-install
+# archive, with that version's CHANGELOG section as release notes.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches the crate version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+      - name: Check
+        run: |
+          cargo fmt --all --check
+          cargo clippy --release --workspace --all-targets -- -D warnings
+          cargo test --release --workspace
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Check the library
+        run: |
+          nm -D --defined-only target/release/libvkslang.so | grep -E ' vk(NegotiateLoaderLayerInterfaceVersion|GetInstanceProcAddr|GetDeviceProcAddr)$'
+          readelf -d target/release/libvkslang.so | grep -E 'SYMBOLIC'
+          python3 -m json.tool layer/vkslang.json > /dev/null
+      - name: Package
+        run: |
+          name="vkslang-${GITHUB_REF_NAME#v}-x86_64-linux"
+          mkdir -p "dist/$name/target/release"
+          cp target/release/libvkslang.so target/release/vkslang-ui "dist/$name/target/release/"
+          cp -r layer config scripts README.md CHANGELOG.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - name: Release notes
+        run: |
+          # The section of CHANGELOG.md for this version, without its heading.
+          awk -v v="${GITHUB_REF_NAME#v}" '
+            /^## / { if (found) exit; found = index($0, "[" v "]") > 0; next }
+            found
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "no CHANGELOG section for $GITHUB_REF_NAME"; exit 1; }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+            --title "vkSlang ${GITHUB_REF_NAME#v}" --notes-file notes.md

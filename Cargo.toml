@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/vkslang", "crates/vkslang-ipc", "crates/vkslang-ui"]
 
 [workspace.package]
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 license = "MPL-2.0"
 repository = "https://github.com/Ataraxsys/vkSlang"
