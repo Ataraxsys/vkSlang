@@ -479,10 +479,16 @@ impl CaptureTarget {
         )?;
         let reqs = d.get_buffer_memory_requirements(buffer);
         let props = dev.instance.fns.get_physical_device_memory_properties(dev.physical_device);
-        let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let type_index = (0..props.memory_type_count).find(|&i| {
-            reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(wanted)
-        });
+        // The CPU reads this memory back: cached memory first. The first
+        // host-visible type is often video memory mapped uncached, where
+        // reading a 4K picture takes seconds and freezes the game meanwhile.
+        let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let find = |wanted: vk::MemoryPropertyFlags| {
+            (0..props.memory_type_count).find(|&i| {
+                reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(wanted)
+            })
+        };
+        let type_index = find(coherent | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|| find(coherent));
         let cleanup = |e: vk::Result| {
             d.destroy_buffer(buffer, None);
             d.destroy_image(image, None);
@@ -1744,9 +1750,12 @@ impl Runtime {
         if let (Some((base, area)), Some(target)) = (captured, capture.as_ref()) {
             let fence = slot.fence;
             if d.wait_for_fences(&[fence], true, 1_000_000_000).is_ok() {
+                // Written before taking the control lock: the UI keeps
+                // talking to the layer meanwhile.
+                let written = target.write(base, area);
                 let mut ctl = control();
                 let id = ctl.capture.as_ref().map_or(1, |c| c.id + 1);
-                match target.write(base, area) {
+                match written {
                     Ok(mut info) => {
                         info.id = id;
                         log_debug!("capture {}x{} -> {}", info.size[0], info.size[1], info.path);
