@@ -844,7 +844,7 @@ impl App {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label(l.t("Dupliquer les pixels", "Duplicate pixels"))
-                .on_hover_text(l.t("Répète chaque pixel source, pour les modes aux pixels non carrés (DOS 320×200 : ↕ 2 donne 400 vraies lignes au preset)", "Repeat each source pixel, for modes whose pixels are not square (DOS 320×200: ↕ 2 gives the preset 400 real lines)"));
+                .on_hover_text(l.t("Réglage brut : ne change que ce que reçoit le shader, pas la forme du jeu. Pour agrandir le jeu, utilise « Dupliquer » de la section Forme en haut.", "Raw setting: only changes what the shader receives, not the game's shape. To make the game bigger, use Duplicate in the Shape section above."));
             for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
                 changed |= ui
                     .add(egui::DragValue::new(&mut edit.duplicate[axis]).range(1..=8).prefix(label))

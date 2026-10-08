@@ -60,15 +60,18 @@ impl Plan {
     }
 
     /// Width over height of the drawn picture.
+    ///
+    /// Duplication always reshapes the game itself: ↕ 2 makes it twice as
+    /// tall whatever the shape, and the shader then works on that taller
+    /// game, its scanlines keeping their thickness.
     pub fn aspect(&self) -> f32 {
-        match self.shape {
-            Shape::Square => {
-                let [w, h] = self.input();
-                w as f32 / h as f32
-            }
+        let [w, h] = self.game();
+        let base = match self.shape {
+            Shape::Square => w as f32 / h as f32,
             Shape::Crt => 4.0 / 3.0,
             Shape::AsShown => self.zone[2] as f32 / self.zone[3].max(1) as f32,
-        }
+        };
+        base * self.dup[0].max(1) as f32 / self.dup[1].max(1) as f32
     }
 
     /// Where the preset draws, `[x, y, width, height]` on a `screen`.
@@ -165,6 +168,18 @@ mod tests {
         assert_eq!(plan.display(SCREEN), [192, 0, 3456, 2160]);
         let single = Plan { dup: [1, 1], ..plan };
         assert!(single.display(SCREEN)[3] < plan.display(SCREEN)[3], "doubling changes the shape");
+    }
+
+    #[test]
+    fn duplicating_reshapes_the_game_in_every_shape() {
+        for shape in [Shape::Crt, Shape::Square, Shape::AsShown] {
+            let plan = Plan { shape, size: Size::Fit, ..dos() };
+            let doubled = Plan { dup: [1, 2], ..plan };
+            assert!(
+                (doubled.aspect() * 2.0 - plan.aspect()).abs() < 1e-4,
+                "{shape:?}: twice as tall, not just more lines for the shader"
+            );
+        }
     }
 
     #[test]

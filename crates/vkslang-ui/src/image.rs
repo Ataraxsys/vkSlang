@@ -400,10 +400,10 @@ impl App {
         });
         ui.horizontal_wrapped(|ui| {
             ui.strong(l.t("Dupliquer", "Duplicate")).on_hover_text(l.t(
-                "Répète chaque pixel du jeu. ↕ 2 double les lignes : le shader travaille sur ces lignes doublées \
-                 (le VGA affichait le 320×200 sur 400 lignes), et en pixels carrés l'image devient deux fois plus haute.",
-                "Repeats each game pixel. ↕ 2 doubles the lines: the shader works on the doubled lines (VGA showed \
-                 320×200 on 400 lines), and with square pixels the picture becomes twice as tall.",
+                "Répète chaque pixel du jeu : ↕ 2 rend le jeu deux fois plus haut, ↔ 2 deux fois plus large. \
+                 Le shader s'applique ensuite sur ce jeu dupliqué, ses scanlines gardent leur épaisseur.",
+                "Repeats each game pixel: ↕ 2 makes the game twice as tall, ↔ 2 twice as wide. The shader then \
+                 applies to that duplicated game, its scanlines keeping their thickness.",
             ));
             ui.add(egui::DragValue::new(&mut plan.dup[0]).range(1..=8).prefix("↔ "));
             ui.add(egui::DragValue::new(&mut plan.dup[1]).range(1..=8).prefix("↕ "));
@@ -413,10 +413,16 @@ impl App {
                 let [_, _, dw, dh] = plan.display(screen);
                 ui.weak(match l {
                     crate::i18n::Lang::Fr => {
-                        format!("jeu {gw}×{gh} › shader {iw}×{ih} › affiché {dw}×{dh}, {:.2} lignes d'écran par ligne", dh as f32 / ih as f32)
+                        format!(
+                            "jeu {gw}×{gh} › shader {iw}×{ih} › affiché {dw}×{dh}, {:.2} lignes d'écran par ligne",
+                            dh as f32 / ih as f32
+                        )
                     }
                     crate::i18n::Lang::En => {
-                        format!("game {gw}×{gh} › shader {iw}×{ih} › drawn {dw}×{dh}, {:.2} screen lines per line", dh as f32 / ih as f32)
+                        format!(
+                            "game {gw}×{gh} › shader {iw}×{ih} › drawn {dw}×{dh}, {:.2} screen lines per line",
+                            dh as f32 / ih as f32
+                        )
                     }
                 });
             }
