@@ -15,20 +15,6 @@ pub enum SourceRect {
     Explicit(vk::Rect2D),
 }
 
-/// Whether the layer may turn the application's swapchain into an HDR10 one
-/// so that an HDR-aware preset (Sony Megatron...) can output real HDR from an
-/// SDR game.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HdrOutput {
-    /// Never touch the swapchain's format.
-    Off,
-    /// Promote when the preset writes HDR and the surface supports HDR10.
-    #[default]
-    Auto,
-    /// Promote whenever the surface supports HDR10, whatever the preset.
-    Force,
-}
-
 /// How the swapchain image is turned into the chain's `Original` input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -76,10 +62,8 @@ pub struct Config {
     pub params: Vec<(String, f32)>,
     /// Control socket for vkslang-ui (`VKSLANG_IPC=0` disables it).
     pub ipc: bool,
-    /// HDR uniforms for HDR-aware presets.
+    /// HDR output and its settings.
     pub hdr: vkslang_ipc::HdrSettings,
-    /// Whether the swapchain may be promoted to HDR10.
-    pub hdr_output: HdrOutput,
     /// Presentations per application frame (1 = untouched). With a 60 Hz
     /// source on a 240 Hz display, 3 or 4 let interlacing presets alternate
     /// fields faster than the game's frame rate.
@@ -188,17 +172,46 @@ pub fn parse_rect(s: &str) -> Option<SourceRect> {
 
 /// Clamps HDR settings to the ranges the shaders accept.
 pub fn sanitize_hdr(hdr: vkslang_ipc::HdrSettings) -> vkslang_ipc::HdrSettings {
+    let default = vkslang_ipc::HdrSettings::default();
+    let finite = |v: f32, lo: f32, hi: f32, fallback: f32| if v.is_finite() { v.clamp(lo, hi) } else { fallback };
+    let brightness_nits = finite(hdr.brightness_nits, 0.0, 10000.0, default.brightness_nits);
     vkslang_ipc::HdrSettings {
-        brightness_nits: if hdr.brightness_nits.is_finite() { hdr.brightness_nits.clamp(0.0, 10000.0) } else { 200.0 },
+        mode: hdr.mode,
+        brightness_nits,
+        // Highlights below paper white would invert the curve.
+        peak_nits: finite(hdr.peak_nits, 100.0, 10000.0, default.peak_nits).max(brightness_nits + 1.0),
+        contrast: finite(hdr.contrast, 0.5, 3.0, default.contrast),
         expand_gamut: hdr.expand_gamut.min(3),
     }
 }
 
-fn parse_hdr(kv: &HashMap<String, String>) -> vkslang_ipc::HdrSettings {
-    let default = vkslang_ipc::HdrSettings::default();
+/// `off`, `auto` or `on` (`force`, the older spelling, still works).
+pub fn parse_hdr_mode(spec: &str) -> Option<vkslang_ipc::HdrMode> {
+    use vkslang_ipc::HdrMode;
+    match spec.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" | "false" => Some(HdrMode::Off),
+        "auto" => Some(HdrMode::Auto),
+        "on" | "force" | "1" | "true" => Some(HdrMode::On),
+        _ => None,
+    }
+}
+
+/// HDR settings: each key spelled out wins over the profile's value.
+fn parse_hdr(kv: &HashMap<String, String>, profile: Option<vkslang_ipc::HdrSettings>) -> vkslang_ipc::HdrSettings {
+    let base = profile.unwrap_or_default();
+    let number = |key: &str, fallback: f32| kv.get(key).and_then(|v| v.parse().ok()).unwrap_or(fallback);
     sanitize_hdr(vkslang_ipc::HdrSettings {
-        brightness_nits: kv.get("brightness_nits").and_then(|v| v.parse().ok()).unwrap_or(default.brightness_nits),
-        expand_gamut: kv.get("expand_gamut").and_then(|v| v.parse().ok()).unwrap_or(default.expand_gamut),
+        mode: match kv.get("hdr_output") {
+            Some(spec) => parse_hdr_mode(spec).unwrap_or_else(|| {
+                crate::log_warn!("invalid hdr_output '{spec}', expected off, auto or on");
+                base.mode
+            }),
+            None => base.mode,
+        },
+        brightness_nits: number("brightness_nits", base.brightness_nits),
+        peak_nits: number("hdr_peak_nits", base.peak_nits),
+        contrast: number("hdr_contrast", base.contrast),
+        expand_gamut: kv.get("expand_gamut").and_then(|v| v.parse().ok()).unwrap_or(base.expand_gamut),
     })
 }
 
@@ -350,11 +363,7 @@ impl Config {
             process,
             params,
             ipc: kv.get("ipc").is_none_or(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
-            hdr: if from_profile("brightness_nits") && from_profile("expand_gamut") {
-                profile.as_ref().map_or_else(|| parse_hdr(&kv), |p| p.hdr)
-            } else {
-                parse_hdr(&kv)
-            },
+            hdr: parse_hdr(&kv, profile.as_ref().map(|p| p.hdr)),
             subframes: kv
                 .get("subframes")
                 .and_then(|v| v.parse().ok())
@@ -364,11 +373,6 @@ impl Config {
             subframe_black: match kv.get("subframe_mode") {
                 Some(v) => v.eq_ignore_ascii_case("black") || v.eq_ignore_ascii_case("bfi"),
                 None => profile.as_ref().is_some_and(|p| p.subframe_black),
-            },
-            hdr_output: match kv.get("hdr_output").map(|v| v.to_ascii_lowercase()).as_deref() {
-                Some("off") | Some("0") | Some("false") => HdrOutput::Off,
-                Some("force") | Some("1") | Some("true") => HdrOutput::Force,
-                _ => HdrOutput::Auto,
             },
         }
     }
@@ -676,11 +680,19 @@ mod tests {
 
     #[test]
     fn hdr() {
-        let kv = parse_file("brightness_nits = 400\nexpand_gamut = 9\n");
-        let hdr = parse_hdr(&kv);
-        assert_eq!((hdr.brightness_nits, hdr.expand_gamut), (400.0, 3));
-        let hdr = parse_hdr(&HashMap::new());
-        assert_eq!((hdr.brightness_nits, hdr.expand_gamut), (200.0, 0));
+        use vkslang_ipc::HdrMode;
+        let kv = parse_file("brightness_nits = 400\nexpand_gamut = 9\nhdr_output = force\n");
+        let hdr = parse_hdr(&kv, None);
+        assert_eq!((hdr.brightness_nits, hdr.expand_gamut, hdr.mode), (400.0, 3, HdrMode::On));
+        let hdr = parse_hdr(&HashMap::new(), None);
+        assert_eq!((hdr.brightness_nits, hdr.expand_gamut, hdr.mode), (200.0, 0, HdrMode::Auto));
+        // A key in the file wins over the profile, the rest comes from it.
+        let profile = vkslang_ipc::HdrSettings { mode: HdrMode::On, peak_nits: 600.0, ..Default::default() };
+        let hdr = parse_hdr(&parse_file("hdr_peak_nits = 1500\n"), Some(profile));
+        assert_eq!((hdr.mode, hdr.peak_nits), (HdrMode::On, 1500.0));
+        // Peak never below paper white.
+        let hdr = sanitize_hdr(vkslang_ipc::HdrSettings { brightness_nits: 300.0, peak_nits: 150.0, ..profile });
+        assert!(hdr.peak_nits > hdr.brightness_nits);
     }
 
     /// The sample installed for new users must not set anything: whatever it

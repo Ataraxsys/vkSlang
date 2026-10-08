@@ -25,6 +25,14 @@ swapchain through librashader, with a live control panel.
 - Steam/Proton: paths retried under `/run/host`, control socket reachable from
   the container, `VKSLANG_LOG_FILE`.
 
+- HDR like RetroArch: with HDR on, any preset's SDR picture is converted to
+  HDR10 by a final pass (inverse tone mapping, BT.2020, PQ) with peak
+  luminance, paper white, contrast and gamut. HDR switches on and off while
+  the game runs: the layer asks it to recreate its swapchain.
+- Chained presets keep the first one's resolution: its last pass, drawn at
+  the viewport's size when it ended the chain, fell back to its input's size
+  once followed by another preset.
+
 ### Control panel (`vkslang-ui`)
 
 - Redesigned around what the user wants rather than the settings behind it:

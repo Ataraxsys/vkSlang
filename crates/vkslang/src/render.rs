@@ -20,7 +20,9 @@ use crate::control::{control, Control};
 use crate::state::DeviceData;
 use crate::{log_debug, log_error, log_info, log_warn};
 use ash::vk;
-use librashader::presets::{get_parameter_meta, PresetColorSpace, ShaderFeatures, ShaderPreset};
+use librashader::presets::{
+    get_parameter_meta, PresetColorSpace, Scale2D, ScaleFactor, ScaleType, Scaling, ShaderFeatures, ShaderPreset,
+};
 use librashader::runtime::vk::{FilterChain, FilterChainOptions, FrameOptions, VulkanImage};
 use librashader::runtime::{ColorSpace, FilterChainParameters, Size, Viewport};
 use std::collections::{HashMap, HashSet};
@@ -180,6 +182,109 @@ unsafe fn allocate_cmd(dev: &DeviceData, pool: vk::CommandPool) -> Result<vk::Co
     Ok(cmd)
 }
 
+/// Final pass turning an SDR preset's output into HDR10, the way RetroArch's
+/// HDR option does: linearise with the contrast as gamma, inverse tone map so
+/// that mid grey lands on paper white and white on the display's peak, move
+/// to BT.2020 (optionally expanded), encode PQ. Its parameters are driven by
+/// the HDR settings, never shown as preset parameters.
+const HDR_PASS: &str = r#"#version 450
+#pragma name vkslang_hdr
+#pragma format A2B10G10R10_UNORM_PACK32
+#pragma parameter VKSLANG_HDR_PAPER_WHITE "vkSlang HDR paper white" 200.0 0.0 10000.0 1.0
+#pragma parameter VKSLANG_HDR_PEAK "vkSlang HDR peak" 1000.0 100.0 10000.0 1.0
+#pragma parameter VKSLANG_HDR_CONTRAST "vkSlang HDR contrast" 1.0 0.5 3.0 0.01
+#pragma parameter VKSLANG_HDR_EXPAND "vkSlang HDR expand gamut" 0.0 0.0 1.0 1.0
+
+layout(push_constant) uniform Push {
+    float VKSLANG_HDR_PAPER_WHITE;
+    float VKSLANG_HDR_PEAK;
+    float VKSLANG_HDR_CONTRAST;
+    float VKSLANG_HDR_EXPAND;
+} params;
+
+layout(std140, set = 0, binding = 0) uniform UBO {
+    mat4 MVP;
+} global;
+
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+
+void main() {
+    gl_Position = global.MVP * Position;
+    vTexCoord = TexCoord;
+}
+
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 2) uniform sampler2D Source;
+
+const float kEpsilon = 0.0001;
+
+// SDR (0..1, display gamma) to linear light in units of paper white.
+vec3 inverse_tonemap(vec3 sdr) {
+    sdr = pow(abs(sdr), vec3(params.VKSLANG_HDR_CONTRAST * 2.2));
+    float luma = dot(sdr, vec3(0.2126, 0.7152, 0.0722));
+    float peak = max(params.VKSLANG_HDR_PEAK / max(params.VKSLANG_HDR_PAPER_WHITE, 1.0), 1.0 + kEpsilon);
+    // Inverse of a Reinhard curve below 0.5, of a curve reaching the peak
+    // at 1.0 above it; both meet at paper white.
+    float elbow = peak / (peak - 1.0);
+    float offset = 1.0 - (0.5 * elbow) / (elbow - 0.5);
+    float high = offset + (luma * elbow) / (elbow - luma);
+    float low = luma / ((1.0 - kEpsilon) - luma);
+    float target = luma > 0.5 ? high : low;
+    return sdr / (luma + kEpsilon) * target;
+}
+
+vec3 to_bt2020(vec3 c) {
+    if (params.VKSLANG_HDR_EXPAND > 0.5) {
+        return vec3(dot(c, vec3(0.6274040, 0.3292820, 0.0433136)),
+                    dot(c, vec3(0.0457456, 0.9417770, 0.0124772)),
+                    dot(c, vec3(-0.0012106, 0.0176041, 0.9836070)));
+    }
+    return vec3(dot(c, vec3(0.6274040, 0.3292820, 0.0433136)),
+                dot(c, vec3(0.0690970, 0.9195400, 0.0113612)),
+                dot(c, vec3(0.0163916, 0.0880132, 0.8955950)));
+}
+
+// Linear light normalised to 10000 nits, to SMPTE ST 2084.
+vec3 pq(vec3 l) {
+    vec3 p = pow(clamp(l, 0.0, 1.0), vec3(0.1593017578125));
+    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), vec3(78.84375));
+}
+
+void main() {
+    vec3 sdr = texture(Source, vTexCoord).rgb;
+    vec3 nits = to_bt2020(inverse_tonemap(sdr)) * params.VKSLANG_HDR_PAPER_WHITE;
+    FragColor = vec4(pq(nits / 10000.0), 1.0);
+}
+"#;
+
+/// Parameters of [`HDR_PASS`]: driven by the HDR settings, hidden from the
+/// preset's own parameters.
+const HDR_PARAM_PREFIX: &str = "VKSLANG_HDR_";
+
+/// Writes the HDR pass where librashader can read it, and returns its preset.
+fn hdr_pass_preset() -> Result<PathBuf, String> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("vkslang");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let shader = dir.join("vkslang-hdr.slang");
+    let preset = dir.join("vkslang-hdr.slangp");
+    std::fs::write(&shader, HDR_PASS).map_err(|e| format!("{}: {e}", shader.display()))?;
+    std::fs::write(
+        &preset,
+        "shaders = 1\nshader0 = vkslang-hdr.slang\nfilter_linear0 = false\nscale_type0 = viewport\n",
+    )
+    .map_err(|e| format!("{}: {e}", preset.display()))?;
+    Ok(preset)
+}
+
 /// Concatenates presets into a single chain: the passes of the second run on
 /// the output of the first, and so on.
 ///
@@ -194,6 +299,16 @@ fn merge_presets(paths: &[PathBuf]) -> Result<ShaderPreset, String> {
         match merged.as_mut() {
             None => merged = Some(preset),
             Some(chain) => {
+                // A last pass without a scale is drawn at the viewport's
+                // size; followed by more passes it would fall back to its
+                // input's size, and the first preset would lose all its
+                // resolution. It keeps the viewport.
+                if let Some(last) = chain.passes.last_mut() {
+                    if !last.meta.scaling.valid {
+                        let viewport = Scaling { scale_type: ScaleType::Viewport, factor: ScaleFactor::Float(1.0) };
+                        last.meta.scaling = Scale2D { valid: true, x: viewport.clone(), y: viewport };
+                    }
+                }
                 for mut pass in preset.passes {
                     if pass
                         .meta
@@ -228,12 +343,20 @@ fn merge_presets(paths: &[PathBuf]) -> Result<ShaderPreset, String> {
 /// private command pool are used, so this may run on any thread.
 unsafe fn load_chain(dev: &DeviceData, paths: &[PathBuf]) -> Result<Loaded, String> {
     let started = Instant::now();
-    let preset = merge_presets(paths)?;
-    let params = preset_params(&preset)?;
-    let color_space = preset.color_space().unwrap_or_else(|e| {
+    let mut preset = merge_presets(paths)?;
+    let mut color_space = preset.color_space().unwrap_or_else(|e| {
         log_warn!("cannot determine the preset's output color space: {e}");
         ColorSpace::Sdr
     });
+    // HDR on and an SDR preset: its output is turned into HDR10.
+    if color_space == ColorSpace::Sdr && control().hdr.mode == vkslang_ipc::HdrMode::On {
+        let mut with_hdr = paths.to_vec();
+        with_hdr.push(hdr_pass_preset()?);
+        preset = merge_presets(&with_hdr)?;
+        color_space = ColorSpace::Hdr10;
+        log_info!("HDR on: the SDR preset's output is converted to HDR10");
+    }
+    let params = preset_params(&preset)?;
 
     let d = &dev.fns;
     let pool = d
@@ -418,6 +541,8 @@ pub struct SwapchainPlan {
     pub promoted: bool,
     /// The layer promoted the swapchain to HDR10 (with or without staging).
     pub hdr_promoted: bool,
+    /// It could have been promoted (display and format allow HDR10).
+    pub hdr_available: bool,
 }
 
 pub struct SwapchainState {
@@ -440,6 +565,9 @@ pub struct SwapchainState {
     source: Option<SourceImage>,
     /// The layer promoted this swapchain to HDR10.
     promoted: bool,
+    /// It could be promoted: switching HDR on or off then needs the
+    /// application to recreate it.
+    hdr_available: bool,
     /// Opaque black, for the bars around a smaller picture area.
     black: Option<BlackImage>,
     /// On a promoted (HDR10) swapchain, a full-size image in the
@@ -611,6 +739,7 @@ impl SwapchainState {
             output_format: plan.output_format,
             color_space: color_space(plan.color_space),
             promoted: plan.promoted || plan.hdr_promoted,
+            hdr_available: plan.hdr_available,
             source: None,
             staging: None,
             black: None,
@@ -821,12 +950,16 @@ impl Runtime {
             dev.fns.destroy_command_pool(pool, None);
         }
         for name in ctl.overrides.keys() {
-            if !loaded.params.iter().any(|p| &p.name == name) {
+            if !loaded.params.iter().any(|p| &p.name == name) && !name.starts_with(HDR_PARAM_PREFIX) {
                 log_warn!("preset has no parameter '{name}'");
             }
         }
-        ctl.params =
-            loaded.params.iter().map(|p| Param { value: ctl.param_value(&p.name, p.initial), ..p.clone() }).collect();
+        ctl.params = loaded
+            .params
+            .iter()
+            .filter(|p| !p.name.starts_with(HDR_PARAM_PREFIX))
+            .map(|p| Param { value: ctl.param_value(&p.name, p.initial), ..p.clone() })
+            .collect();
         ctl.running_presets = loaded.paths.clone();
         ctl.preset_color_space = Some(to_ipc(loaded.color_space));
         ctl.error = None;
@@ -897,6 +1030,19 @@ impl Runtime {
                     }
                 }
             }
+            // The HDR pass follows the HDR settings, read every frame.
+            let runtime = active.chain.parameters();
+            let hdr = ctl.hdr;
+            for (name, value) in [
+                ("VKSLANG_HDR_PAPER_WHITE", hdr.brightness_nits),
+                ("VKSLANG_HDR_PEAK", hdr.peak_nits),
+                ("VKSLANG_HDR_CONTRAST", hdr.contrast),
+                ("VKSLANG_HDR_EXPAND", if hdr.expand_gamut > 0 { 1.0 } else { 0.0 }),
+            ] {
+                if runtime.parameter_value(name).is_some_and(|v| v != value) {
+                    runtime.set_parameter_value(name, value);
+                }
+            }
         }
 
         // Source settings: rebuild the source images.
@@ -911,6 +1057,12 @@ impl Runtime {
             // The input size changed, so the published sizes must follow.
             self.publish_outputs();
         }
+    }
+
+    /// Whether `swapchain` was created for another HDR choice than the
+    /// current one, and could follow it if the application recreated it.
+    pub fn hdr_outdated(&self, swapchain: vk::SwapchainKHR, want_hdr10: bool) -> bool {
+        self.swapchains.get(&swapchain).is_some_and(|s| s.hdr_available && s.promoted != want_hdr10)
     }
 
     pub fn is_rendering(&self) -> bool {
@@ -935,7 +1087,10 @@ impl Runtime {
     }
 
     pub fn track_swapchain(&mut self, swapchain: vk::SwapchainKHR, state: SwapchainState) {
-        if let Some(active) = &self.chain {
+        // While a chain compiles (HDR just switched), the running one is
+        // about to go: comparing with it would only warn about a mismatch
+        // that is being fixed.
+        if let Some(active) = self.chain.as_ref().filter(|_| self.loader.is_none()) {
             warn_mismatch(active.color_space, &state);
         }
         self.swapchains.insert(swapchain, state);

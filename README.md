@@ -170,7 +170,9 @@ Settings are read from `$VKSLANG_CONFIG`, else `$XDG_CONFIG_HOME/vkSlang/vkSlang
 | `source_scale` | `1.2`, `1,2` | Scales the picture inside it (the preset keeps its geometry). |
 | `subframes` | `1`–`8` | Presentations per application frame. |
 | `subframe_mode` | `shader`, `black` | Run the preset again for each subframe, or insert black frames. |
-| `hdr_output` | `auto`, `force`, `off` | Promote the swapchain to HDR10. |
+| `hdr_output` | `off`, `auto`, `on` | HDR10 output (see HDR). |
+| `hdr_peak_nits` | `1000` | HDR peak luminance, for the conversion. |
+| `hdr_contrast` | `1.0` | HDR contrast, for the conversion. |
 | `brightness_nits` | `200` | HDR paper white (`BrightnessNits`). |
 | `expand_gamut` | `0`–`3` | HDR gamut (`ExpandGamut`): Accurate, Expanded, Wide, Super. |
 | `ipc` | `0` | Disables the control socket. |
@@ -220,23 +222,20 @@ The layer acquires its own images one at a time and never asks for extra ones (t
 
 ### HDR
 
-vkSlang can give an **SDR game real HDR output**, the way RetroArch does: the swapchain is created in HDR10 while the game keeps rendering 8-bit SDR into it through a view in its own format, and an HDR preset such as `hdr/crt-sony-megatron-v2-default.slangp` reads those pixels and writes PQ.
+vkSlang gives games **real HDR output the way RetroArch does**: the swapchain is created in HDR10 while the game keeps rendering 8-bit SDR into it, through a view in its own format, and the picture is turned into HDR at the end of the chain.
 
-```sh
-ENABLE_VKSLANG=1 VKSLANG_PRESET=/…/hdr/crt-sony-megatron-v2-default.slangp %command%
-```
-
-| `hdr_output` | Behaviour |
+| `hdr_output` (panel: *Display › HDR*) | Behaviour |
 |---|---|
-| `auto` (default) | Promote to HDR10 when the preset writes HDR and the display supports it. |
-| `force` | Promote whenever the display supports HDR10. |
 | `off` | Never touch the swapchain's format. |
+| `auto` (default) | HDR10 only for presets that write HDR themselves, such as `hdr/crt-sony-megatron-v2-default.slangp`. |
+| `on` | Always HDR10. **Any preset** gets a final conversion pass, as RetroArch's HDR option: linearised with the contrast as gamma, inverse tone mapped so mid grey lands on paper white and white on the display's peak, moved to BT.2020 (expanded or not), encoded PQ. |
 
-The layer enables `VK_EXT_swapchain_colorspace` itself, so the HDR10 formats are visible even when the game never asks for them. On KDE with HDR enabled this works without gamescope. Paper white and gamut are set in the panel, which also warns when the preset and the output disagree.
+The settings are RetroArch's: **peak luminance** (`hdr_peak_nits`, what the display can show), **paper white** (`brightness_nits`, the mid tones), **contrast** (`hdr_contrast`) and **gamut** (`expand_gamut`, Accurate to Super). HDR presets receive paper white and gamut as `BrightnessNits` and `ExpandGamut`.
 
-- A game that outputs HDR itself (`DXVK_HDR=1`) hands the preset PQ-encoded pixels while presets expect SDR: colors will be off.
-- An SDR preset on a promoted output looks wrong. Switching presets live does not un-promote the swapchain; that happens when the game restarts.
-- Without an HDR preset, gamescope's own conversion is a good option: `--hdr-enabled --hdr-itm-enabled` with any SDR preset.
+HDR can be switched on and off **while the game runs**: the layer asks the game to recreate its swapchain (`VK_SUBOPTIMAL_KHR`), which most games do at once; otherwise restart it. The display must have HDR enabled (KDE: *Display configuration › HDR*); gamescope is not needed. The layer enables `VK_EXT_swapchain_colorspace` itself, so the HDR10 formats are visible even to games that never ask for them.
+
+- A game that outputs HDR itself (`DXVK_HDR=1`) hands the preset PQ-encoded pixels while presets expect SDR: leave HDR off for it.
+- Through gamescope, `--hdr-enabled --hdr-itm-enabled` is another route, with any SDR preset.
 
 ## Troubleshooting
 
