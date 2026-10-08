@@ -989,7 +989,9 @@ impl App {
                 ui.weak(format!("{what} · {}", o.format));
             }
         }
-        if let (Some(p), Some(o)) = (preset, &output) {
+        // With HDR on, an SDR preset is converted: nothing to warn about.
+        let converted = hdr.mode == vkslang_ipc::HdrMode::On && preset.is_some_and(|p| !p.is_hdr());
+        if let (Some(p), Some(o), false) = (preset, &output, converted) {
             if let Some(why) = color_space_warning(p, o.color_space, o.promoted) {
                 ui.colored_label(orange, format!("⚠ {why}"));
             }

@@ -615,15 +615,23 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
     // HDR switched on or off since the swapchain was made: ask the
     // application to recreate it, which is where the format changes.
     let want = want_hdr10();
-    let outdated = processed.iter().any(|&sc| rt.hdr_outdated(sc, want));
+    // Out of date wins over suboptimal when several swapchains disagree.
+    let mut nudge = None;
+    for &sc in &processed {
+        if let Some(answer) = rt.hdr_nudge(sc, want) {
+            if nudge != Some(vk::Result::ERROR_OUT_OF_DATE_KHR) {
+                nudge = Some(answer);
+            }
+        }
+    }
     if subframes > 1 && matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR) {
         for swapchain in processed {
             rt.present_subframes(&dev, submit_queue, queue, swapchain, subframes, black);
         }
     }
     drop(guard);
-    if outdated && result == vk::Result::SUCCESS {
-        return vk::Result::SUBOPTIMAL_KHR;
+    match nudge {
+        Some(answer) if result == vk::Result::SUCCESS => answer,
+        _ => result,
     }
-    result
 }

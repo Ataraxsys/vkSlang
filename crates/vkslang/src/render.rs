@@ -75,7 +75,15 @@ fn to_ipc(cs: ColorSpace) -> vkslang_ipc::ColorSpace {
     }
 }
 
-fn warn_mismatch(preset: ColorSpace, state: &SwapchainState) {
+fn warn_mismatch(preset: ColorSpace, hdr_pass: bool, state: &SwapchainState) {
+    if hdr_pass {
+        // Converted when the swapchain is HDR10, passed through otherwise:
+        // right either way.
+        if state.promoted {
+            log_info!("HDR10 output: the SDR preset's picture is converted");
+        }
+        return;
+    }
     match vkslang_ipc::color_space_warning(to_ipc(preset), to_ipc(state.color_space), state.promoted) {
         Some(why) => log_warn!("{why}"),
         None if state.promoted => log_info!("HDR10 output: the game renders SDR, the preset writes HDR"),
@@ -159,8 +167,10 @@ pub struct Loaded {
     paths: Vec<PathBuf>,
     chain: FilterChain,
     params: Vec<Param>,
-    /// Color space the final pass writes.
+    /// Color space the preset's own final pass writes.
     color_space: ColorSpace,
+    /// The HDR conversion pass was appended (HDR on, SDR preset).
+    hdr_pass: bool,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
 }
@@ -194,12 +204,14 @@ const HDR_PASS: &str = r#"#version 450
 #pragma parameter VKSLANG_HDR_PEAK "vkSlang HDR peak" 1000.0 100.0 10000.0 1.0
 #pragma parameter VKSLANG_HDR_CONTRAST "vkSlang HDR contrast" 1.0 0.5 3.0 0.01
 #pragma parameter VKSLANG_HDR_EXPAND "vkSlang HDR expand gamut" 0.0 0.0 1.0 1.0
+#pragma parameter VKSLANG_HDR_ENABLE "vkSlang HDR enable" 0.0 0.0 1.0 1.0
 
 layout(push_constant) uniform Push {
     float VKSLANG_HDR_PAPER_WHITE;
     float VKSLANG_HDR_PEAK;
     float VKSLANG_HDR_CONTRAST;
     float VKSLANG_HDR_EXPAND;
+    float VKSLANG_HDR_ENABLE;
 } params;
 
 layout(std140, set = 0, binding = 0) uniform UBO {
@@ -257,6 +269,12 @@ vec3 pq(vec3 l) {
 
 void main() {
     vec3 sdr = texture(Source, vTexCoord).rgb;
+    // Still an SDR swapchain (the game has not recreated it yet): pass the
+    // picture through rather than write PQ into it.
+    if (params.VKSLANG_HDR_ENABLE < 0.5) {
+        FragColor = vec4(sdr, 1.0);
+        return;
+    }
     vec3 nits = to_bt2020(inverse_tonemap(sdr)) * params.VKSLANG_HDR_PAPER_WHITE;
     FragColor = vec4(pq(nits / 10000.0), 1.0);
 }
@@ -344,16 +362,16 @@ fn merge_presets(paths: &[PathBuf]) -> Result<ShaderPreset, String> {
 unsafe fn load_chain(dev: &DeviceData, paths: &[PathBuf]) -> Result<Loaded, String> {
     let started = Instant::now();
     let mut preset = merge_presets(paths)?;
-    let mut color_space = preset.color_space().unwrap_or_else(|e| {
+    let color_space = preset.color_space().unwrap_or_else(|e| {
         log_warn!("cannot determine the preset's output color space: {e}");
         ColorSpace::Sdr
     });
     // HDR on and an SDR preset: its output is turned into HDR10.
-    if color_space == ColorSpace::Sdr && control().hdr.mode == vkslang_ipc::HdrMode::On {
+    let hdr_pass = color_space == ColorSpace::Sdr && control().hdr.mode == vkslang_ipc::HdrMode::On;
+    if hdr_pass {
         let mut with_hdr = paths.to_vec();
         with_hdr.push(hdr_pass_preset()?);
         preset = merge_presets(&with_hdr)?;
-        color_space = ColorSpace::Hdr10;
         log_info!("HDR on: the SDR preset's output is converted to HDR10");
     }
     let params = preset_params(&preset)?;
@@ -392,7 +410,7 @@ unsafe fn load_chain(dev: &DeviceData, paths: &[PathBuf]) -> Result<Loaded, Stri
         FilterChain::load_from_preset_deferred(preset, vulkan, cmd, Some(&options)).map_err(|e| fail(e.to_string()))?;
     d.end_command_buffer(cmd).map_err(|e| fail(e.to_string()))?;
     log_info!("compiled {} in {:.2?}", describe(paths), started.elapsed());
-    Ok(Loaded { paths: paths.to_vec(), chain, params, color_space, pool, cmd })
+    Ok(Loaded { paths: paths.to_vec(), chain, params, color_space, hdr_pass, pool, cmd })
 }
 
 // ---------------------------------------------------------------- swapchain
@@ -568,6 +586,10 @@ pub struct SwapchainState {
     /// It could be promoted: switching HDR on or off then needs the
     /// application to recreate it.
     hdr_available: bool,
+    /// Presents answered "suboptimal" since HDR changed, and how many times
+    /// the layer insisted with "out of date".
+    nudges: u32,
+    insisted: u32,
     /// Opaque black, for the bars around a smaller picture area.
     black: Option<BlackImage>,
     /// On a promoted (HDR10) swapchain, a full-size image in the
@@ -740,6 +762,8 @@ impl SwapchainState {
             color_space: color_space(plan.color_space),
             promoted: plan.promoted || plan.hdr_promoted,
             hdr_available: plan.hdr_available,
+            nudges: 0,
+            insisted: 0,
             source: None,
             staging: None,
             black: None,
@@ -818,6 +842,7 @@ struct FrameSlot {
 struct ActiveChain {
     chain: FilterChain,
     color_space: ColorSpace,
+    hdr_pass: bool,
     /// Metadata; `initial` is the preset's own value.
     params: Vec<Param>,
 }
@@ -964,9 +989,14 @@ impl Runtime {
         ctl.preset_color_space = Some(to_ipc(loaded.color_space));
         ctl.error = None;
         for state in self.swapchains.values() {
-            warn_mismatch(loaded.color_space, state);
+            warn_mismatch(loaded.color_space, loaded.hdr_pass, state);
         }
-        self.chain = Some(ActiveChain { chain: loaded.chain, color_space: loaded.color_space, params: loaded.params });
+        self.chain = Some(ActiveChain {
+            chain: loaded.chain,
+            color_space: loaded.color_space,
+            hdr_pass: loaded.hdr_pass,
+            params: loaded.params,
+        });
         self.pending_init = Some((loaded.pool, loaded.cmd));
         self.failed = false;
         self.applied_params_gen = None;
@@ -1059,10 +1089,25 @@ impl Runtime {
         }
     }
 
-    /// Whether `swapchain` was created for another HDR choice than the
-    /// current one, and could follow it if the application recreated it.
-    pub fn hdr_outdated(&self, swapchain: vk::SwapchainKHR, want_hdr10: bool) -> bool {
-        self.swapchains.get(&swapchain).is_some_and(|s| s.hdr_available && s.promoted != want_hdr10)
+    /// What to answer the application when `swapchain` was created for
+    /// another HDR choice than the current one and could follow it.
+    ///
+    /// "Suboptimal" first, which asks politely; many applications (Qt among
+    /// them) ignore it. After half a second the layer insists with "out of
+    /// date", which every application must handle by recreating its
+    /// swapchain; at most three times, so a stubborn one never loops.
+    pub fn hdr_nudge(&mut self, swapchain: vk::SwapchainKHR, want_hdr10: bool) -> Option<vk::Result> {
+        let s = self.swapchains.get_mut(&swapchain)?;
+        if !s.hdr_available || s.promoted == want_hdr10 {
+            return None;
+        }
+        s.nudges += 1;
+        if s.nudges >= 30 && s.insisted < 3 {
+            s.nudges = 0;
+            s.insisted += 1;
+            return Some(vk::Result::ERROR_OUT_OF_DATE_KHR);
+        }
+        Some(vk::Result::SUBOPTIMAL_KHR)
     }
 
     pub fn is_rendering(&self) -> bool {
@@ -1091,7 +1136,7 @@ impl Runtime {
         // about to go: comparing with it would only warn about a mismatch
         // that is being fixed.
         if let Some(active) = self.chain.as_ref().filter(|_| self.loader.is_none()) {
-            warn_mismatch(active.color_space, &state);
+            warn_mismatch(active.color_space, active.hdr_pass, &state);
         }
         self.swapchains.insert(swapchain, state);
         self.publish_outputs();
@@ -1752,6 +1797,10 @@ impl Runtime {
             },
             size: Size::new(display.extent.width, display.extent.height),
         };
+        if active.hdr_pass {
+            let enable = if state.color_space == ColorSpace::Hdr10 { 1.0 } else { 0.0 };
+            active.chain.parameters().set_parameter_value("VKSLANG_HDR_ENABLE", enable);
+        }
         if let Err(e) = active.chain.frame(&input, &viewport, cmd, *frame_count, Some(&options)) {
             log_error!("filter chain frame failed, disabling: {e}");
             *failed = true;
