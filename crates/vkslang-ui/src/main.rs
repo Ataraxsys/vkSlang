@@ -42,6 +42,20 @@ fn game_scale(screen: [u32; 2], game: [u32; 2], integer: bool) -> f32 {
     }
 }
 
+/// Shape of the drawn area once each of the `size` game pixels is repeated
+/// `dup` times and drawn square: duplicating lines makes the picture taller.
+fn final_shape(size: [u32; 2], dup: [u32; 2]) -> String {
+    let (w, h) = (size[0].max(1) * dup[0].max(1), size[1].max(1) * dup[1].max(1));
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let g = gcd(w, h);
+    format!("{}:{}", w / g, h / g)
+}
+
 /// Where the game sits on the screen, `[x, y, width, height]`: scaled by
 /// [`game_scale`] and centred, as gamescope places it.
 fn game_rect(screen: [u32; 2], game: [u32; 2], integer: bool) -> [u32; 4] {
@@ -188,9 +202,13 @@ struct App {
     /// Pixel grid assistant.
     grid_open: bool,
     grid_texture: Option<GridImage>,
-    /// Grid pitch, in captured-image pixels. Square: non-square pixels are
-    /// reproduced by stretching the display area, not the measuring grid.
-    grid_cell: f32,
+    /// Grid pitch per axis, in captured-image pixels: a game pixel may be
+    /// half as tall as it is wide (a 640×200 mode shown with square pixels).
+    grid_cell: egui::Vec2,
+    /// Width and height move together, keeping their ratio.
+    grid_lock: bool,
+    /// Duplication the grid proposes, previewed and applied with the result.
+    grid_dup: [u32; 2],
     grid_offset: egui::Vec2,
     grid_zoom: f32,
     /// Last capture request, to avoid asking on every frame.
@@ -321,7 +339,9 @@ impl App {
             param_filter: String::new(),
             grid_open: false,
             grid_texture: None,
-            grid_cell: 4.0,
+            grid_cell: egui::vec2(4.0, 4.0),
+            grid_lock: true,
+            grid_dup: [1, 1],
             grid_offset: egui::Vec2::ZERO,
             grid_zoom: 2.0,
             grid_requested: None,
@@ -912,6 +932,7 @@ impl App {
         }
         if open_grid {
             self.grid_open = true;
+            self.grid_dup = self.source.as_ref().map_or([1, 1], |e| e.duplicate);
             self.send(Request::Capture { max_width: 1280 });
         }
     }
@@ -1283,11 +1304,11 @@ impl App {
         let mut request_capture = self.grid_texture.is_none() && stale;
         let mut apply: Option<SourceSize> = None;
         let mut apply_rect: Option<String> = None;
+        let mut apply_final: Option<([u32; 2], [u32; 2], String)> = None;
         egui::Window::new("Pixel grid").open(&mut open).default_size([760.0, 560.0]).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 request_capture |= ui.button("Capture the picture").clicked();
                 ui.add(egui::Slider::new(&mut self.grid_zoom, 1.0..=8.0).text("zoom"));
-                ui.add(egui::Slider::new(&mut self.grid_cell, 1.0..=64.0).step_by(0.05).text("pixel size"));
                 ui.separator();
                 ui.selectable_value(&mut self.frame_mode, false, "measure");
                 ui.selectable_value(&mut self.frame_mode, true, "frame the picture");
@@ -1307,7 +1328,7 @@ impl App {
                 grid.base[0] as f32 / grid.size[0] as f32,
                 grid.base[1] as f32 / grid.size[1] as f32,
             );
-            let cell_output = egui::vec2(self.grid_cell * scale.x, self.grid_cell * scale.y);
+            let cell_output = self.grid_cell * scale;
 
             // Measured inside the picture area, not the whole image.
             let area = egui::vec2(grid.area[2] as f32, grid.area[3] as f32);
@@ -1316,11 +1337,34 @@ impl App {
                 (area.y / cell_output.y).round().max(1.0),
             ];
 
+            if !self.frame_mode {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Pixel");
+                    let before = self.grid_cell;
+                    ui.add(egui::Slider::new(&mut self.grid_cell.x, 1.0..=64.0).step_by(0.05).text("↔"));
+                    ui.add(egui::Slider::new(&mut self.grid_cell.y, 1.0..=64.0).step_by(0.05).text("↕"));
+                    if self.grid_lock && before != self.grid_cell {
+                        // Keep the ratio they had, whichever one moved.
+                        if before.x != self.grid_cell.x {
+                            self.grid_cell.y = (before.y * self.grid_cell.x / before.x).clamp(1.0, 64.0);
+                        } else {
+                            self.grid_cell.x = (before.x * self.grid_cell.y / before.y).clamp(1.0, 64.0);
+                        }
+                    }
+                    ui.checkbox(&mut self.grid_lock, "lock").on_hover_text("Keep the current ratio between width and height");
+                    if ui.small_button("square").clicked() {
+                        self.grid_cell.y = self.grid_cell.x;
+                    }
+                });
+            }
+            let measured = [native[0] as u32, native[1] as u32];
+            let [dx, dy] = self.grid_dup;
+            let shape = final_shape(measured, self.grid_dup);
             ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("{} × {}", native[0], native[1]));
+                ui.strong(format!("{} × {}", measured[0], measured[1]));
                 ui.weak(format!(
-                    "pixels of {:.2} output pixels, picture {}×{}",
-                    cell_output.x, grid.area[2], grid.area[3]
+                    "game pixels of {:.2}×{:.2} output pixels, picture {}×{}",
+                    cell_output.x, cell_output.y, grid.area[2], grid.area[3]
                 ));
                 if self.frame_mode {
                     let area = frame_to_area(self.frame_rect, grid.size, grid.base);
@@ -1337,17 +1381,53 @@ impl App {
                     }
                     return;
                 }
-                if ui.button("Use as fixed resolution").clicked() {
-                    apply = Some(SourceSize::Fixed { size: [native[0] as u32, native[1] as u32] });
-                }
-                if ui
-                    .add(egui::Button::new(format!("Use as ÷{:.2}", cell_output.x)))
-                    .on_hover_text("Keeps the ratio if the output resolution changes")
-                    .clicked()
+                if (cell_output.x - cell_output.y).abs() < 0.01
+                    && ui
+                        .add(egui::Button::new(format!("Use as ÷{:.2}", cell_output.x)))
+                        .on_hover_text("Resolution only; keeps the ratio if the output resolution changes")
+                        .clicked()
                 {
                     apply = Some(SourceSize::Divide { by: cell_output.x });
                 }
+                if ui.button("Use as fixed resolution").on_hover_text("Resolution only, areas untouched").clicked() {
+                    apply = Some(SourceSize::Fixed { size: measured });
+                }
             });
+            if !self.frame_mode {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Duplicate").on_hover_text(
+                        "Repeat each game pixel: ↕ 2 turns every line into two, so the picture really gets \
+                         twice as tall, and the preset gets the repeated lines",
+                    );
+                    ui.add(egui::DragValue::new(&mut self.grid_dup[0]).range(1..=8).prefix("↔"));
+                    ui.add(egui::DragValue::new(&mut self.grid_dup[1]).range(1..=8).prefix("↕"));
+                    ui.separator();
+                    ui.strong(format!("→ {}×{}, drawn {shape}", measured[0] * dx, measured[1] * dy));
+                    if ui
+                        .button("Apply")
+                        .on_hover_text(format!(
+                            "Source {}×{}, duplicated {dx}×{dy}, display area {shape}: what the preview shows",
+                            measured[0], measured[1]
+                        ))
+                        .clicked()
+                    {
+                        apply_final = Some((measured, self.grid_dup, shape.clone()));
+                    }
+                });
+                // The final shape, exactly as it will be drawn.
+                let [ax, ay, aw, ah] = grid.area.map(|v| v.max(0) as f32);
+                let uv = egui::Rect::from_min_max(
+                    egui::pos2(ax / grid.base[0] as f32, ay / grid.base[1] as f32),
+                    egui::pos2((ax + aw) / grid.base[0] as f32, (ay + ah) / grid.base[1] as f32),
+                );
+                let ratio = (measured[0] * dx) as f32 / (measured[1] * dy).max(1) as f32;
+                let height = 180.0;
+                ui.horizontal(|ui| {
+                    ui.weak("result");
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(height * ratio, height), egui::Sense::hover());
+                    ui.painter().image(grid.texture.id(), rect, uv, egui::Color32::WHITE);
+                });
+            }
 
             egui::ScrollArea::both().show(ui, |ui| {
                 let zoom = self.grid_zoom;
@@ -1440,21 +1520,21 @@ impl App {
                 }
 
                 let step = self.grid_cell * zoom;
-                if step >= 2.0 {
+                if step.min_elem() >= 2.0 {
                     let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180));
                     let (ox, oy) = (
-                        self.grid_offset.x.rem_euclid(self.grid_cell) * zoom,
-                        self.grid_offset.y.rem_euclid(self.grid_cell) * zoom,
+                        self.grid_offset.x.rem_euclid(self.grid_cell.x) * zoom,
+                        self.grid_offset.y.rem_euclid(self.grid_cell.y) * zoom,
                     );
                     let mut x = rect.left() + ox;
                     while x <= rect.right() {
                         painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
-                        x += step;
+                        x += step.x;
                     }
                     let mut y = rect.top() + oy;
                     while y <= rect.bottom() {
                         painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
-                        y += step;
+                        y += step.y;
                     }
                 }
             });
@@ -1467,6 +1547,16 @@ impl App {
         if let Some(res) = apply {
             if let Some(edit) = self.source.as_mut() {
                 edit.mode = res;
+                let source = edit.to_settings();
+                self.send(Request::SetSource { source });
+            }
+        }
+        if let Some((size, dup, shape)) = apply_final {
+            if let Some(edit) = self.source.as_mut() {
+                edit.mode = SourceSize::Fixed { size };
+                (edit.width, edit.height) = (size[0], size[1]);
+                edit.duplicate = dup;
+                edit.display = shape;
                 let source = edit.to_settings();
                 self.send(Request::SetSource { source });
             }
@@ -1545,6 +1635,15 @@ mod tests {
         // Never below 1, even for a game larger than the screen.
         assert_eq!(game_scale([1280, 720], [1920, 1080], true), 1.0);
         assert_eq!(game_scale([1280, 720], [1920, 1080], false), 1.0);
+    }
+
+    #[test]
+    fn duplication_shapes_the_picture() {
+        assert_eq!(final_shape([320, 200], [1, 1]), "8:5");
+        // Doubled lines: twice as tall.
+        assert_eq!(final_shape([640, 200], [1, 2]), "8:5");
+        assert_eq!(final_shape([320, 200], [1, 2]), "4:5");
+        assert_eq!(final_shape([640, 480], [1, 1]), "4:3");
     }
 
     #[test]
