@@ -27,6 +27,17 @@ swapchain through librashader, with a live control panel.
 
 ### Control panel (`vkslang-ui`)
 
+- Redesigned around what the user wants rather than the settings behind it:
+  a **Set up this game** assistant (capture, game zone, pixels, shape and size,
+  shader, profile) and tabs (Picture, Shader, Display, Profiles).
+- Automatic detection on a full-resolution capture: the game's zone inside
+  black bars, and the exact size of its pixels per axis, integer or not,
+  including lines half as tall as pixels are wide.
+- Shapes and sizes that mean something: a 4:3 monitor of the time, square
+  pixels, as shown; whole multiples for even scanlines. Duplication changes
+  the picture's shape where it should, and a miniature screen shows the result.
+- French and English, French by default on a French system.
+
 - Preset browser as a folder tree with search, chain editing.
 - Live parameters, source and area settings, HDR, subframes, measured rates.
 - Pixel grid assistant: measure a game's resolution and frame its picture on a
