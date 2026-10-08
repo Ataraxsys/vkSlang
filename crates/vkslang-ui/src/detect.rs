@@ -121,6 +121,44 @@ pub fn pitch(p: &Pixels, region: [u32; 4], horizontal: bool) -> Option<Pitch> {
     None
 }
 
+/// Resolutions of the time, per axis.
+const WIDTHS: [u32; 12] = [160, 256, 280, 288, 320, 352, 360, 384, 512, 560, 640, 720];
+const HEIGHTS: [u32; 14] = [144, 160, 192, 200, 224, 240, 256, 288, 350, 384, 400, 480, 576, 600];
+
+/// Grows a zone found from lit pixels back to the game's full resolution.
+///
+/// A game's own black border is invisible against the bars: King's Quest
+/// on a PCjr lights 316×199 of its 320×200. When a resolution of the time
+/// is at most a few pixels larger, the zone is grown to it, centred on the
+/// screen as emulators and gamescope place the picture, on the same grid.
+pub fn grow_to_standard(zone: [u32; 4], pixel: [f32; 2], screen: [u32; 2]) -> [u32; 4] {
+    let mut out = zone;
+    for (axis, standard) in [(0usize, &WIDTHS[..]), (1usize, &HEIGHTS[..])] {
+        let size = pixel[axis];
+        let count = (zone[axis + 2] as f32 / size).round() as u32;
+        let Some(&target) = standard.iter().find(|&&t| t >= count && t - count <= (t / 25).max(4)) else {
+            continue;
+        };
+        let length = (target as f32 * size).round() as u32;
+        if target == count || length > screen[axis] {
+            continue;
+        }
+        // Centred, then moved onto the grid of what was found, and kept
+        // around the lit part.
+        let centred = (screen[axis] - length) as f32 / 2.0;
+        let phase = (zone[axis] as f32).rem_euclid(size);
+        let snapped = ((centred - phase) / size).round() * size + phase;
+        let lit_end = (zone[axis] + zone[axis + 2]) as f32;
+        let start = snapped.min(zone[axis] as f32).max(lit_end - length as f32).max(0.0);
+        if start + length as f32 > screen[axis] as f32 {
+            continue;
+        }
+        out[axis] = start.round() as u32;
+        out[axis + 2] = length;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +228,18 @@ mod tests {
         let p = Pixels { data: &data, width: w, height: h };
         assert_eq!(pitch(&p, [0, 0, w, h], true).map(|p| p.size), Some(4.5));
         assert_eq!(pitch(&p, [0, 0, w, h], false).map(|p| p.size), Some(3.0));
+    }
+
+    #[test]
+    fn a_game_with_black_borders_of_its_own() {
+        // King's Quest on an IBM PCjr in 86Box: 320×200 drawn 12×6, lit
+        // from 24,486 for 3792×1194 on a 4K screen.
+        let grown = grow_to_standard([24, 486, 3792, 1194], [12.0, 6.0], [3840, 2160]);
+        assert_eq!(grown, [0, 480, 3840, 1200]);
+        // Already a standard size: untouched.
+        assert_eq!(grow_to_standard([0, 480, 3840, 1200], [12.0, 6.0], [3840, 2160]), [0, 480, 3840, 1200]);
+        // Far from any standard size: untouched.
+        assert_eq!(grow_to_standard([100, 100, 1000, 900], [10.0, 10.0], [3840, 2160]), [100, 100, 1000, 900]);
     }
 
     #[test]
