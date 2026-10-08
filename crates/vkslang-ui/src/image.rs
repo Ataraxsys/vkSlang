@@ -219,6 +219,7 @@ impl App {
             return;
         }
         let region = plan.zone;
+        let capture_size = [pixels.width, pixels.height];
         let (h, v) = (detect::pitch(&pixels, region, true), detect::pitch(&pixels, region, false));
         match (h, v) {
             (Some(h), Some(v)) if h.size > 1.0 || v.size > 1.0 => {
@@ -232,6 +233,7 @@ impl App {
                     plan.zone[axis] += offset as u32;
                     plan.zone[axis + 2] = (count * pitch.size).round() as u32;
                 }
+                plan.zone = detect::grow_to_standard(plan.zone, plan.pixel, capture_size);
                 let [gw, gh] = plan.game();
                 self.image.found = Some(match l {
                     crate::i18n::Lang::Fr => {
