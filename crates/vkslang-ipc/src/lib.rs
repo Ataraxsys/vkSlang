@@ -110,13 +110,13 @@ impl ColorSpace {
 pub fn color_space_warning(preset: ColorSpace, output: ColorSpace, promoted: bool) -> Option<&'static str> {
     if promoted {
         return (!preset.is_hdr())
-            .then_some("the output was promoted to HDR but the preset writes SDR: pick an HDR preset (Sony Megatron) or set hdr_output = off");
+            .then_some("the output was promoted to HDR but the preset writes SDR: turn HDR on to convert it, or pick an HDR preset (Sony Megatron)");
     }
     match (preset.is_hdr(), output.is_hdr()) {
         (true, false) => Some("HDR preset on an SDR output: colors and brightness will be wrong"),
         (false, true) => Some(
-            "SDR preset on an HDR output: the picture will look wrong (no SDR/HDR conversion yet). \
-             For SDR games, apply vkSlang to the game and let gamescope --hdr-enabled --hdr-itm-enabled do the HDR",
+            "SDR preset on an HDR output the game created itself: the picture will look wrong. For SDR games, \
+             let vkSlang make the HDR (HDR on), or gamescope --hdr-enabled --hdr-itm-enabled",
         ),
         (true, true) => Some(
             "HDR output: the application's picture is already HDR encoded, while presets expect an SDR \
@@ -126,17 +126,40 @@ pub fn color_space_warning(preset: ColorSpace, output: ColorSpace, promoted: boo
     }
 }
 
+/// Whether the output is turned into HDR10.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HdrMode {
+    /// Never touch the swapchain's format.
+    Off,
+    /// Only for presets that write HDR themselves (Sony Megatron).
+    #[default]
+    Auto,
+    /// Always, as RetroArch's HDR option: an SDR preset's output is turned
+    /// into HDR10 by a final pass (inverse tone mapping, BT.2020, PQ).
+    On,
+}
+
+/// Every field defaults, so profiles saved before a setting existed load.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
 pub struct HdrSettings {
+    pub mode: HdrMode,
     /// Paper white / SDR reference in nits (`BrightnessNits`).
     pub brightness_nits: f32,
+    /// Brightest highlights in nits, for the SDR to HDR conversion: what
+    /// the display can actually show.
+    pub peak_nits: f32,
+    /// Gamma applied before the conversion, 1 = untouched (RetroArch's
+    /// HDR contrast).
+    pub contrast: f32,
     /// 0 Accurate, 1 Expanded, 2 Wide, 3 Super (`ExpandGamut`).
     pub expand_gamut: u32,
 }
 
 impl Default for HdrSettings {
     fn default() -> Self {
-        HdrSettings { brightness_nits: 200.0, expand_gamut: 0 }
+        HdrSettings { mode: HdrMode::Auto, brightness_nits: 200.0, peak_nits: 1000.0, contrast: 1.0, expand_gamut: 0 }
     }
 }
 
@@ -607,11 +630,19 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(r#"{"cmd":"get_state"}"#).unwrap(), Request::GetState);
         assert_eq!(
             serde_json::to_string(&Request::SetHdr { hdr: HdrSettings::default() }).unwrap(),
-            r#"{"cmd":"set_hdr","hdr":{"brightness_nits":200.0,"expand_gamut":0}}"#
+            r#"{"cmd":"set_hdr","hdr":{"mode":"auto","brightness_nits":200.0,"peak_nits":1000.0,"contrast":1.0,"expand_gamut":0}}"#
         );
         let resp = Response::Error { message: "x".into() };
         let s = serde_json::to_string(&resp).unwrap();
         assert_eq!(s, r#"{"type":"error","message":"x"}"#);
+    }
+
+    #[test]
+    fn hdr_settings_saved_before_the_mode_still_load() {
+        let old: HdrSettings = serde_json::from_str(r#"{"brightness_nits":250.0,"expand_gamut":1}"#).unwrap();
+        assert_eq!(old.brightness_nits, 250.0);
+        assert_eq!(old.mode, HdrMode::Auto);
+        assert_eq!(old.peak_nits, HdrSettings::default().peak_nits);
     }
 
     #[test]

@@ -940,51 +940,113 @@ impl App {
     fn hdr_panel(&mut self, ui: &mut egui::Ui) {
         let l = self.lang;
         let Some(state) = self.state.as_ref() else { return };
-        let output = state.outputs.first().map(|o| o.color_space);
+        let output = state.outputs.first().cloned();
         let preset = state.preset_color_space;
         let mut hdr = state.hdr;
-        let mut changed = false;
+        let before = hdr;
+        let orange = egui::Color32::from_rgb(255, 170, 60);
 
+        ui.label(egui::RichText::new("HDR").size(18.0).strong());
         ui.horizontal_wrapped(|ui| {
-            ui.label("HDR");
-            for o in &state.outputs {
-                let promoted = if o.promoted { l.t(", promue par vkSlang", ", promoted by vkSlang") } else { "" };
-                ui.weak(format!("{} {} ({}{})", l.t("sortie", "output"), o.color_space.label(), o.format, promoted));
-            }
-            if let Some(p) = preset {
-                ui.weak(format!("· preset {}", p.label()));
-            }
+            ui.selectable_value(&mut hdr.mode, vkslang_ipc::HdrMode::Off, l.t("Désactivé", "Off"));
+            ui.selectable_value(&mut hdr.mode, vkslang_ipc::HdrMode::On, l.t("Activé", "On")).on_hover_text(l.t(
+                "Comme l'option HDR de RetroArch : la sortie passe en HDR10, et l'image de n'importe quel preset \
+                 est convertie (tone mapping inverse, BT.2020, PQ).",
+                "Like RetroArch's HDR option: the output becomes HDR10, and any preset's picture is converted \
+                 (inverse tone mapping, BT.2020, PQ).",
+            ));
+            ui.selectable_value(&mut hdr.mode, vkslang_ipc::HdrMode::Auto, l.t("Auto", "Auto")).on_hover_text(l.t(
+                "HDR seulement avec les presets qui écrivent eux-mêmes du HDR (Sony Megatron).",
+                "HDR only with presets that write HDR themselves (Sony Megatron).",
+            ));
         });
-        let promoted = state.outputs.first().is_some_and(|o| o.promoted);
-        if let (Some(p), Some(o)) = (preset, output) {
-            if let Some(why) = color_space_warning(p, o, promoted) {
-                ui.colored_label(egui::Color32::from_rgb(255, 170, 60), format!("⚠ {why}"));
+
+        // Where things stand.
+        let hdr_out = output.as_ref().is_some_and(|o| o.color_space.is_hdr());
+        match (hdr.mode, &output) {
+            (_, None) => {}
+            (vkslang_ipc::HdrMode::On, Some(_)) if !hdr_out => {
+                ui.colored_label(
+                    orange,
+                    l.t(
+                        "En attente : le jeu doit recréer son image pour passer en HDR (souvent tout seul). Sinon \
+                         relance-le. Vérifie aussi que le HDR est activé dans les réglages d'affichage du système.",
+                        "Waiting: the game must recreate its picture to switch to HDR (often by itself). Otherwise \
+                         restart it. Also check HDR is on in the system's display settings.",
+                    ),
+                );
+            }
+            (_, Some(o)) => {
+                let what = if o.color_space.is_hdr() {
+                    if o.promoted {
+                        l.t("✔ Sortie HDR10, créée par vkSlang", "✔ HDR10 output, made by vkSlang")
+                    } else {
+                        l.t("Sortie HDR (celle du jeu)", "HDR output (the game's own)")
+                    }
+                } else {
+                    l.t("Sortie SDR", "SDR output")
+                };
+                ui.weak(format!("{what} · {}", o.format));
             }
         }
-        // Only meaningful for HDR-aware presets (HDRMode != 0).
-        let hdr_active = preset.is_some_and(|p| p.is_hdr()) || output.is_some_and(|o| o.is_hdr());
-        ui.add_enabled_ui(hdr_active, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut hdr.brightness_nits, 80.0..=2000.0)
-                            .logarithmic(true)
-                            .step_by(10.0)
-                            .suffix(" nits")
-                            .text(l.t("Blanc papier", "Paper white")),
-                    )
-                    .on_hover_text(
-                        l.t("BrightnessNits : blanc de référence SDR", "BrightnessNits: SDR reference white"),
-                    )
-                    .changed();
-                ui.separator();
-                ui.label(l.t("Gamut", "Gamut"));
-                for (i, name) in GAMUT_NAMES.iter().enumerate() {
-                    changed |= ui.selectable_value(&mut hdr.expand_gamut, i as u32, *name).changed();
-                }
+        if let (Some(p), Some(o)) = (preset, &output) {
+            if let Some(why) = color_space_warning(p, o.color_space, o.promoted) {
+                ui.colored_label(orange, format!("⚠ {why}"));
+            }
+        }
+
+        ui.add_enabled_ui(hdr.mode != vkslang_ipc::HdrMode::Off, |ui| {
+            egui::Grid::new("hdr-settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label(l.t("Luminance de crête", "Peak luminance")).on_hover_text(l.t(
+                    "Ce que ton écran sait afficher au plus fort, en nits (voir sa fiche technique). Les blancs \
+                     du jeu montent jusque-là.",
+                    "The brightest your display can show, in nits (see its specifications). The game's whites \
+                     reach up to it.",
+                ));
+                ui.add(
+                    egui::Slider::new(&mut hdr.peak_nits, 100.0..=4000.0)
+                        .logarithmic(true)
+                        .step_by(10.0)
+                        .suffix(" nits"),
+                );
+                ui.end_row();
+                ui.label(l.t("Blanc papier", "Paper white")).on_hover_text(l.t(
+                    "La luminosité des tons moyens, en nits : celle d'une page blanche. Plus haut, l'image est \
+                     plus claire.",
+                    "How bright the mid tones are, in nits: that of a white page. Higher makes the picture \
+                     brighter.",
+                ));
+                ui.add(
+                    egui::Slider::new(&mut hdr.brightness_nits, 80.0..=1000.0)
+                        .logarithmic(true)
+                        .step_by(5.0)
+                        .suffix(" nits"),
+                );
+                ui.end_row();
+                ui.label(l.t("Contraste", "Contrast")).on_hover_text(l.t(
+                    "Au-dessus de 1, les ombres plongent et les lumières ressortent.",
+                    "Above 1, shadows sink and highlights stand out.",
+                ));
+                ui.add(egui::Slider::new(&mut hdr.contrast, 0.5..=3.0).step_by(0.05));
+                ui.end_row();
+                ui.label(l.t("Gamut", "Gamut")).on_hover_text(l.t(
+                    "Accurate garde les couleurs d'origine ; au-delà, elles sont étendues vers le BT.2020, plus \
+                     vives.",
+                    "Accurate keeps the original colours; beyond, they are stretched towards BT.2020, more vivid.",
+                ));
+                ui.horizontal(|ui| {
+                    for (i, name) in GAMUT_NAMES.iter().enumerate() {
+                        ui.selectable_value(&mut hdr.expand_gamut, i as u32, *name);
+                    }
+                });
+                ui.end_row();
             });
+            if ui.small_button(l.t("Valeurs par défaut", "Defaults")).clicked() {
+                let mode = hdr.mode;
+                hdr = vkslang_ipc::HdrSettings { mode, ..Default::default() };
+            }
         });
-        if changed {
+        if hdr != before {
             self.send(Request::SetHdr { hdr });
         }
     }

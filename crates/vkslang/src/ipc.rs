@@ -112,7 +112,15 @@ pub fn handle(request: Request) -> Response {
             }
             Err(message) => return Response::Error { message },
         },
-        Request::SetHdr { hdr } => ctl.hdr = config::sanitize_hdr(hdr),
+        Request::SetHdr { hdr } => {
+            let hdr = config::sanitize_hdr(hdr);
+            // HDR switched on or off: the chain gains or loses its HDR pass.
+            if hdr.mode != ctl.hdr.mode && !ctl.presets.is_empty() {
+                ctl.preset_gen += 1;
+                ctl.loading = true;
+            }
+            ctl.hdr = hdr;
+        }
         Request::Capture { max_width } => ctl.capture_request = Some(max_width.clamp(64, 8192)),
         Request::SetSubframes { subframes, black } => {
             ctl.subframes = subframes.clamp(1, 8);

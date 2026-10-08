@@ -3,7 +3,7 @@
 //! Each hook calls the next layer through pointers captured at create time
 //! (never through the loader), mirroring vkBasalt's `vkBasalt_*` functions.
 
-use crate::config::{self, HdrOutput};
+use crate::config;
 use crate::loader::{self, LayerDeviceLink, LayerFunction, LayerInstanceLink, PfnSetDeviceLoaderData};
 use crate::render::{srgb_to_unorm, Runtime, SwapchainPlan, SwapchainState};
 use crate::state::{self, load_pfn, DeviceData, InstanceData, DEVICES, INSTANCES};
@@ -55,7 +55,8 @@ pub unsafe extern "system" fn create_instance(
     let already_enabled = slice(ci.pp_enabled_extension_names, ci.enabled_extension_count)
         .iter()
         .any(|&e| CStr::from_ptr(e) == colorspace_ext);
-    let add_colorspace = config::get().hdr_output != HdrOutput::Off && !already_enabled;
+    // Always asked for, so HDR can be switched on later from the panel.
+    let add_colorspace = !already_enabled;
 
     let mut extensions: Vec<*const c_char> = slice(ci.pp_enabled_extension_names, ci.enabled_extension_count).to_vec();
     let mut modified = *ci;
@@ -298,37 +299,37 @@ unsafe fn surface_formats(dev: &DeviceData, surface: vk::SurfaceKHR) -> Vec<vk::
     formats
 }
 
-/// Whether to hand the application an HDR10 swapchain it never asked for.
-///
-/// The application keeps rendering 8-bit SDR through a view in its own
-/// format; the filter chain reads those pixels and writes PQ through the
-/// HDR10 view of the same images. This is what lets an HDR preset produce
-/// real HDR out of an SDR game, the way RetroArch does.
-unsafe fn promote_to_hdr10(dev: &DeviceData, ci: &vk::SwapchainCreateInfoKHR) -> bool {
-    let cfg = config::get();
-    if cfg.hdr_output == HdrOutput::Off || !dev.mutable_format || !is_promotable(ci.image_format) {
+/// Whether this swapchain could be turned into an HDR10 one: the
+/// application's format can share an image with the HDR10 view, and the
+/// display takes HDR10.
+unsafe fn hdr10_available(dev: &DeviceData, ci: &vk::SwapchainCreateInfoKHR) -> bool {
+    if !dev.mutable_format
+        || !is_promotable(ci.image_format)
+        || ci.image_color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT
+    {
         return false;
-    }
-    if cfg.hdr_output == HdrOutput::Auto {
-        // Only when the preset actually writes HDR.
-        let preset_is_hdr = crate::control::control().preset_color_space.is_some_and(|cs| cs.is_hdr());
-        if !preset_is_hdr {
-            return false;
-        }
-    }
-    if ci.image_color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT {
-        return false; // already HDR10
     }
     let formats = surface_formats(dev, ci.surface);
     for f in &formats {
         log_debug!("surface offers {:?} / {:?}", f.format, f.color_space);
     }
-    let supported =
-        formats.iter().any(|f| f.format == HDR10_FORMAT && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT);
-    if !supported {
-        log_warn!("the surface does not offer HDR10, keeping the SDR swapchain");
+    formats.iter().any(|f| f.format == HDR10_FORMAT && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT)
+}
+
+/// Whether to hand the application an HDR10 swapchain it never asked for.
+///
+/// The application keeps rendering 8-bit SDR through a view in its own
+/// format; the filter chain reads those pixels and writes PQ through the
+/// HDR10 view of the same images. With HDR on, an SDR preset gets a final
+/// conversion pass (inverse tone mapping), as RetroArch does; in auto, only a
+/// preset that writes HDR itself (Sony Megatron) promotes the output.
+fn want_hdr10() -> bool {
+    let ctl = crate::control::control();
+    match ctl.hdr.mode {
+        vkslang_ipc::HdrMode::Off => false,
+        vkslang_ipc::HdrMode::On => true,
+        vkslang_ipc::HdrMode::Auto => ctl.preset_color_space.is_some_and(|cs| cs.is_hdr()),
     }
-    supported
 }
 
 /// Decides whether a swapchain can be processed. Returns the format
@@ -445,7 +446,11 @@ pub unsafe extern "system" fn create_swapchain(
 
     // Application format kept for the raw-bit copy of what the game renders.
     let app_format = ci.image_format;
-    let promoted = promote_to_hdr10(&dev, ci);
+    let hdr_available = hdr10_available(&dev, ci);
+    let promoted = hdr_available && want_hdr10();
+    if want_hdr10() && !hdr_available {
+        log_warn!("HDR asked for, but this swapchain cannot be HDR10 (display or format), keeping SDR");
+    }
     // Same format on both sides: only the color space changes, the pixels the
     // application writes are read back directly.
     let needs_staging = promoted && app_format != HDR10_FORMAT;
@@ -505,6 +510,7 @@ pub unsafe extern "system" fn create_swapchain(
         color_space: modified.image_color_space,
         promoted: needs_staging,
         hdr_promoted: promoted,
+        hdr_available,
     };
     let rt = guard.as_mut().unwrap();
     // Tracked even if the preset failed to load: another one can be loaded
@@ -606,11 +612,18 @@ pub unsafe extern "system" fn queue_present(queue: vk::Queue, p_present_info: *c
         let ctl = crate::control::control();
         (ctl.subframes, ctl.subframe_black)
     };
+    // HDR switched on or off since the swapchain was made: ask the
+    // application to recreate it, which is where the format changes.
+    let want = want_hdr10();
+    let outdated = processed.iter().any(|&sc| rt.hdr_outdated(sc, want));
     if subframes > 1 && matches!(result, vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR) {
         for swapchain in processed {
             rt.present_subframes(&dev, submit_queue, queue, swapchain, subframes, black);
         }
     }
     drop(guard);
+    if outdated && result == vk::Result::SUCCESS {
+        return vk::Result::SUBOPTIMAL_KHR;
+    }
     result
 }
