@@ -1,10 +1,13 @@
-//! The Image tab and the "Set up this game" assistant.
+//! The Picture page and the "Set up this game" assistant.
 //!
-//! Both work on a [`Plan`]: where the game is, how big its pixels are, what
-//! shape and size it is drawn with. A full-resolution capture lets the panel
-//! find the first two by itself; every change is applied live.
+//! One large view (the result on the screen, or the captured game with its
+//! frame and grid) and three short cards: the game, its shape, its size.
+//! Opening the page analyses the game by itself: a full-resolution capture
+//! gives where it is and how big its pixels are. Every change is applied
+//! live.
 
 use crate::detect::{self, Pixels};
+use crate::i18n::Lang;
 use crate::plan::{parse_area, Plan, Shape, Size};
 use crate::{App, SourceEdit};
 use eframe::egui;
@@ -13,7 +16,6 @@ use vkslang_ipc::{Request, SourceSize};
 
 /// A full-resolution picture of the game, before the preset.
 pub struct Capture {
-    pub id: u64,
     pub texture: egui::TextureHandle,
     pub size: [u32; 2],
     /// Size of the output it was taken from.
@@ -21,18 +23,36 @@ pub struct Capture {
     pub rgba: Vec<u8>,
 }
 
+/// What the large view shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tool {
-    /// Look only.
-    View,
-    /// Drag the game's zone.
-    Zone,
-    /// The game's pixel grid over the picture; dragging shifts it.
+enum View {
+    /// The screen as it will look.
+    Result,
+    /// The captured game, to correct the frame or check the grid.
+    Capture,
+}
+
+/// What dragging on the captured game does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    /// Moves or resizes the game's frame.
+    Frame,
+    /// Shows the pixel grid; dragging shifts it onto the game's blocks.
     Grid,
 }
 
-/// Steps of the assistant.
-const STEPS: usize = 6;
+/// How sure the analysis is.
+#[derive(Debug, Clone, PartialEq)]
+enum Found {
+    /// Zone and pixels measured.
+    Measured,
+    /// The zone is known, the pixels are not (smoothed picture).
+    ZoneOnly,
+    /// Nothing usable (black picture, no capture).
+    Nothing,
+}
+
+const STEPS: usize = 4;
 
 pub struct ImageState {
     pub capture: Option<Capture>,
@@ -41,14 +61,16 @@ pub struct ImageState {
     read_id: Option<u64>,
     requested: Option<Instant>,
     pub plan: Option<Plan>,
+    /// Analyse the next capture as soon as it arrives.
+    analyse_next: bool,
+    found: Option<Found>,
+    view: View,
     tool: Tool,
-    /// Which edges of the zone the current drag moves (none: all of it).
+    /// Which edges of the frame the current drag moves (none: all of it).
     drag: Option<[bool; 4]>,
-    /// Zoom of the picture; 0 fits it to the space available.
+    /// Zoom of the captured game; 0 fits it.
     zoom: f32,
     lock: bool,
-    /// Outcome of the last detection, shown next to its button.
-    found: Option<String>,
     /// Current step of the assistant, when open.
     pub wizard: Option<usize>,
     search: String,
@@ -63,11 +85,13 @@ impl Default for ImageState {
             read_id: None,
             requested: None,
             plan: None,
-            tool: Tool::View,
+            analyse_next: true,
+            found: None,
+            view: View::Result,
+            tool: Tool::Frame,
             drag: None,
             zoom: 0.0,
             lock: true,
-            found: None,
             wizard: None,
             search: String::new(),
             profile_name: String::new(),
@@ -88,6 +112,49 @@ fn read_capture(path: &str) -> Option<(Vec<u8>, [u32; 2])> {
     Some((data.get(12..12 + len)?.to_vec(), [width, height]))
 }
 
+/// `8` or `8.33`: whole numbers without decimals.
+fn num(v: f32) -> String {
+    if (v - v.round()).abs() < 0.005 {
+        format!("{}", v.round())
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// A large selectable block: a title and one line saying what it does.
+fn choice(ui: &mut egui::Ui, selected: bool, title: &str, detail: &str) -> bool {
+    let visuals = ui.visuals();
+    let fill = if selected { visuals.selection.bg_fill } else { visuals.faint_bg_color };
+    let stroke = if selected { visuals.selection.stroke } else { visuals.widgets.noninteractive.bg_stroke };
+    let response = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(title);
+            ui.weak(detail);
+        })
+        .response
+        .interact(egui::Sense::click());
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// A card: a numbered title over its contents.
+fn card(ui: &mut egui::Ui, number: &str, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style()).corner_radius(8.0).inner_margin(10).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(number).strong().size(18.0).color(ui.visuals().selection.bg_fill));
+            ui.label(egui::RichText::new(title).strong().size(16.0));
+        });
+        ui.add_space(4.0);
+        add(ui);
+    });
+    ui.add_space(6.0);
+}
+
 impl App {
     fn screen(&self) -> Option<[u32; 2]> {
         self.state.as_ref().and_then(|s| s.outputs.first()).map(|o| o.size)
@@ -98,6 +165,13 @@ impl App {
         // Full resolution: a downscaled picture blends the game's pixels and
         // hides their grid.
         self.send(Request::Capture { max_width: 8192 });
+    }
+
+    /// Takes a new picture and analyses it as soon as it arrives.
+    fn analyse(&mut self) {
+        self.image.analyse_next = true;
+        self.image.found = None;
+        self.request_capture();
     }
 
     /// Picks up a capture published by the layer.
@@ -113,16 +187,12 @@ impl App {
         };
         let image = egui::ColorImage::from_rgba_unmultiplied([size[0] as usize, size[1] as usize], &rgba);
         let texture = ctx.load_texture("vkslang-capture", image, egui::TextureOptions::NEAREST);
-        self.image.capture = Some(Capture { id: c.id, texture, size, base: c.base, rgba });
+        self.image.capture = Some(Capture { texture, size, base: c.base, rgba });
         if self.image.plan.is_none() {
             self.image.plan = self.plan_from_settings();
         }
-        // The assistant may already be past the capture: do what entering
-        // that step would have done had the picture been there.
-        match self.image.wizard {
-            Some(1) => self.detect_zone(),
-            Some(2) => self.detect_pixels(),
-            _ => {}
+        if std::mem::take(&mut self.image.analyse_next) {
+            self.detect();
         }
     }
 
@@ -162,309 +232,321 @@ impl App {
         self.send(Request::SetSource { source });
     }
 
-    fn capture_pixels(&self) -> Option<(Pixels<'_>, f32)> {
-        let c = self.image.capture.as_ref()?;
-        let scale = c.base[0] as f32 / c.size[0] as f32;
-        Some((Pixels { data: &c.rgba, width: c.size[0], height: c.size[1] }, scale))
-    }
-
-    fn detect_zone(&mut self) {
-        let l = self.lang;
-        let Some((pixels, scale)) = self.capture_pixels() else { return };
-        let found = detect::content_bounds(&pixels).map(|r| r.map(|v| (v as f32 * scale).round() as u32));
-        let screen = self.screen().unwrap_or([pixels.width, pixels.height]);
-        match found {
-            Some(zone) => {
-                let plan = self.image.plan.get_or_insert(Plan {
-                    zone,
-                    pixel: [1.0, 1.0],
-                    dup: [1, 1],
-                    shape: Shape::AsShown,
-                    size: Size::InPlace,
-                });
-                plan.zone = zone;
-                let whole = zone == [0, 0, screen[0], screen[1]];
-                self.image.found = Some(
-                    if whole {
-                        l.t(
-                            "Aucune bande noire : le jeu occupe tout l'écran.",
-                            "No black bars: the game fills the screen.",
-                        )
-                    } else {
-                        l.t("Zone trouvée.", "Zone found.")
-                    }
-                    .to_string(),
-                );
-                self.apply_plan();
-            }
-            None => {
-                self.image.found =
-                    Some(l.t("L'image est entièrement noire.", "The picture is entirely black.").to_string());
-            }
-        }
-    }
-
-    fn detect_pixels(&mut self) {
-        let l = self.lang;
-        let Some(plan) = self.image.plan else { return };
-        let Some((pixels, scale)) = self.capture_pixels() else { return };
-        if (scale - 1.0).abs() > 0.01 {
-            self.image.found = Some(
-                l.t(
-                    "Capture réduite : impossible de mesurer les pixels exactement. Utilise la grille.",
-                    "Downscaled capture: pixels cannot be measured exactly. Use the grid.",
-                )
-                .to_string(),
-            );
-            return;
-        }
-        let region = plan.zone;
-        let capture_size = [pixels.width, pixels.height];
-        let (h, v) = (detect::pitch(&pixels, region, true), detect::pitch(&pixels, region, false));
-        match (h, v) {
-            (Some(h), Some(v)) if h.size > 1.0 || v.size > 1.0 => {
-                let plan = self.image.plan.as_mut().unwrap();
-                plan.pixel = [h.size, v.size];
-                // Start the zone on the grid and keep only whole game pixels:
-                // a partial one at either end would be bar, not game.
-                for (axis, pitch) in [(0, h), (1, v)] {
-                    let offset = pitch.offset.round().min(plan.zone[axis + 2] as f32 - 1.0).max(0.0);
-                    let count = ((plan.zone[axis + 2] as f32 - offset) / pitch.size).floor().max(1.0);
-                    plan.zone[axis] += offset as u32;
-                    plan.zone[axis + 2] = (count * pitch.size).round() as u32;
-                }
-                plan.zone = detect::grow_to_standard(plan.zone, plan.pixel, capture_size);
-                let [gw, gh] = plan.game();
-                self.image.found = Some(match l {
-                    crate::i18n::Lang::Fr => {
-                        format!("Jeu en {gw} × {gh}, chaque pixel fait {:.2} × {:.2} pixels d'écran.", h.size, v.size)
-                    }
-                    crate::i18n::Lang::En => {
-                        format!("Game at {gw} × {gh}, each pixel is {:.2} × {:.2} screen pixels.", h.size, v.size)
-                    }
-                });
-                self.apply_plan();
-            }
-            _ => {
-                self.image.found = Some(
-                    l.t(
-                        "Pas de grille nette (image lissée ou trop uniforme). Règle la taille à la main, la grille t'aide.",
-                        "No clear grid (smoothed or too uniform picture). Set the size by hand, the grid helps.",
-                    )
-                    .to_string(),
-                );
-            }
-        }
-    }
-
-    /// Step 1: the picture.
-    fn section_capture(&mut self, ui: &mut egui::Ui) {
-        let l = self.lang;
-        ui.horizontal_wrapped(|ui| {
-            if ui.button(l.t("📷 Capturer l'image", "📷 Capture the picture")).clicked() {
-                self.request_capture();
-            }
-            let waiting =
-                self.image.requested.is_some_and(|t| t.elapsed() < Duration::from_secs(3))
-                    && self.image.capture.as_ref().is_none_or(|c| {
-                        self.state.as_ref().and_then(|s| s.capture.as_ref()).is_none_or(|n| n.id == c.id)
-                    });
-            let stuck = self.image.requested.is_some_and(|t| t.elapsed() >= Duration::from_secs(3))
-                && self.image.capture.is_none();
-            if waiting {
-                ui.spinner();
-            } else if stuck {
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 170, 60),
-                    l.t(
-                        "Pas de capture : il faut un preset chargé et « Shader actif » coché.",
-                        "No capture: a preset must be loaded and \"Shader on\" ticked.",
-                    ),
-                );
-            }
-            match &self.image.capture {
-                Some(c) => ui.weak(match l {
-                    crate::i18n::Lang::Fr => format!("image du jeu avant le shader, {}×{}", c.size[0], c.size[1]),
-                    crate::i18n::Lang::En => format!("the game before the shader, {}×{}", c.size[0], c.size[1]),
-                }),
-                None => ui.weak(l.t(
-                    "Capture l'image du jeu pour que tout se règle dessus.",
-                    "Capture the game's picture: everything is set on it.",
-                )),
-            };
-        });
-    }
-
-    /// Step 2: where the game is.
-    fn section_zone(&mut self, ui: &mut egui::Ui) {
-        let l = self.lang;
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(l.t("Zone du jeu", "Game zone")).on_hover_text(l.t(
-                "La partie de l'écran où le jeu dessine, sans les bandes noires. Le shader ne lit que celle-ci.",
-                "The part of the screen the game draws in, without the black bars. The shader only reads this.",
-            ));
-            if ui
-                .add_enabled(self.image.capture.is_some(), egui::Button::new(l.t("✨ Détecter", "✨ Detect")))
-                .clicked()
-            {
-                self.detect_zone();
-            }
-            let editing = self.image.tool == Tool::Zone;
-            if ui.selectable_label(editing, l.t("✋ Ajuster à la main", "✋ Adjust by hand")).clicked() {
-                self.image.tool = if editing { Tool::View } else { Tool::Zone };
-            }
-            if ui.button(l.t("Tout l'écran", "Whole screen")).clicked() {
-                let screen = self.screen();
-                if let (Some(plan), Some([w, h])) = (self.image.plan.as_mut(), screen) {
-                    plan.zone = [0, 0, w, h];
-                }
-                self.apply_plan();
-            }
-            if let Some(plan) = &self.image.plan {
-                let [x, y, w, h] = plan.zone;
-                ui.weak(format!("{w}×{h} @ {x},{y}"));
-            }
-        });
-        if self.image.tool == Tool::Zone {
-            if let Some(found) = &self.image.found {
-                ui.weak(found.as_str());
-            }
-        }
-    }
-
-    /// Step 3: how big the game's pixels are.
-    fn section_pixels(&mut self, ui: &mut egui::Ui) {
-        let l = self.lang;
-        let Some(mut plan) = self.image.plan else {
-            ui.weak(l.t("Commence par la zone du jeu.", "Start with the game zone."));
+    /// Finds the game on the capture: its zone, then its pixel grid.
+    fn detect(&mut self) {
+        let Some(c) = self.image.capture.as_ref() else {
+            self.image.found = Some(Found::Nothing);
             return;
         };
-        let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(l.t("Pixels du jeu", "Game pixels")).on_hover_text(l.t(
-                "Combien de pixels d'écran couvre un pixel du jeu. Ils peuvent être plus hauts que larges, ou l'inverse.",
-                "How many screen pixels one game pixel covers. They may be taller than wide, or the reverse.",
-            ));
-            if ui
-                .add_enabled(self.image.capture.is_some(), egui::Button::new(l.t("✨ Détecter", "✨ Detect")))
-                .clicked()
-            {
-                self.detect_pixels();
-                plan = self.image.plan.unwrap_or(plan);
+        let pixels = Pixels { data: &c.rgba, width: c.size[0], height: c.size[1] };
+        let full_size = c.size == c.base;
+        let Some(lit) = detect::content_bounds(&pixels) else {
+            self.image.found = Some(Found::Nothing);
+            return;
+        };
+        let scale = c.base[0] as f32 / c.size[0] as f32;
+        let mut zone = lit.map(|v| (v as f32 * scale).round() as u32);
+        // A downscaled capture blends pixels: the grid cannot be read there.
+        let grid =
+            if full_size { detect::pitch(&pixels, lit, true).zip(detect::pitch(&pixels, lit, false)) } else { None };
+        let base = c.base;
+        let previous = self.image.plan;
+        let mut plan =
+            previous.unwrap_or(Plan { zone, pixel: [1.0, 1.0], dup: [1, 1], shape: Shape::Crt, size: Size::Integer });
+        match grid {
+            Some((h, v)) if h.size > 1.0 || v.size > 1.0 => {
+                plan.pixel = [h.size, v.size];
+                // Start on the grid and keep only whole game pixels.
+                for (axis, pitch) in [(0, h), (1, v)] {
+                    let offset = pitch.offset.round().min(zone[axis + 2] as f32 - 1.0).max(0.0);
+                    let count = ((zone[axis + 2] as f32 - offset) / pitch.size).floor().max(1.0);
+                    zone[axis] += offset as u32;
+                    zone[axis + 2] = (count * pitch.size).round() as u32;
+                }
+                // The game's own black borders are invisible against the bars.
+                plan.zone = detect::grow_to_standard(zone, plan.pixel, base);
+                self.image.found = Some(Found::Measured);
             }
-            let grid = self.image.tool == Tool::Grid;
-            if ui
-                .selectable_label(grid, l.t("📐 Vérifier avec la grille", "📐 Check with the grid"))
+            _ => {
+                plan.zone = zone;
+                self.image.found = Some(Found::ZoneOnly);
+            }
+        }
+        // A first analysis picks the look most retro games want.
+        if previous.is_none_or(|p| p.shape == Shape::AsShown && p.size == Size::InPlace) {
+            plan.shape = Shape::Crt;
+            plan.size = Size::Integer;
+        }
+        self.image.plan = Some(plan);
+        self.apply_plan();
+    }
+
+    /// One sentence on what reaches the screen.
+    fn summary(&self) -> Option<String> {
+        let (plan, screen) = (self.image.plan?, self.screen()?);
+        let [gw, gh] = plan.game();
+        let [iw, ih] = plan.input();
+        let [_, _, dw, dh] = plan.display(screen);
+        let (sx, sy) = (dw as f32 / iw as f32, dh as f32 / ih as f32);
+        let uneven = (sx - sx.round()).abs() > 0.01 || (sy - sy.round()).abs() > 0.01;
+        let dup = plan.dup != [1, 1];
+        Some(match self.lang {
+            Lang::Fr => {
+                let mut s = format!("Le jeu fait {gw} × {gh}.");
+                if dup {
+                    s += &format!(" Dupliqué, le shader travaille sur {iw} × {ih}.");
+                }
+                s += &format!(" Chaque pixel devient {} × {} pixels d'écran : image de {dw} × {dh}.", num(sx), num(sy));
+                if uneven {
+                    s += " Pixels de tailles inégales : choisis « Nette » pour des pixels identiques.";
+                }
+                s
+            }
+            Lang::En => {
+                let mut s = format!("The game is {gw} × {gh}.");
+                if dup {
+                    s += &format!(" Duplicated, the shader works on {iw} × {ih}.");
+                }
+                s += &format!(" Each pixel becomes {} × {} screen pixels: a {dw} × {dh} picture.", num(sx), num(sy));
+                if uneven {
+                    s += " Pixels of uneven sizes: pick \"Sharp\" for identical pixels.";
+                }
+                s
+            }
+        })
+    }
+
+    // ------------------------------------------------------------- cards
+
+    /// Card 1: what the game is.
+    fn card_game(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        let elapsed = self.image.requested.map(|t| t.elapsed());
+        let waiting = self.image.analyse_next && elapsed.is_some_and(|e| e < Duration::from_secs(3));
+        let stuck = self.image.analyse_next && elapsed.is_some_and(|e| e >= Duration::from_secs(3));
+        let found = self.image.found.clone();
+        let plan = self.image.plan;
+        let mut analyse = false;
+        card(ui, "1", l.t("Le jeu", "The game"), |ui| {
+            match (&found, plan) {
+                _ if waiting => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(l.t("Analyse de l'image…", "Analysing the picture…"));
+                    });
+                }
+                _ if stuck => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 170, 60),
+                        l.t(
+                            "Pas d'image : il faut un preset chargé et « Shader actif » coché.",
+                            "No picture: a preset must be loaded and \"Shader on\" ticked.",
+                        ),
+                    );
+                }
+                (Some(Found::Measured), Some(plan)) => {
+                    let [w, h] = plan.game();
+                    ui.label(egui::RichText::new(format!("✔ {w} × {h}")).size(22.0).strong());
+                    ui.weak(match l {
+                        Lang::Fr => format!(
+                            "pixels de {} × {} à l'écran, mesurés sur l'image",
+                            num(plan.pixel[0]),
+                            num(plan.pixel[1])
+                        ),
+                        Lang::En => format!(
+                            "pixels of {} × {} on screen, measured on the picture",
+                            num(plan.pixel[0]),
+                            num(plan.pixel[1])
+                        ),
+                    });
+                }
+                (Some(Found::ZoneOnly), Some(plan)) => {
+                    let [w, h] = plan.game();
+                    ui.label(egui::RichText::new(format!("⚠ {w} × {h} ?")).size(22.0).strong());
+                    ui.weak(l.t(
+                        "Le jeu est trouvé, mais pas ses pixels (image lissée ou trop simple). Indique sa \
+                         résolution dans « Corriger » ou vérifie la grille.",
+                        "The game is found, not its pixels (smoothed or too plain a picture). Give its resolution \
+                         under \"Correct\" or check the grid.",
+                    ));
+                }
+                (Some(Found::Nothing), _) => {
+                    ui.weak(l.t(
+                        "Image noire : va sur un écran du jeu bien rempli et réanalyse.",
+                        "Black picture: go to a busy screen of the game and analyse again.",
+                    ));
+                }
+                (_, Some(plan)) => {
+                    let [w, h] = plan.game();
+                    ui.label(egui::RichText::new(format!("{w} × {h}")).size(22.0).strong());
+                    ui.weak(l.t("d'après les réglages actuels", "from the current settings"));
+                }
+                (_, None) => {
+                    ui.weak(l.t("Pas encore analysé.", "Not analysed yet."));
+                }
+            }
+            ui.add_space(4.0);
+            analyse = ui
+                .button(l.t("🔍 Analyser l'image", "🔍 Analyse the picture"))
                 .on_hover_text(l.t(
-                    "Les lignes doivent suivre les blocs du jeu. Fais glisser l'image pour décaler la grille.",
-                    "The lines must follow the game's blocks. Drag the picture to shift the grid.",
+                    "Reprend une photo du jeu et retrouve sa zone et ses pixels. Utile après un changement de mode.",
+                    "Takes a new picture of the game and finds its zone and pixels again. Useful after a mode change.",
                 ))
-                .clicked()
-            {
-                self.image.tool = if grid { Tool::View } else { Tool::Grid };
+                .clicked();
+            egui::CollapsingHeader::new(l.t("Corriger", "Correct"))
+                .id_salt("correct-game")
+                .show(ui, |ui| self.correct_game(ui));
+        });
+        if analyse {
+            self.analyse();
+        }
+    }
+
+    /// Fine corrections of what the analysis found.
+    fn correct_game(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        let Some(mut plan) = self.image.plan else { return };
+        let before = plan;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(l.t("Résolution", "Resolution"));
+            let mut game = plan.game();
+            let mut edited = ui.add(egui::DragValue::new(&mut game[0]).range(1..=4096)).changed();
+            ui.label("×");
+            edited |= ui.add(egui::DragValue::new(&mut game[1]).range(1..=4096)).changed();
+            if edited {
+                plan.pixel = [plan.zone[2] as f32 / game[0] as f32, plan.zone[3] as f32 / game[1] as f32];
             }
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label(l.t("Taille d'un pixel", "Pixel size"));
-            let before = plan.pixel;
-            for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
-                changed |= ui
-                    .add(egui::DragValue::new(&mut plan.pixel[axis]).speed(0.01).range(0.5..=64.0).prefix(label))
-                    .changed();
+            for (w, h) in [(320, 200), (320, 240), (640, 200), (640, 400), (640, 480)] {
+                if ui.small_button(format!("{w}×{h}")).clicked() {
+                    plan.pixel = [plan.zone[2] as f32 / w as f32, plan.zone[3] as f32 / h as f32];
+                }
             }
-            if self.image.lock && before != plan.pixel {
-                // Keep the ratio they had, whichever one moved.
-                if before[0] != plan.pixel[0] {
-                    plan.pixel[1] = before[1] * plan.pixel[0] / before[0];
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(l.t("Pixel à l'écran", "Pixel on screen"));
+            let start = plan.pixel;
+            for (axis, label) in [(0usize, "↔ "), (1usize, "↕ ")] {
+                ui.add(egui::DragValue::new(&mut plan.pixel[axis]).speed(0.01).range(0.5..=64.0).prefix(label));
+            }
+            if self.image.lock && start != plan.pixel {
+                if start[0] != plan.pixel[0] {
+                    plan.pixel[1] = start[1] * plan.pixel[0] / start[0];
                 } else {
-                    plan.pixel[0] = before[0] * plan.pixel[1] / before[1];
+                    plan.pixel[0] = start[0] * plan.pixel[1] / start[1];
                 }
             }
             ui.checkbox(&mut self.image.lock, "🔒").on_hover_text(l.t("Garder le rapport", "Keep the ratio"));
-            ui.separator();
-            ui.label(l.t("Résolution du jeu", "Game resolution"));
-            let mut game = plan.game();
-            let mut edited = false;
-            edited |= ui.add(egui::DragValue::new(&mut game[0]).range(1..=4096)).changed();
-            ui.label("×");
-            edited |= ui.add(egui::DragValue::new(&mut game[1]).range(1..=4096)).changed();
-            for (w, h) in [(320, 200), (320, 240), (640, 400), (640, 480)] {
-                if ui.small_button(format!("{w}×{h}")).clicked() {
-                    game = [w, h];
-                    edited = true;
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(l.t("✋ Cadre sur l'image", "✋ Frame on the picture")).clicked() {
+                self.image.view = View::Capture;
+                self.image.tool = Tool::Frame;
+                self.image.zoom = 0.0;
+            }
+            if ui.button(l.t("📐 Vérifier la grille", "📐 Check the grid")).clicked() {
+                self.image.view = View::Capture;
+                self.image.tool = Tool::Grid;
+                self.image.zoom = 4.0;
+            }
+            if ui.button(l.t("Tout l'écran", "Whole screen")).clicked() {
+                if let Some([w, h]) = self.screen() {
+                    plan.zone = [0, 0, w, h];
                 }
             }
-            if edited {
-                plan.pixel = [plan.zone[2] as f32 / game[0] as f32, plan.zone[3] as f32 / game[1] as f32];
-                changed = true;
-            }
         });
-        if let Some(found) = &self.image.found {
-            ui.weak(found.as_str());
-        }
-        if changed {
+        let [x, y, w, h] = plan.zone;
+        ui.weak(match l {
+            Lang::Fr => format!("cadre du jeu : {w} × {h} en {x}, {y}"),
+            Lang::En => format!("game frame: {w} × {h} at {x}, {y}"),
+        });
+        if plan != before {
             self.image.plan = Some(plan);
             self.apply_plan();
         }
     }
 
-    /// Step 4: shape and size on screen.
-    fn section_shape(&mut self, ui: &mut egui::Ui) {
+    /// Card 2: the shape it is drawn with.
+    fn card_shape(&mut self, ui: &mut egui::Ui) {
         let l = self.lang;
         let Some(mut plan) = self.image.plan else { return };
         let before = plan;
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(l.t("Forme", "Shape"));
-            ui.radio_value(&mut plan.shape, Shape::Crt, l.t("Écran 4:3 d'époque", "4:3 monitor of the time"))
-                .on_hover_text(l.t(
-                    "Comme sur un moniteur CRT : 320×200 en 4:3, pixels 1,2 fois plus hauts que larges.",
-                    "As on a CRT monitor: 320×200 in 4:3, pixels 1.2 times taller than wide.",
+        card(ui, "2", l.t("Forme", "Shape"), |ui| {
+            if choice(
+                ui,
+                plan.shape == Shape::Crt,
+                l.t("Écran 4:3 d'époque", "4:3 monitor of the time"),
+                l.t("comme sur un moniteur CRT : le 320×200 étiré en 4:3", "as on a CRT: 320×200 stretched to 4:3"),
+            ) {
+                plan.shape = Shape::Crt;
+            }
+            if choice(
+                ui,
+                plan.shape == Shape::Square,
+                l.t("Pixels carrés", "Square pixels"),
+                l.t("chaque pixel du jeu dessiné carré", "every game pixel drawn square"),
+            ) {
+                plan.shape = Shape::Square;
+            }
+            if choice(
+                ui,
+                plan.shape == Shape::AsShown,
+                l.t("Tel qu'à l'écran", "As shown now"),
+                l.t("la forme que l'émulateur lui donne", "the shape the emulator gives it"),
+            ) {
+                plan.shape = Shape::AsShown;
+            }
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(l.t("Dupliquer", "Duplicate")).on_hover_text(l.t(
+                    "Répète chaque pixel du jeu : ↕ 2 rend le jeu deux fois plus haut, ↔ 2 deux fois plus large. \
+                     Le shader travaille ensuite sur ce jeu dupliqué.",
+                    "Repeats each game pixel: ↕ 2 makes the game twice as tall, ↔ 2 twice as wide. The shader \
+                     then works on that duplicated game.",
                 ));
-            ui.radio_value(&mut plan.shape, Shape::Square, l.t("Pixels carrés", "Square pixels")).on_hover_text(l.t(
-                "Chaque pixel (dupliqué) dessiné carré : doubler les lignes rend l'image deux fois plus haute.",
-                "Every (duplicated) pixel drawn square: doubling the lines makes the picture twice as tall.",
-            ));
-            ui.radio_value(&mut plan.shape, Shape::AsShown, l.t("Comme à l'écran", "As shown now"));
+                ui.add(egui::DragValue::new(&mut plan.dup[0]).range(1..=8).prefix("↔ ×"));
+                ui.add(egui::DragValue::new(&mut plan.dup[1]).range(1..=8).prefix("↕ ×"));
+            });
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(l.t("Taille", "Size"));
-            ui.radio_value(&mut plan.size, Size::Integer, l.t("Entière", "Whole multiple")).on_hover_text(l.t(
-                "Un nombre entier de pixels d'écran par pixel du jeu, en largeur et en hauteur : tous les pixels \
-                 et toutes les scanlines ont la même taille, la forme est la plus proche possible.",
-                "A whole number of screen pixels per game pixel, across and down: every pixel and scanline has \
-                 the same size, the shape as close as possible.",
-            ));
-            ui.radio_value(&mut plan.size, Size::Fit, l.t("Plein écran", "Fill the screen"));
-            ui.radio_value(&mut plan.size, Size::InPlace, l.t("À sa place", "Where it is"))
-                .on_hover_text(l.t("Dans la zone actuelle du jeu.", "Inside the game's current zone."));
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(l.t("Dupliquer", "Duplicate")).on_hover_text(l.t(
-                "Répète chaque pixel du jeu : ↕ 2 rend le jeu deux fois plus haut, ↔ 2 deux fois plus large. \
-                 Le shader s'applique ensuite sur ce jeu dupliqué, ses scanlines gardent leur épaisseur.",
-                "Repeats each game pixel: ↕ 2 makes the game twice as tall, ↔ 2 twice as wide. The shader then \
-                 applies to that duplicated game, its scanlines keeping their thickness.",
-            ));
-            ui.add(egui::DragValue::new(&mut plan.dup[0]).range(1..=8).prefix("↔ "));
-            ui.add(egui::DragValue::new(&mut plan.dup[1]).range(1..=8).prefix("↕ "));
-            if let Some(screen) = self.screen() {
-                let [gw, gh] = plan.game();
-                let [iw, ih] = plan.input();
-                let [_, _, dw, dh] = plan.display(screen);
-                ui.weak(match l {
-                    crate::i18n::Lang::Fr => {
-                        format!(
-                            "jeu {gw}×{gh} › shader {iw}×{ih} › affiché {dw}×{dh}, {:.2} lignes d'écran par ligne",
-                            dh as f32 / ih as f32
-                        )
-                    }
-                    crate::i18n::Lang::En => {
-                        format!(
-                            "game {gw}×{gh} › shader {iw}×{ih} › drawn {dw}×{dh}, {:.2} screen lines per line",
-                            dh as f32 / ih as f32
-                        )
-                    }
-                });
+        if plan != before {
+            self.image.plan = Some(plan);
+            self.apply_plan();
+        }
+    }
+
+    /// Card 3: how big.
+    fn card_size(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        let Some(mut plan) = self.image.plan else { return };
+        let before = plan;
+        card(ui, "3", l.t("Taille", "Size"), |ui| {
+            if choice(
+                ui,
+                plan.size == Size::Integer,
+                l.t("Nette", "Sharp"),
+                l.t(
+                    "tous les pixels et scanlines de la même taille, le plus grand possible",
+                    "every pixel and scanline the same size, as large as possible",
+                ),
+            ) {
+                plan.size = Size::Integer;
+            }
+            if choice(
+                ui,
+                plan.size == Size::Fit,
+                l.t("Plein écran", "Fill the screen"),
+                l.t("aussi grand que l'écran, pixels un peu inégaux", "as large as the screen, pixels slightly uneven"),
+            ) {
+                plan.size = Size::Fit;
+            }
+            if choice(
+                ui,
+                plan.size == Size::InPlace,
+                l.t("À sa place", "Where it is"),
+                l.t("dans le cadre actuel du jeu", "inside the game's current frame"),
+            ) {
+                plan.size = Size::InPlace;
             }
         });
         if plan != before {
@@ -473,50 +555,113 @@ impl App {
         }
     }
 
-    /// The final layout on a miniature screen: black screen, game drawn where
-    /// the preset will draw it.
-    fn preview(&self, ui: &mut egui::Ui, height: f32) {
+    // -------------------------------------------------------------- views
+
+    /// The large view: result or captured game, switchable.
+    fn view(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.image.view,
+                View::Result,
+                egui::RichText::new(l.t("Résultat", "Result")).size(16.0),
+            );
+            ui.selectable_value(
+                &mut self.image.view,
+                View::Capture,
+                egui::RichText::new(l.t("Image du jeu", "Game picture")).size(16.0),
+            );
+            if self.image.view == View::Capture {
+                ui.separator();
+                ui.selectable_value(&mut self.image.tool, Tool::Frame, l.t("✋ cadre", "✋ frame"));
+                ui.selectable_value(&mut self.image.tool, Tool::Grid, l.t("📐 grille", "📐 grid"));
+                ui.separator();
+                let fit = self.image.zoom == 0.0;
+                if ui.selectable_label(fit, l.t("ajusté", "fit")).clicked() {
+                    self.image.zoom = 0.0;
+                }
+                for z in [1.0, 2.0, 4.0, 8.0] {
+                    if ui.selectable_label(!fit && self.image.zoom == z, format!("×{z}")).clicked() {
+                        self.image.zoom = z;
+                    }
+                }
+            }
+        });
+        if self.image.capture.is_none() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.weak(l.t("L'image du jeu apparaîtra ici.", "The game's picture shows up here."));
+            });
+            return;
+        }
+        match self.image.view {
+            View::Result => self.result_view(ui),
+            View::Capture => {
+                let height = ui.available_height().max(200.0);
+                self.canvas(ui, height);
+                ui.weak(match self.image.tool {
+                    Tool::Frame => l.t(
+                        "Fais glisser le cadre orange : dedans pour le déplacer, près d'un bord pour le redimensionner.",
+                        "Drag the orange frame: inside to move it, near an edge to resize it.",
+                    ),
+                    Tool::Grid => l.t(
+                        "Chaque case doit contenir un seul bloc de couleur. Fais glisser pour caler la grille.",
+                        "Every cell must hold a single block of colour. Drag to lay the grid on the blocks.",
+                    ),
+                });
+            }
+        }
+    }
+
+    /// The screen as it will look: black screen, game where it will be drawn.
+    fn result_view(&mut self, ui: &mut egui::Ui) {
+        let summary = self.summary();
         let (Some(plan), Some(screen), Some(c)) = (self.image.plan, self.screen(), self.image.capture.as_ref()) else {
             return;
         };
-        let scale = height / screen[1] as f32;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(screen[0] as f32 * scale, height), egui::Sense::hover());
+        let space = ui.available_size() - egui::vec2(0.0, 48.0);
+        let scale = (space.x / screen[0] as f32).min(space.y / screen[1] as f32).max(0.01);
+        let (rect, _) = ui
+            .allocate_exact_size(egui::vec2(screen[0] as f32 * scale, screen[1] as f32 * scale), egui::Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, egui::Color32::BLACK);
-        let [dx, dy, dw, dh] = plan.display(screen).map(|v| v as f32 * scale);
-        let target = egui::Rect::from_min_size(rect.min + egui::vec2(dx, dy), egui::vec2(dw, dh));
+        painter.rect_filled(rect, 4.0, egui::Color32::BLACK);
+        let [dx, dy, dw, dh] = plan.display(screen);
+        let target = egui::Rect::from_min_size(
+            rect.min + egui::vec2(dx as f32 * scale, dy as f32 * scale),
+            egui::vec2(dw as f32 * scale, dh as f32 * scale),
+        );
         let [zx, zy, zw, zh] = plan.zone.map(|v| v as f32);
         let (bw, bh) = (c.base[0] as f32, c.base[1] as f32);
         let uv = egui::Rect::from_min_max(egui::pos2(zx / bw, zy / bh), egui::pos2((zx + zw) / bw, (zy + zh) / bh));
         painter.image(c.texture.id(), target, uv, egui::Color32::WHITE);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, egui::Color32::DARK_GRAY), egui::StrokeKind::Inside);
+        let label = format!("{dw} × {dh}");
+        let font = egui::FontId::proportional(14.0);
+        let anchor = target.center_bottom() + egui::vec2(0.0, -6.0);
+        let galley = painter.layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE);
+        let back = egui::Rect::from_center_size(
+            anchor - egui::vec2(0.0, galley.size().y / 2.0),
+            galley.size() + egui::vec2(10.0, 4.0),
+        );
+        painter.rect_filled(back, 4.0, egui::Color32::from_black_alpha(170));
+        painter.text(anchor, egui::Align2::CENTER_BOTTOM, label, font, egui::Color32::WHITE);
+        if let Some(summary) = summary {
+            ui.add_space(6.0);
+            ui.label(summary);
+        }
     }
 
-    /// The capture with the zone or the grid over it.
+    /// The captured game with its frame or grid over it.
     fn canvas(&mut self, ui: &mut egui::Ui, max_height: f32) {
         let l = self.lang;
         let Some(c) = self.image.capture.as_ref() else { return };
         let (texture, base) = (c.texture.id(), c.base);
-        ui.horizontal(|ui| {
-            ui.weak(l.t("Zoom", "Zoom"));
-            let mut fit = self.image.zoom == 0.0;
-            if ui.selectable_label(fit, l.t("ajusté", "fit")).clicked() {
-                fit = true;
-                self.image.zoom = 0.0;
-            }
-            for z in [1.0, 2.0, 4.0, 8.0] {
-                if ui.selectable_label(!fit && self.image.zoom == z, format!("×{z}")).clicked() {
-                    self.image.zoom = z;
-                }
-            }
-        });
-        // Screen pixels to canvas points.
-        let fit = (ui.available_width() / base[0] as f32).min(max_height / base[1] as f32);
+        let fit = (ui.available_width() / base[0] as f32).min((max_height - 30.0) / base[1] as f32);
         // ×N: N canvas points per screen pixel.
         let zoom = if self.image.zoom == 0.0 { fit } else { self.image.zoom };
-        let canvas = egui::vec2(base[0] as f32 * zoom, base[1] as f32 * zoom);
-        egui::ScrollArea::both().max_height(max_height).id_salt("capture").show(ui, |ui| {
-            let (rect, response) = ui.allocate_exact_size(canvas, egui::Sense::drag());
+        let size = egui::vec2(base[0] as f32 * zoom, base[1] as f32 * zoom);
+        egui::ScrollArea::both().max_height(max_height - 30.0).id_salt("capture").show(ui, |ui| {
+            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
             let painter = ui.painter_at(rect);
             painter.image(
                 texture,
@@ -542,8 +687,7 @@ impl App {
 
             let mut moved = false;
             match self.image.tool {
-                Tool::View => {}
-                Tool::Zone => {
+                Tool::Frame => {
                     for corner in [zone.left_top(), zone.right_top(), zone.left_bottom(), zone.right_bottom()] {
                         painter.circle_filled(corner, 5.0, orange);
                     }
@@ -585,36 +729,35 @@ impl App {
                     let step = egui::vec2(plan.pixel[0] * zoom, plan.pixel[1] * zoom);
                     if step.min_elem() >= 3.0 {
                         let line = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 60, 60, 170));
-                        let mut x = zone.left();
-                        while x <= zone.right() + 0.5 {
-                            painter.line_segment([egui::pos2(x, zone.top()), egui::pos2(x, zone.bottom())], line);
+                        // Only the lines in sight: at ×4 a 4K capture is huge.
+                        let visible = ui.clip_rect().intersect(zone);
+                        let mut x = zone.left() + ((visible.left() - zone.left()) / step.x).floor() * step.x;
+                        while x <= visible.right() + 0.5 {
+                            painter.line_segment([egui::pos2(x, visible.top()), egui::pos2(x, visible.bottom())], line);
                             x += step.x;
                         }
-                        let mut y = zone.top();
-                        while y <= zone.bottom() + 0.5 {
-                            painter.line_segment([egui::pos2(zone.left(), y), egui::pos2(zone.right(), y)], line);
+                        let mut y = zone.top() + ((visible.top() - zone.top()) / step.y).floor() * step.y;
+                        while y <= visible.bottom() + 0.5 {
+                            painter.line_segment([egui::pos2(visible.left(), y), egui::pos2(visible.right(), y)], line);
                             y += step.y;
                         }
                     } else {
                         painter.text(
                             zone.center(),
                             egui::Align2::CENTER_CENTER,
-                            l.t("Zoome pour voir la grille", "Zoom in to see the grid"),
-                            egui::FontId::proportional(16.0),
+                            l.t("Zoome (×4) pour voir la grille", "Zoom in (×4) to see the grid"),
+                            egui::FontId::proportional(18.0),
                             orange,
                         );
                     }
-                    // Dragging shifts the whole zone, grid included, so the
-                    // lines can be laid on the game's blocks.
+                    // Dragging shifts the frame, grid included, onto the
+                    // game's blocks.
                     if response.dragged() {
                         let d = response.drag_delta() / zoom;
-                        self.image.drag = None;
                         let max_x = base[0].saturating_sub(plan.zone[2]) as f32;
                         let max_y = base[1].saturating_sub(plan.zone[3]) as f32;
-                        let x = (plan.zone[0] as f32 + d.x).round().clamp(0.0, max_x);
-                        let y = (plan.zone[1] as f32 + d.y).round().clamp(0.0, max_y);
-                        plan.zone[0] = x as u32;
-                        plan.zone[1] = y as u32;
+                        plan.zone[0] = (plan.zone[0] as f32 + d.x).round().clamp(0.0, max_x) as u32;
+                        plan.zone[1] = (plan.zone[1] as f32 + d.y).round().clamp(0.0, max_y) as u32;
                     }
                     if response.drag_stopped() {
                         moved = true;
@@ -627,41 +770,38 @@ impl App {
         });
     }
 
-    /// The Image tab: every section at once, then the raw settings.
+    // --------------------------------------------------------------- page
+
+    /// The Picture page.
     pub fn image_tab(&mut self, ui: &mut egui::Ui) {
         let l = self.lang;
-        if self.image.capture.is_none() && self.image.requested.is_none() {
-            self.request_capture();
+        // Opening the page analyses the game once, by itself.
+        if self.image.requested.is_none() {
+            self.analyse();
         }
-        egui::ScrollArea::vertical().id_salt("image-tab").show(ui, |ui| {
-            self.section_capture(ui);
-            ui.separator();
-            self.section_zone(ui);
-            ui.separator();
-            self.section_pixels(ui);
-            ui.separator();
-            self.section_shape(ui);
-            ui.horizontal(|ui| {
-                ui.weak(l.t("Résultat", "Result"));
-                self.preview(ui, 140.0);
+        egui::Panel::right("picture-cards").resizable(true).default_size(360.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("picture-cards").show(ui, |ui| {
+                self.card_game(ui);
+                self.card_shape(ui);
+                self.card_size(ui);
+                egui::CollapsingHeader::new(l.t("Réglages avancés", "Advanced settings")).id_salt("advanced").show(
+                    ui,
+                    |ui| {
+                        ui.weak(l.t(
+                            "Les réglages bruts de la couche. Les cartes du dessus les remplissent pour toi.",
+                            "The layer's raw settings. The cards above fill them in for you.",
+                        ));
+                        self.source_panel(ui);
+                    },
+                );
             });
-            ui.separator();
-            self.canvas(ui, 420.0);
-            ui.separator();
-            egui::CollapsingHeader::new(l.t("Réglages avancés", "Advanced settings")).id_salt("advanced").show(
-                ui,
-                |ui| {
-                    ui.weak(l.t(
-                        "Les mêmes réglages un par un. Les sections du dessus les remplissent pour toi.",
-                        "The same settings one by one. The sections above fill them in for you.",
-                    ));
-                    self.source_panel(ui);
-                },
-            );
         });
+        self.view(ui);
     }
 
-    /// The "Set up this game" assistant.
+    // ---------------------------------------------------------- assistant
+
+    /// The "Set up this game" assistant: the same cards, one at a time.
     pub fn wizard_window(&mut self, ctx: &egui::Context) {
         let l = self.lang;
         let Some(step) = self.image.wizard else { return };
@@ -670,142 +810,79 @@ impl App {
             return;
         }
         let titles = [
-            l.t("1. Capture", "1. Capture"),
-            l.t("2. Zone du jeu", "2. Game zone"),
-            l.t("3. Pixels", "3. Pixels"),
-            l.t("4. Forme et taille", "4. Shape and size"),
-            l.t("5. Shader", "5. Shader"),
-            l.t("6. Profil", "6. Profile"),
+            l.t("1. Le jeu", "1. The game"),
+            l.t("2. Forme et taille", "2. Shape and size"),
+            l.t("3. Shader", "3. Shader"),
+            l.t("4. Profil", "4. Profile"),
         ];
         let mut open = true;
         let mut next = step;
         egui::Window::new(l.t("Configurer ce jeu", "Set up this game"))
             .open(&mut open)
-            .default_size([900.0, 700.0])
+            .default_size([1000.0, 720.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     for (i, title) in titles.iter().enumerate() {
-                        if ui.selectable_label(i == step, *title).clicked() {
+                        if ui.selectable_label(i == step, egui::RichText::new(*title).size(15.0)).clicked() {
                             next = i;
                         }
                     }
                 });
                 ui.separator();
+                egui::Panel::bottom("wizard-nav").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(step > 0, egui::Button::new(l.t("◀ Précédent", "◀ Back"))).clicked() {
+                            next = step - 1;
+                        }
+                        if step + 1 < STEPS && ui.button(l.t("Suivant ▶", "Next ▶")).clicked() {
+                            next = step + 1;
+                        }
+                    });
+                });
                 match step {
                     0 => {
-                        ui.label(l.t(
-                            "vkSlang prend une photo du jeu tel qu'il le dessine, avant le shader. Lance une scène \
-                             bien remplie (pas un écran noir), puis capture.",
-                            "vkSlang takes a picture of the game as it draws it, before the shader. Go to a busy \
-                             scene (not a black screen), then capture.",
-                        ));
-                        self.section_capture(ui);
-                        self.canvas(ui, 460.0);
+                        egui::Panel::right("wizard-game").default_size(340.0).show(ui, |ui| {
+                            ui.label(l.t(
+                                "Va sur un écran du jeu bien rempli (pas un écran noir). vkSlang le photographie \
+                                 avant le shader et trouve tout seul où il est et la taille de ses pixels.",
+                                "Go to a busy screen of the game (not a black one). vkSlang photographs it before \
+                                 the shader and finds by itself where it is and how big its pixels are.",
+                            ));
+                            ui.add_space(6.0);
+                            self.card_game(ui);
+                        });
+                        self.view(ui);
                     }
                     1 => {
-                        ui.label(l.t(
-                            "Où le jeu se trouve à l'écran. « Détecter » enlève les bandes noires ; ajuste à la main \
-                             si le jeu a lui-même des bords noirs.",
-                            "Where the game is on the screen. \"Detect\" removes the black bars; adjust by hand if \
-                             the game has black borders of its own.",
-                        ));
-                        self.section_zone(ui);
-                        self.canvas(ui, 460.0);
+                        egui::Panel::right("wizard-shape").default_size(340.0).show(ui, |ui| {
+                            egui::ScrollArea::vertical().id_salt("wizard-shape").show(ui, |ui| {
+                                self.card_shape(ui);
+                                self.card_size(ui);
+                            });
+                        });
+                        self.image.view = View::Result;
+                        self.view(ui);
                     }
-                    2 => {
-                        ui.label(l.t(
-                            "La taille d'un pixel du jeu. « Détecter » la mesure sur la capture ; vérifie avec la \
-                             grille au zoom ×4 : chaque case doit contenir un seul bloc de couleur.",
-                            "The size of one game pixel. \"Detect\" measures it on the capture; check with the grid \
-                             at ×4 zoom: every cell must hold a single block of colour.",
-                        ));
-                        self.section_pixels(ui);
-                        self.canvas(ui, 420.0);
-                    }
-                    3 => {
-                        ui.label(l.t(
-                            "Comment le jeu doit apparaître. Le résultat s'applique tout de suite sur le jeu.",
-                            "How the game should look. The result applies to the game right away.",
-                        ));
-                        self.section_shape(ui);
-                        self.preview(ui, 300.0);
-                    }
-                    4 => self.wizard_shader(ui),
+                    2 => self.wizard_shader(ui),
                     _ => self.wizard_profile(ui),
                 }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(step > 0, egui::Button::new(l.t("◀ Précédent", "◀ Back"))).clicked() {
-                        next = step - 1;
-                    }
-                    if step + 1 < STEPS && ui.button(l.t("Suivant ▶", "Next ▶")).clicked() {
-                        next = step + 1;
-                    }
-                });
             });
         if !open {
             self.image.wizard = None;
-            self.image.tool = Tool::View;
             return;
         }
         if next != step {
-            self.enter_step(next);
+            self.image.wizard = Some(next);
         }
     }
 
-    /// Opens the assistant on its first step.
+    /// Opens the assistant, analysing the game afresh.
     pub fn open_wizard(&mut self) {
         self.image.plan = None;
-        self.image.found = None;
-        self.image.capture = None;
         self.image.profile_name = self.state.as_ref().map(|s| s.process.clone()).unwrap_or_default();
-        self.request_capture();
+        self.image.view = View::Result;
         self.image.wizard = Some(0);
-        self.image.tool = Tool::View;
-    }
-
-    /// Moving to a step does its obvious first move for the user.
-    fn enter_step(&mut self, step: usize) {
-        self.image.wizard = Some(step);
-        self.image.found = None;
-        if matches!(step, 1 | 2) && self.image.capture.is_none() {
-            self.image.found = Some(
-                self.lang
-                    .t(
-                        "En attente de la capture : la détection se fera dès qu'elle arrive.",
-                        "Waiting for the capture: detection runs as soon as it arrives.",
-                    )
-                    .to_string(),
-            );
-        }
-        match step {
-            1 => {
-                self.image.tool = Tool::Zone;
-                if self
-                    .image
-                    .plan
-                    .is_none_or(|p| Some([0, 0, p.zone[2], p.zone[3]]) == self.screen().map(|[w, h]| [0, 0, w, h]))
-                {
-                    self.detect_zone();
-                }
-            }
-            2 => {
-                self.image.tool = Tool::Grid;
-                self.image.zoom = 4.0;
-                self.detect_pixels();
-            }
-            3 => {
-                self.image.tool = Tool::View;
-                if let Some(plan) = self.image.plan.as_mut() {
-                    if plan.shape == Shape::AsShown && plan.size == Size::InPlace {
-                        plan.shape = Shape::Crt;
-                        plan.size = Size::Integer;
-                    }
-                }
-                self.apply_plan();
-            }
-            _ => self.image.tool = Tool::View,
-        }
+        self.analyse();
     }
 
     fn wizard_shader(&mut self, ui: &mut egui::Ui) {
@@ -823,7 +900,7 @@ impl App {
         let running: Vec<String> = self.state.as_ref().map(|s| s.presets.clone()).unwrap_or_default();
         let root = std::path::PathBuf::from(&self.shader_root);
         let mut clicked = None;
-        egui::ScrollArea::vertical().max_height(420.0).id_salt("wizard-presets").show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("wizard-presets").show(ui, |ui| {
             let matches = self.presets.iter().filter(|p| {
                 let s = p.to_string_lossy().to_lowercase();
                 words.iter().all(|w| s.contains(w.as_str()))
@@ -857,8 +934,8 @@ impl App {
         ui.checkbox(
             &mut self.image.star,
             match l {
-                crate::i18n::Lang::Fr => format!("Charger automatiquement pour {}", state.process),
-                crate::i18n::Lang::En => format!("Load automatically for {}", state.process),
+                Lang::Fr => format!("Charger automatiquement pour {}", state.process),
+                Lang::En => format!("Load automatically for {}", state.process),
             },
         );
         let named = !self.image.profile_name.trim().is_empty();
@@ -876,11 +953,10 @@ impl App {
                     }
                     self.reload_profiles();
                     self.info(match l {
-                        crate::i18n::Lang::Fr => format!("profil « {} » enregistré", p.name),
-                        crate::i18n::Lang::En => format!("profile \"{}\" saved", p.name),
+                        Lang::Fr => format!("profil « {} » enregistré", p.name),
+                        Lang::En => format!("profile \"{}\" saved", p.name),
                     });
                     self.image.wizard = None;
-                    self.image.tool = Tool::View;
                 }
                 Err(e) => self.error(format!("{e}")),
             }
