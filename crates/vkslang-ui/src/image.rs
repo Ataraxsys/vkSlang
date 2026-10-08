@@ -36,6 +36,9 @@ const STEPS: usize = 6;
 
 pub struct ImageState {
     pub capture: Option<Capture>,
+    /// Last capture published by the layer that was read, even if it could
+    /// not be: a broken file is not read again on every repaint.
+    read_id: Option<u64>,
     requested: Option<Instant>,
     pub plan: Option<Plan>,
     tool: Tool,
@@ -57,6 +60,7 @@ impl Default for ImageState {
     fn default() -> Self {
         ImageState {
             capture: None,
+            read_id: None,
             requested: None,
             plan: None,
             tool: Tool::View,
@@ -99,15 +103,26 @@ impl App {
     /// Picks up a capture published by the layer.
     pub fn poll_capture(&mut self, ctx: &egui::Context) {
         let Some(c) = self.state.as_ref().and_then(|s| s.capture.clone()) else { return };
-        if self.image.capture.as_ref().is_some_and(|old| old.id == c.id) {
+        if self.image.read_id == Some(c.id) {
             return;
         }
-        let Some((rgba, size)) = read_capture(&c.path) else { return };
+        self.image.read_id = Some(c.id);
+        let Some((rgba, size)) = read_capture(&c.path) else {
+            self.error(self.lang.t("capture illisible", "unreadable capture"));
+            return;
+        };
         let image = egui::ColorImage::from_rgba_unmultiplied([size[0] as usize, size[1] as usize], &rgba);
         let texture = ctx.load_texture("vkslang-capture", image, egui::TextureOptions::NEAREST);
         self.image.capture = Some(Capture { id: c.id, texture, size, base: c.base, rgba });
         if self.image.plan.is_none() {
             self.image.plan = self.plan_from_settings();
+        }
+        // The assistant may already be past the capture: do what entering
+        // that step would have done had the picture been there.
+        match self.image.wizard {
+            Some(1) => self.detect_zone(),
+            Some(2) => self.detect_pixels(),
+            _ => {}
         }
     }
 
@@ -115,7 +130,13 @@ impl App {
     fn plan_from_settings(&self) -> Option<Plan> {
         let screen = self.screen()?;
         let s = &self.state.as_ref()?.source;
-        let zone = parse_area(&s.rect).unwrap_or([0, 0, screen[0], screen[1]]);
+        // An explicit area is where it says; `4:3` and the like are centred,
+        // and the layer reports their size.
+        let zone = parse_area(&s.rect).unwrap_or_else(|| {
+            let [w, h] =
+                self.state.as_ref().and_then(|s| s.outputs.first()).map_or(screen, |o| o.picture).map(|v| v.max(1));
+            [(screen[0].saturating_sub(w)) / 2, (screen[1].saturating_sub(h)) / 2, w, h]
+        });
         let pixel = match s.res {
             SourceSize::Fixed { size: [w, h] } => [zone[2] as f32 / w as f32, zone[3] as f32 / h as f32],
             SourceSize::Divide { by } => [by, by],
@@ -246,8 +267,18 @@ impl App {
                     && self.image.capture.as_ref().is_none_or(|c| {
                         self.state.as_ref().and_then(|s| s.capture.as_ref()).is_none_or(|n| n.id == c.id)
                     });
+            let stuck = self.image.requested.is_some_and(|t| t.elapsed() >= Duration::from_secs(3))
+                && self.image.capture.is_none();
             if waiting {
                 ui.spinner();
+            } else if stuck {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 170, 60),
+                    l.t(
+                        "Pas de capture : il faut un preset chargé et « Shader actif » coché.",
+                        "No capture: a preset must be loaded and \"Shader on\" ticked.",
+                    ),
+                );
             }
             match &self.image.capture {
                 Some(c) => ui.weak(match l {
@@ -292,6 +323,11 @@ impl App {
                 ui.weak(format!("{w}×{h} @ {x},{y}"));
             }
         });
+        if self.image.tool == Tool::Zone {
+            if let Some(found) = &self.image.found {
+                ui.weak(found.as_str());
+            }
+        }
     }
 
     /// Step 3: how big the game's pixels are.
@@ -569,8 +605,10 @@ impl App {
                     if response.dragged() {
                         let d = response.drag_delta() / zoom;
                         self.image.drag = None;
-                        let x = (plan.zone[0] as f32 + d.x).round().clamp(0.0, (base[0] - plan.zone[2]) as f32);
-                        let y = (plan.zone[1] as f32 + d.y).round().clamp(0.0, (base[1] - plan.zone[3]) as f32);
+                        let max_x = base[0].saturating_sub(plan.zone[2]) as f32;
+                        let max_y = base[1].saturating_sub(plan.zone[3]) as f32;
+                        let x = (plan.zone[0] as f32 + d.x).round().clamp(0.0, max_x);
+                        let y = (plan.zone[1] as f32 + d.y).round().clamp(0.0, max_y);
                         plan.zone[0] = x as u32;
                         plan.zone[1] = y as u32;
                     }
@@ -726,6 +764,16 @@ impl App {
     fn enter_step(&mut self, step: usize) {
         self.image.wizard = Some(step);
         self.image.found = None;
+        if matches!(step, 1 | 2) && self.image.capture.is_none() {
+            self.image.found = Some(
+                self.lang
+                    .t(
+                        "En attente de la capture : la détection se fera dès qu'elle arrive.",
+                        "Waiting for the capture: detection runs as soon as it arrives.",
+                    )
+                    .to_string(),
+            );
+        }
         match step {
             1 => {
                 self.image.tool = Tool::Zone;
@@ -816,7 +864,10 @@ impl App {
             match crate::profile::save(&p) {
                 Ok(_) => {
                     if self.image.star {
-                        let _ = crate::save::set_default_profile(&state.process, Some(&p.name));
+                        if let Err(e) = crate::save::set_default_profile(&state.process, Some(&p.name)) {
+                            self.error(format!("vkSlang.conf: {e}"));
+                            return;
+                        }
                         self.default_profile = None;
                     }
                     self.reload_profiles();
