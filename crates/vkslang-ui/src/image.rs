@@ -429,8 +429,10 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.strong(l.t("Taille", "Size"));
             ui.radio_value(&mut plan.size, Size::Integer, l.t("Entière", "Whole multiple")).on_hover_text(l.t(
-                "Un nombre entier de lignes d'écran par ligne du jeu : toutes les scanlines ont la même épaisseur.",
-                "A whole number of screen lines per game line: every scanline has the same thickness.",
+                "Un nombre entier de pixels d'écran par pixel du jeu, en largeur et en hauteur : tous les pixels \
+                 et toutes les scanlines ont la même taille, la forme est la plus proche possible.",
+                "A whole number of screen pixels per game pixel, across and down: every pixel and scanline has \
+                 the same size, the shape as close as possible.",
             ));
             ui.radio_value(&mut plan.size, Size::Fit, l.t("Plein écran", "Fill the screen"));
             ui.radio_value(&mut plan.size, Size::InPlace, l.t("À sa place", "Where it is"))

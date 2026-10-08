@@ -82,9 +82,19 @@ impl Plan {
             Size::Fit => fit(sw, sh, aspect),
             Size::InPlace => fit(self.zone[2] as f32, self.zone[3] as f32, aspect),
             Size::Integer => {
-                let lines = self.input()[1] as f32;
-                let k = (sh / lines).min(sw / (lines * aspect)).floor().max(1.0);
-                (lines * k * aspect, lines * k)
+                // Whole screen pixels per game pixel on both axes, so every
+                // pixel (and scanline) is the same size; the shape is then
+                // as close to the asked one as whole numbers allow.
+                let [cols, lines] = self.input().map(|v| v as f32);
+                let width_per_height = aspect * lines / cols;
+                let mut sy = (sh / lines).floor().max(1.0);
+                loop {
+                    let sx = (sy * width_per_height).round().max(1.0);
+                    if cols * sx <= sw || sy <= 1.0 {
+                        break (cols * sx, lines * sy);
+                    }
+                    sy -= 1.0;
+                }
             }
         };
         let (w, h) = (w.round().min(sw) as u32, h.round().min(sh) as u32);
@@ -186,9 +196,13 @@ mod tests {
     fn integer_size_gives_even_scanlines() {
         let plan = Plan { size: Size::Integer, ..dos() };
         let [_, _, w, h] = plan.display(SCREEN);
-        // 200 lines × 10 screen lines each; width follows 4:3.
-        assert_eq!((w, h), (2667, 2000));
-        assert_eq!(h % 200, 0);
+        // 8×10 screen pixels per game pixel: whole on both axes, as close
+        // to 4:3 as whole numbers allow (2560×2000).
+        assert_eq!((w, h), (2560, 2000));
+        assert_eq!((w % 320, h % 200), (0, 0));
+        // Square pixels stay square.
+        let square = Plan { shape: Shape::Square, ..plan };
+        assert_eq!(square.display(SCREEN)[2..], [3200, 2000]);
     }
 
     #[test]
