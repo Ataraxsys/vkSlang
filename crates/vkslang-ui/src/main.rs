@@ -4,6 +4,10 @@
 //! gamescope), and lets you switch presets, tweak parameters and the source
 //! resolution while it runs, then save the result.
 
+mod detect;
+mod i18n;
+mod image;
+mod plan;
 mod profile;
 mod save;
 
@@ -18,18 +22,6 @@ use vkslang_ipc::{
 const POLL: Duration = Duration::from_millis(400);
 const SCAN: Duration = Duration::from_secs(2);
 
-/// Capture shown by the pixel grid assistant.
-struct GridImage {
-    id: u64,
-    texture: egui::TextureHandle,
-    /// Size of the captured image.
-    size: [u32; 2],
-    /// Size of the whole output image it came from.
-    base: [u32; 2],
-    /// Picture area when it was taken, in output pixels.
-    area: [i32; 4],
-}
-
 /// How many screen pixels one game pixel covers: the divisor that brings the
 /// screen back to the game's own grid. Integer scaling keeps whole screen
 /// pixels per game pixel; otherwise the picture is fitted to the screen.
@@ -42,20 +34,6 @@ fn game_scale(screen: [u32; 2], game: [u32; 2], integer: bool) -> f32 {
     }
 }
 
-/// Shape of the drawn area once each of the `size` game pixels is repeated
-/// `dup` times and drawn square: duplicating lines makes the picture taller.
-fn final_shape(size: [u32; 2], dup: [u32; 2]) -> String {
-    let (w, h) = (size[0].max(1) * dup[0].max(1), size[1].max(1) * dup[1].max(1));
-    let gcd = |mut a: u32, mut b: u32| {
-        while b != 0 {
-            (a, b) = (b, a % b);
-        }
-        a
-    };
-    let g = gcd(w, h);
-    format!("{}:{}", w / g, h / g)
-}
-
 /// Where the game sits on the screen, `[x, y, width, height]`: scaled by
 /// [`game_scale`] and centred, as gamescope places it.
 fn game_rect(screen: [u32; 2], game: [u32; 2], integer: bool) -> [u32; 4] {
@@ -65,27 +43,12 @@ fn game_rect(screen: [u32; 2], game: [u32; 2], integer: bool) -> [u32; 4] {
     [(screen[0] - w) / 2, (screen[1] - h) / 2, w, h]
 }
 
-/// Converts a frame drawn on the capture into a picture area in output
-/// pixels, as `source_rect` spells it.
-fn frame_to_area(frame: egui::Rect, capture: [u32; 2], base: [u32; 2]) -> String {
-    let to_output = egui::vec2(base[0] as f32 / capture[0] as f32, base[1] as f32 / capture[1] as f32);
-    let x = (frame.min.x * to_output.x).round().max(0.0);
-    let y = (frame.min.y * to_output.y).round().max(0.0);
-    let w = (frame.width() * to_output.x).round().max(1.0).min(base[0] as f32 - x);
-    let h = (frame.height() * to_output.y).round().max(1.0).min(base[1] as f32 - y);
-    format!("{x},{y},{w}x{h}")
-}
-
-/// Decodes the raw capture written by the layer (magic, width, height, RGBA8).
-fn load_capture(path: &Path) -> Option<(egui::ColorImage, [u32; 2])> {
-    let data = std::fs::read(path).ok()?;
-    if data.len() < 12 || data[..4] != vkslang_ipc::CAPTURE_MAGIC {
-        return None;
-    }
-    let width = u32::from_le_bytes(data[4..8].try_into().ok()?);
-    let height = u32::from_le_bytes(data[8..12].try_into().ok()?);
-    let pixels = data.get(12..12 + (width as usize * height as usize * 4))?;
-    Some((egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], pixels), [width, height]))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Shader,
+    Image,
+    Display,
+    Profiles,
 }
 
 #[derive(Clone, PartialEq)]
@@ -199,26 +162,11 @@ struct App {
     chain: Vec<ChainEntry>,
 
     param_filter: String,
-    /// Pixel grid assistant.
-    grid_open: bool,
-    grid_texture: Option<GridImage>,
-    /// Grid pitch per axis, in captured-image pixels: a game pixel may be
-    /// half as tall as it is wide (a 640×200 mode shown with square pixels).
-    grid_cell: egui::Vec2,
-    /// Width and height move together, keeping their ratio.
-    grid_lock: bool,
-    /// Duplication the grid proposes, previewed and applied with the result.
-    grid_dup: [u32; 2],
-    grid_offset: egui::Vec2,
-    grid_zoom: f32,
-    /// Last capture request, to avoid asking on every frame.
-    grid_requested: Option<Instant>,
-    /// Picture area being framed, in captured-image pixels.
-    frame_rect: egui::Rect,
-    /// Which edges the current drag is moving (none = moving the whole frame).
-    frame_drag: Option<[bool; 4]>,
-    /// Show the framing tool rather than the measuring grid.
-    frame_mode: bool,
+    /// Language of the panel, remembered between runs.
+    lang: i18n::Lang,
+    tab: Tab,
+    /// Capture, picture plan and assistant.
+    image: image::ImageState,
     source: Option<SourceEdit>,
     save_path: String,
     /// Named profiles, and the parameters waiting for a chain to finish
@@ -337,17 +285,9 @@ impl App {
             preset_filter: String::new(),
             chain: Vec::new(),
             param_filter: String::new(),
-            grid_open: false,
-            grid_texture: None,
-            grid_cell: egui::vec2(4.0, 4.0),
-            grid_lock: true,
-            grid_dup: [1, 1],
-            grid_offset: egui::Vec2::ZERO,
-            grid_zoom: 2.0,
-            grid_requested: None,
-            frame_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(64.0, 64.0)),
-            frame_drag: None,
-            frame_mode: false,
+            lang: i18n::Prefs::load().lang,
+            tab: Tab::Image,
+            image: image::ImageState::default(),
             source: None,
             save_path: String::new(),
             profiles: profile::read_dir(&profile::dir()).0,
@@ -366,7 +306,11 @@ impl App {
         // vkSlang.conf may have been edited by hand too.
         self.default_profile = None;
         if !failures.is_empty() {
-            self.error(format!("unreadable profile(s): {}", failures.join("; ")));
+            self.error(format!(
+                "{} {}",
+                self.lang.t("profil(s) illisible(s) :", "unreadable profile(s):"),
+                failures.join("; ")
+            ));
         }
     }
 
@@ -438,7 +382,11 @@ impl App {
                 self.client = Some(client);
                 self.send(Request::GetState);
             }
-            Err(e) => self.error(format!("cannot connect to {}: {e}", path.display())),
+            Err(e) => self.error(format!(
+                "{} {}: {e}",
+                self.lang.t("connexion impossible à", "cannot connect to"),
+                path.display()
+            )),
         }
     }
 
@@ -463,7 +411,7 @@ impl App {
                     }
                     self.error(format!("{e}"));
                 } else {
-                    self.error(format!("connection lost: {e}"));
+                    self.error(format!("{} {e}", self.lang.t("connexion perdue :", "connection lost:")));
                 }
                 self.disconnect();
                 self.last_scan = Instant::now() - SCAN;
@@ -479,7 +427,7 @@ impl App {
     /// previous look's tweaks would otherwise leak into it.
     fn apply_profile(&mut self, p: &profile::Profile) {
         if self.client.is_none() {
-            self.error("no process connected");
+            self.error(self.lang.t("aucun jeu connecté", "no game connected"));
             return;
         }
         self.chain = p.presets.iter().map(|s| ChainEntry { path: PathBuf::from(s), enabled: true }).collect();
@@ -491,7 +439,7 @@ impl App {
         self.send(Request::SetSubframes { subframes: p.subframes, black: p.subframe_black });
         self.source = Some(SourceEdit::from(&p.source));
         self.pending_params = Some(p.params.clone());
-        self.info(format!("profile \"{}\" applied", p.name));
+        self.info(format!("{} « {} »", self.lang.t("profil appliqué :", "profile applied:"), p.name));
     }
 
     fn tick(&mut self) {
@@ -519,57 +467,85 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
         ui.horizontal(|ui| {
             ui.strong("vkSlang");
             ui.separator();
             let current = self
                 .selected
                 .and_then(|pid| self.targets.iter().find(|t| t.pid == pid))
-                .map_or("no process".to_string(), |t| t.label.clone());
+                .map_or(l.t("aucun jeu", "no game").to_string(), |t| t.label.clone());
             let mut choice = self.selected;
             let hidden = self.targets.iter().filter(|t| !t.active).count();
             let show_all = self.show_all;
             egui::ComboBox::from_id_salt("target").selected_text(current).width(220.0).show_ui(ui, |ui| {
                 for t in self.targets.iter().filter(|t| t.active || show_all) {
-                    let label = if t.active { t.label.clone() } else { format!("{} (no swapchain)", t.label) };
+                    let label = if t.active {
+                        t.label.clone()
+                    } else {
+                        format!("{} ({})", t.label, l.t("rien à l'écran", "nothing on screen"))
+                    };
                     ui.selectable_value(&mut choice, Some(t.pid), label);
                 }
             });
             if hidden > 0 {
-                ui.checkbox(&mut self.show_all, format!("+{hidden} idle"))
-                    .on_hover_text("Also list processes that load the layer but present no swapchain (gamescope…)");
+                ui.checkbox(&mut self.show_all, format!("+{hidden} {}", l.t("inactifs", "idle"))).on_hover_text(l.t(
+                    "Aussi les programmes qui chargent vkSlang sans rien afficher (gamescope sans --backend sdl…)",
+                    "Also programs that load vkSlang but show nothing (gamescope without --backend sdl…)",
+                ));
             }
             if choice != self.selected {
                 if let Some(pid) = choice {
                     self.select(pid);
                 }
             }
-            if ui.button("⟳").on_hover_text("Rescan processes").clicked() {
+            if ui.button("⟳").on_hover_text(l.t("Chercher les jeux", "Look for games")).clicked() {
                 self.scan_targets();
             }
-
             if let Some(mut enabled) = self.state.as_ref().map(|s| s.enabled) {
-                if ui.checkbox(&mut enabled, "Shader enabled").changed() {
+                if ui
+                    .checkbox(&mut enabled, l.t("Shader actif", "Shader on"))
+                    .on_hover_text(l.t("Comparer avec et sans", "Compare with and without"))
+                    .changed()
+                {
                     self.send(Request::SetEnabled { enabled });
                 }
             }
-            if let Some(state) = &self.state {
-                if state.loading {
-                    ui.spinner();
-                    ui.label("compiling…");
-                }
-                let outputs: Vec<String> = state
-                    .outputs
-                    .iter()
-                    .map(|o| format!("{}×{} {}", o.size[0], o.size[1], o.color_space.label()))
-                    .collect();
-                if !outputs.is_empty() {
-                    ui.weak(format!("output {}", outputs.join(", ")));
-                }
+            if self.state.as_ref().is_some_and(|s| s.loading) {
+                ui.spinner();
+                ui.label(l.t("compilation…", "compiling…"));
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut lang = self.lang;
+                ui.selectable_value(&mut lang, i18n::Lang::En, "EN");
+                ui.selectable_value(&mut lang, i18n::Lang::Fr, "FR");
+                if lang != self.lang {
+                    self.lang = lang;
+                    i18n::Prefs { lang }.save();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.client.is_some(),
+                        egui::Button::new(
+                            egui::RichText::new(l.t("🎯 Configurer ce jeu", "🎯 Set up this game")).strong(),
+                        ),
+                    )
+                    .on_hover_text(l.t(
+                        "Pas à pas : zone du jeu, pixels, forme, shader, profil",
+                        "Step by step: game zone, pixels, shape, shader, profile",
+                    ))
+                    .clicked()
+                {
+                    self.open_wizard();
+                }
+            });
         });
         if let Some(error) = self.state.as_ref().and_then(|s| s.error.clone()) {
-            ui.colored_label(egui::Color32::LIGHT_RED, format!("Preset error: {error}"));
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                format!("{} {error}", l.t("Erreur du preset :", "Preset error:")),
+            );
         }
         if let Some((msg, is_error)) = self.message.clone() {
             let color = if is_error { egui::Color32::LIGHT_RED } else { egui::Color32::LIGHT_GREEN };
@@ -586,14 +562,15 @@ impl App {
     }
 
     fn preset_browser(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Presets");
+        let l = self.lang;
+        ui.heading(l.t("Presets", "Presets"));
         ui.horizontal(|ui| {
-            ui.label("Folder");
+            ui.label(l.t("Dossier", "Folder"));
             ui.add(egui::TextEdit::singleline(&mut self.shader_root).desired_width(f32::INFINITY));
         });
         ui.add(
             egui::TextEdit::singleline(&mut self.preset_filter)
-                .hint_text("Search (e.g. crt royale)")
+                .hint_text(l.t("Rechercher (ex. crt royale)", "Search (e.g. crt royale)"))
                 .desired_width(f32::INFINITY),
         );
         let words: Vec<String> = self.preset_filter.to_lowercase().split_whitespace().map(String::from).collect();
@@ -608,9 +585,9 @@ impl App {
         if !chain.is_empty() {
             ui.separator();
             ui.horizontal(|ui| {
-                ui.strong(format!("Chain ({})", chain.len()));
-                apply_chain = ui.button("Apply").clicked();
-                if ui.button("Clear").clicked() {
+                ui.strong(format!("{} ({})", l.t("Chaîne", "Chain"), chain.len()));
+                apply_chain = ui.button(l.t("Appliquer", "Apply")).clicked();
+                if ui.button(l.t("Vider", "Clear")).clicked() {
                     chain.clear();
                 }
             });
@@ -623,7 +600,10 @@ impl App {
                     ui.weak(format!("{}.", i + 1));
                     // Switching one off leaves the others, and their
                     // parameters, exactly as they are.
-                    toggled |= ui.checkbox(&mut entry.enabled, "").on_hover_text("Run this one in the chain").changed();
+                    toggled |= ui
+                        .checkbox(&mut entry.enabled, "")
+                        .on_hover_text(l.t("Activer celui-ci dans la chaîne", "Run this one in the chain"))
+                        .changed();
                     if ui.small_button("↑").clicked() && i > 0 {
                         swap = Some((i - 1, i));
                     }
@@ -654,12 +634,12 @@ impl App {
         }
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            draw_tree(ui, &self.tree, &words, &root, &running, &mut clicked, &mut chain);
+            draw_tree(ui, &self.tree, &words, &root, &running, &mut clicked, &mut chain, l);
         });
         self.chain = chain;
 
         if self.client.is_none() && (clicked.is_some() || apply_chain) {
-            self.error("no process connected");
+            self.error(l.t("aucun jeu connecté", "no game connected"));
         } else if let Some(path) = clicked {
             // A plain click runs that preset on its own.
             self.chain = vec![ChainEntry { path: path.clone(), enabled: true }];
@@ -678,28 +658,38 @@ impl App {
     }
 
     fn source_panel(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
         let mut changed = false;
-        let mut open_grid = false;
         if let Some(o) = self.state.as_ref().and_then(|s| s.outputs.first()).cloned() {
             let ([w, h], [pw, ph], [iw, ih]) = (o.size, o.picture, o.input);
-            let picture = if [pw, ph] == [w, h] { String::new() } else { format!("picture {pw}×{ph}, ") };
-            ui.weak(format!("base {w}×{h}, {picture}input {iw}×{ih}, output {w}×{h}"));
+            let picture =
+                if [pw, ph] == [w, h] { String::new() } else { format!("{} {pw}×{ph}, ", l.t("image", "picture")) };
+            ui.weak(format!(
+                "{} {w}×{h}, {picture}{} {iw}×{ih}",
+                l.t("écran", "screen"),
+                l.t("entrée du shader", "shader input")
+            ));
         }
         let output_size = self.state.as_ref().and_then(|s| s.outputs.first()).map(|o| o.size);
         let Some(edit) = self.source.as_mut() else { return };
         ui.horizontal_wrapped(|ui| {
-            ui.label("Source resolution");
+            ui.label(l.t("Résolution source", "Source resolution"));
             let native = matches!(edit.mode, SourceSize::Native);
             let divide = matches!(edit.mode, SourceSize::Divide { .. });
-            if ui.selectable_label(native, "native").clicked() && !native {
+            if ui.selectable_label(native, l.t("native", "native")).clicked() && !native {
                 edit.mode = SourceSize::Native;
                 changed = true;
             }
-            if ui.selectable_label(divide, "divide").on_hover_text("Native size divided by N").clicked() && !divide {
+            if ui
+                .selectable_label(divide, l.t("divisée", "divide"))
+                .on_hover_text(l.t("Taille native divisée par N", "Native size divided by N"))
+                .clicked()
+                && !divide
+            {
                 edit.mode = SourceSize::Divide { by: edit.divisor };
                 changed = true;
             }
-            if ui.selectable_label(!native && !divide, "fixed").clicked() && (native || divide) {
+            if ui.selectable_label(!native && !divide, l.t("fixe", "fixed")).clicked() && (native || divide) {
                 edit.mode = SourceSize::Fixed { size: [edit.width, edit.height] };
                 changed = true;
             }
@@ -742,12 +732,14 @@ impl App {
         });
         if matches!(edit.mode, SourceSize::Divide { .. }) {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Find the divisor:").on_hover_text(
+                ui.label(l.t("Trouver le diviseur :", "Find the divisor:")).on_hover_text(l.t(
+                    "Pixels d'écran par pixel du jeu, d'après les résolutions de l'écran et du jeu. \
+                     En échelle entière, chaque pixel du jeu couvre un nombre entier de pixels d'écran.",
                     "Screen pixels per game pixel, from the screen and game resolutions. \
                      With integer scaling each game pixel covers a whole number of screen pixels.",
-                );
+                ));
                 let mut screen = edit.calc_screen.or(output_size).unwrap_or([3840, 2160]);
-                ui.label("screen");
+                ui.label(l.t("écran", "screen"));
                 let mut edited = ui.add(egui::DragValue::new(&mut screen[0]).range(1..=7680)).changed();
                 ui.label("×");
                 edited |= ui.add(egui::DragValue::new(&mut screen[1]).range(1..=4320)).changed();
@@ -756,20 +748,23 @@ impl App {
                 }
                 if edit.calc_screen.is_some()
                     && output_size.is_some()
-                    && ui.small_button("↺").on_hover_text("Back to the output size").clicked()
+                    && ui
+                        .small_button("↺")
+                        .on_hover_text(l.t("Revenir à la taille de sortie", "Back to the output size"))
+                        .clicked()
                 {
                     edit.calc_screen = None;
                 }
-                ui.label("game");
+                ui.label(l.t("jeu", "game"));
                 ui.add(egui::DragValue::new(&mut edit.calc_game[0]).range(1..=7680));
                 ui.label("×");
                 ui.add(egui::DragValue::new(&mut edit.calc_game[1]).range(1..=4320));
-                ui.checkbox(&mut edit.calc_integer, "integer scale");
+                ui.checkbox(&mut edit.calc_integer, l.t("échelle entière", "integer scale"));
                 let by = game_scale(screen, edit.calc_game, edit.calc_integer);
                 let [x, y, w, h] = game_rect(screen, edit.calc_game, edit.calc_integer);
                 if ui
-                    .button(format!("use ÷{}", (by * 100.0).round() / 100.0))
-                    .on_hover_text(format!("The game is shown {w}×{h} on the screen"))
+                    .button(format!("{} ÷{}", l.t("utiliser", "use"), (by * 100.0).round() / 100.0))
+                    .on_hover_text(format!("{} {w}×{h}", l.t("Le jeu est affiché en", "The game is shown at")))
                     .clicked()
                 {
                     edit.divisor = by;
@@ -777,11 +772,14 @@ impl App {
                     changed = true;
                 }
                 if ui
-                    .button("frame the game")
+                    .button(l.t("cadrer le jeu", "frame the game"))
                     .on_hover_text(format!(
-                        "Read and draw only where the game is, {w}×{h} at {x},{y}, divided by {}: the preset sees \
-                         exactly the game's pixels, and leaves the bars around it black. Resets both scales.",
-                        (by * 100.0).round() / 100.0
+                        "{w}×{h} @ {x},{y}, ÷{} — {}",
+                        (by * 100.0).round() / 100.0,
+                        l.t(
+                            "Lire et dessiner seulement là où est le jeu : le preset voit exactement ses pixels.",
+                            "Read and draw only where the game is: the preset sees exactly its pixels.",
+                        )
                     ))
                     .clicked()
                 {
@@ -799,10 +797,12 @@ impl App {
             });
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label("Picture scale").on_hover_text(
+            ui.label(l.t("Échelle de l'image", "Picture scale")).on_hover_text(l.t(
+                "Taille de l'image dans la zone : une région plus petite est lue, l'image grandit \
+                 et le preset garde les mêmes scanlines et le même masque (×2 en vertical, par exemple)",
                 "Size of the picture inside that area: a smaller region is read, so the picture grows \
                  while the preset keeps the same scanlines and mask (×2 vertically, for instance)",
-            );
+            ));
             let mut moved: Option<usize> = None;
             for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
                 if ui
@@ -827,7 +827,9 @@ impl App {
             }
             if ui
                 .checkbox(&mut edit.source_locked, "lock")
-                .on_hover_text("Keep the current ratio between the two axes")
+                .on_hover_text(
+                    l.t("Garder le rapport actuel entre les deux axes", "Keep the current ratio between the two axes"),
+                )
                 .changed()
                 && edit.source_locked
             {
@@ -841,19 +843,19 @@ impl App {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label("Duplicate pixels")
-                .on_hover_text("Repeat each source pixel, for modes whose pixels are not square (DOS 320×200: ↕ 2 gives the preset 400 real lines)");
+            ui.label(l.t("Dupliquer les pixels", "Duplicate pixels"))
+                .on_hover_text(l.t("Répète chaque pixel source, pour les modes aux pixels non carrés (DOS 320×200 : ↕ 2 donne 400 vraies lignes au preset)", "Repeat each source pixel, for modes whose pixels are not square (DOS 320×200: ↕ 2 gives the preset 400 real lines)"));
             for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
                 changed |= ui
                     .add(egui::DragValue::new(&mut edit.duplicate[axis]).range(1..=8).prefix(label))
                     .changed();
             }
             ui.separator();
-            ui.label("Filter");
-            changed |= ui.selectable_value(&mut edit.filter, Filter::Nearest, "nearest").changed();
-            changed |= ui.selectable_value(&mut edit.filter, Filter::Linear, "linear").changed();
+            ui.label(l.t("Filtre", "Filter"));
+            changed |= ui.selectable_value(&mut edit.filter, Filter::Nearest, l.t("net", "nearest")).changed();
+            changed |= ui.selectable_value(&mut edit.filter, Filter::Linear, l.t("lissé", "linear")).changed();
             ui.separator();
-            ui.label("Picture area");
+            ui.label(l.t("Zone lue", "Picture area"));
             let r = ui.add(egui::TextEdit::singleline(&mut edit.rect).desired_width(110.0));
             changed |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             for preset in ["full", "4:3", "16:9"] {
@@ -862,14 +864,10 @@ impl App {
                     changed = true;
                 }
             }
-            ui.separator();
-            if ui.button("Pixel grid…").clicked() {
-                open_grid = true;
-            }
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label("Display area")
-                .on_hover_text("Where the preset draws. Different from the picture area it stretches the image: a 640×360 source drawn into a 4:3 area gives non-square pixels, scanlines stretched with it.");
+            ui.label(l.t("Zone dessinée", "Display area"))
+                .on_hover_text(l.t("Où le preset dessine. Différente de la zone lue, elle étire l'image : une source 640×360 dessinée en 4:3 donne des pixels non carrés, scanlines étirées avec.", "Where the preset draws. Different from the picture area it stretches the image: a 640×360 source drawn into a 4:3 area gives non-square pixels, scanlines stretched with it."));
             let r = ui.add(egui::TextEdit::singleline(&mut edit.display).desired_width(110.0));
             changed |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             for preset in ["full", "4:3", "16:9", "5:4"] {
@@ -885,9 +883,10 @@ impl App {
             // Two different things, kept apart on purpose: one moves the
             // drawn area (preset and picture together), the other moves the
             // picture inside it (the preset keeps its geometry).
-            ui.label("Area scale").on_hover_text(
+            ui.label(l.t("Échelle de la zone", "Area scale")).on_hover_text(l.t(
+                "Taille de la zone où dessine le preset : le preset et l'image grandissent ensemble",
                 "Size of the area the preset draws into: it carries the preset and the picture together",
-            );
+            ));
             let mut moved: Option<usize> = None;
             for (axis, label) in [(0usize, "↔"), (1usize, "↕")] {
                 if ui
@@ -913,14 +912,20 @@ impl App {
             }
             if ui
                 .checkbox(&mut edit.scale_locked, "lock")
-                .on_hover_text("Keep the current ratio between the two axes")
+                .on_hover_text(
+                    l.t("Garder le rapport actuel entre les deux axes", "Keep the current ratio between the two axes"),
+                )
                 .changed()
                 && edit.scale_locked
             {
                 edit.scale_ratio =
                     if edit.display_scale[0] > 0.0 { edit.display_scale[1] / edit.display_scale[0] } else { 1.0 };
             }
-            if ui.small_button("1:1").on_hover_text("Back to full size, square").clicked() {
+            if ui
+                .small_button("1:1")
+                .on_hover_text(l.t("Revenir à la pleine taille, carrée", "Back to full size, square"))
+                .clicked()
+            {
                 edit.display_scale = [1.0, 1.0];
                 edit.scale_ratio = 1.0;
                 changed = true;
@@ -930,14 +935,10 @@ impl App {
             let source = edit.to_settings();
             self.send(Request::SetSource { source });
         }
-        if open_grid {
-            self.grid_open = true;
-            self.grid_dup = self.source.as_ref().map_or([1, 1], |e| e.duplicate);
-            self.send(Request::Capture { max_width: 1280 });
-        }
     }
 
     fn hdr_panel(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
         let Some(state) = self.state.as_ref() else { return };
         let output = state.outputs.first().map(|o| o.color_space);
         let preset = state.preset_color_space;
@@ -947,8 +948,8 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label("HDR");
             for o in &state.outputs {
-                let promoted = if o.promoted { ", promoted by vkSlang" } else { "" };
-                ui.weak(format!("output {} ({}{})", o.color_space.label(), o.format, promoted));
+                let promoted = if o.promoted { l.t(", promue par vkSlang", ", promoted by vkSlang") } else { "" };
+                ui.weak(format!("{} {} ({}{})", l.t("sortie", "output"), o.color_space.label(), o.format, promoted));
             }
             if let Some(p) = preset {
                 ui.weak(format!("· preset {}", p.label()));
@@ -970,12 +971,14 @@ impl App {
                             .logarithmic(true)
                             .step_by(10.0)
                             .suffix(" nits")
-                            .text("Paper white"),
+                            .text(l.t("Blanc papier", "Paper white")),
                     )
-                    .on_hover_text("BrightnessNits: SDR reference white")
+                    .on_hover_text(
+                        l.t("BrightnessNits : blanc de référence SDR", "BrightnessNits: SDR reference white"),
+                    )
                     .changed();
                 ui.separator();
-                ui.label("Gamut");
+                ui.label(l.t("Gamut", "Gamut"));
                 for (i, name) in GAMUT_NAMES.iter().enumerate() {
                     changed |= ui.selectable_value(&mut hdr.expand_gamut, i as u32, *name).changed();
                 }
@@ -987,26 +990,32 @@ impl App {
     }
 
     fn presentation_panel(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
         let Some(state) = self.state.as_ref() else { return };
         let (mut subframes, mut black) = (state.subframes, state.subframe_black);
         let mut changed = false;
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("Presentations per frame");
+            ui.label(l.t("Présentations par image", "Presentations per frame"));
             let (source, presented) = (state.source_fps, state.present_fps);
             changed |= ui
                 .add(egui::Slider::new(&mut subframes, 1..=8).integer())
-                .on_hover_text(
+                .on_hover_text(l.t(
+                    "Présente chaque image plusieurs fois pour que les presets entrelacés alternent les trames \
+                     plus vite que le jeu. 3 convient à un jeu 60 Hz sur un écran 240 Hz.",
                     "Present each frame several times so interlacing presets alternate fields \
                      faster than the game draws. 3 suits a 60 Hz game on a 240 Hz display.",
-                )
+                ))
                 .changed();
             ui.weak(format!("· {source:.0} fps source, {presented:.0} presented/s"));
             ui.add_enabled_ui(subframes > 1, |ui| {
-                changed |= ui.selectable_value(&mut black, false, "preset").changed();
+                changed |= ui.selectable_value(&mut black, false, l.t("preset", "preset")).changed();
                 changed |= ui
-                    .selectable_value(&mut black, true, "black (BFI)")
-                    .on_hover_text("Insert black frames instead of running the preset again")
+                    .selectable_value(&mut black, true, l.t("noir (BFI)", "black (BFI)"))
+                    .on_hover_text(l.t(
+                        "Insère des images noires au lieu de relancer le preset",
+                        "Insert black frames instead of running the preset again",
+                    ))
                     .changed();
             });
         });
@@ -1016,14 +1025,19 @@ impl App {
     }
 
     fn params_panel(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
         let Some(state) = self.state.as_mut() else { return };
         ui.horizontal(|ui| {
-            ui.heading("Parameters");
-            ui.add(egui::TextEdit::singleline(&mut self.param_filter).hint_text("Filter").desired_width(160.0));
+            ui.heading(l.t("Paramètres", "Parameters"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.param_filter)
+                    .hint_text(l.t("Filtrer", "Filter"))
+                    .desired_width(160.0),
+            );
         });
         let filter = self.param_filter.to_lowercase();
         let mut requests = Vec::new();
-        if ui.button("Reset all").clicked() {
+        if ui.button(l.t("Tout réinitialiser", "Reset all")).clicked() {
             requests.push(Request::ResetParams);
         }
         // A vertical-only scroll area grows to its widest row, and a long
@@ -1035,7 +1049,7 @@ impl App {
             .max_height(ui.available_height().max(120.0))
             .show(ui, |ui| {
                 if state.params.is_empty() {
-                    ui.weak("This preset has no parameters.");
+                    ui.weak(l.t("Ce preset n'a pas de paramètres.", "This preset has no parameters."));
                 }
                 for p in &mut state.params {
                     let matches = filter.is_empty()
@@ -1065,7 +1079,9 @@ impl App {
                                 p.value = before;
                             }
                         }
-                        if p.is_modified() && ui.small_button("↺").on_hover_text("Preset value").clicked() {
+                        if p.is_modified()
+                            && ui.small_button("↺").on_hover_text(l.t("Valeur du preset", "Preset value")).clicked()
+                        {
                             p.value = p.initial;
                             requests.push(Request::SetParam { name: p.name.clone(), value: p.initial });
                         }
@@ -1081,26 +1097,32 @@ impl App {
     }
 
     fn profile_panel(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
         let Some(state) = self.state.clone() else { return };
         ui.horizontal_wrapped(|ui| {
-            ui.label("Profile");
-            ui.add(egui::TextEdit::singleline(&mut self.profile_name).hint_text("name").desired_width(160.0));
+            ui.label(l.t("Profil", "Profile"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.profile_name).hint_text(l.t("nom", "name")).desired_width(160.0),
+            );
             let named = !self.profile_name.trim().is_empty();
             if ui
-                .add_enabled(named, egui::Button::new("Save"))
-                .on_hover_text("Presets, parameters, resolution, areas, HDR and subframes")
+                .add_enabled(named, egui::Button::new(l.t("Enregistrer", "Save")))
+                .on_hover_text(l.t(
+                    "Presets, paramètres, résolution, zones, HDR et sous-images",
+                    "Presets, parameters, resolution, areas, HDR and subframes",
+                ))
                 .clicked()
             {
                 let p = profile::Profile::from_state(&self.profile_name, &state);
                 match profile::save(&p) {
                     Ok(path) => {
-                        self.info(format!("saved {}", path.display()));
+                        self.info(format!("{} {}", l.t("enregistré :", "saved"), path.display()));
                         self.reload_profiles();
                     }
-                    Err(e) => self.error(format!("save failed: {e}")),
+                    Err(e) => self.error(format!("{} {e}", l.t("échec de l'enregistrement :", "save failed:"))),
                 }
             }
-            if ui.button("⟳").on_hover_text("Rescan profiles").clicked() {
+            if ui.button("⟳").on_hover_text(l.t("Relire les profils", "Rescan profiles")).clicked() {
                 self.reload_profiles();
             }
         });
@@ -1122,7 +1144,7 @@ impl App {
         let mut set_default: Option<Option<profile::Profile>> = None;
         ui.horizontal_wrapped(|ui| {
             if profiles.is_empty() {
-                ui.weak("No profile saved yet.");
+                ui.weak(l.t("Aucun profil pour l'instant.", "No profile saved yet."));
             }
             for p in &profiles {
                 let running = state.presets == p.presets;
@@ -1136,17 +1158,30 @@ impl App {
                 let is_default = default_profile == Some(p.name.clone());
                 if ui
                     .small_button(if is_default { "★" } else { "☆" })
-                    .on_hover_text(format!("Load {} automatically for {}", p.name, state.process))
+                    .on_hover_text(format!(
+                        "{} {} › {}",
+                        l.t("Charger automatiquement", "Load automatically"),
+                        p.name,
+                        state.process
+                    ))
                     .clicked()
                 {
                     set_default = Some(if is_default { None } else { Some(p.clone()) });
                 }
                 if confirm_delete.as_deref() == Some(p.name.as_str()) {
-                    if ui.small_button("delete").on_hover_text(format!("Delete {} for good", p.name)).clicked() {
+                    if ui
+                        .small_button(l.t("supprimer", "delete"))
+                        .on_hover_text(format!("{} {}", l.t("Supprimer définitivement", "Delete for good"), p.name))
+                        .clicked()
+                    {
                         delete = Some(p.clone());
                     }
-                    keep |= ui.small_button("keep").clicked();
-                } else if ui.small_button("🗙").on_hover_text(format!("Delete {}", p.name)).clicked() {
+                    keep |= ui.small_button(l.t("garder", "keep")).clicked();
+                } else if ui
+                    .small_button("🗙")
+                    .on_hover_text(format!("{} {}", l.t("Supprimer", "Delete"), p.name))
+                    .clicked()
+                {
                     ask_delete = Some(p.name.clone());
                 }
                 ui.separator();
@@ -1167,58 +1202,76 @@ impl App {
             self.default_profile = None;
             match save::set_default_profile(&state.process, name.as_deref()) {
                 Ok(()) => self.info(match &name {
-                    Some(n) => format!("{n} will load automatically for {}", state.process),
-                    None => format!("no profile loads automatically for {} any more", state.process),
+                    Some(n) => {
+                        format!("{n} › {} ({})", state.process, l.t("chargement automatique", "loads automatically"))
+                    }
+                    None => format!(
+                        "{}: {}",
+                        state.process,
+                        l.t("plus de profil automatique", "no automatic profile any more")
+                    ),
                 }),
-                Err(e) => self.error(format!("could not update vkSlang.conf: {e}")),
+                Err(e) => self.error(format!("vkSlang.conf: {e}")),
             }
         }
         if let Some(p) = delete {
             self.confirm_delete = None;
             match profile::delete(&p) {
                 Ok(()) => {
-                    self.info(format!("deleted {}", p.name));
+                    self.info(format!("{} {}", l.t("supprimé :", "deleted"), p.name));
                     self.reload_profiles();
                 }
-                Err(e) => self.error(format!("delete failed: {e}")),
+                Err(e) => self.error(format!("{} {e}", l.t("échec de la suppression :", "delete failed:"))),
             }
         }
     }
 
     fn save_panel(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
         let Some(state) = self.state.clone() else { return };
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label("Preset");
+            ui.label(l.t("Preset", "Preset"));
             ui.add(
                 egui::TextEdit::singleline(&mut self.save_path)
                     .desired_width((ui.available_width() - 260.0).max(120.0)),
             );
             let single = state.presets.len() == 1;
             if ui
-                .add_enabled(single, egui::Button::new("Save .slangp"))
+                .add_enabled(single, egui::Button::new(l.t("Exporter en .slangp", "Save .slangp")))
                 .on_hover_text(if single {
-                    "#reference + changed parameters (RetroArch compatible)"
+                    l.t(
+                        "#reference + paramètres modifiés (compatible RetroArch)",
+                        "#reference + changed parameters (RetroArch compatible)",
+                    )
                 } else {
-                    "A .slangp references a single preset; save a profile to keep a chain"
+                    l.t(
+                        "Un .slangp référence un seul preset ; enregistre un profil pour garder une chaîne",
+                        "A .slangp references a single preset; save a profile to keep a chain",
+                    )
                 })
                 .clicked()
             {
                 let path = PathBuf::from(&self.save_path);
                 match save::save_slangp(&state, &path) {
-                    Ok(()) => self.info(format!("saved {}", path.display())),
-                    Err(e) => self.error(format!("save failed: {e}")),
+                    Ok(()) => self.info(format!("{} {}", l.t("enregistré :", "saved"), path.display())),
+                    Err(e) => self.error(format!("{} {e}", l.t("échec de l'enregistrement :", "save failed:"))),
                 }
             }
             let global = format!(
-                "Writes this look into {}, where it applies to every game the layer runs in. \
-                 For one game, save a profile and star it instead.",
+                "{} {}",
+                l.t(
+                    "S'applique à TOUS les jeux où tourne vkSlang (gamescope compris). Pour un seul jeu, \
+                     enregistre plutôt un profil et coche ☆. Fichier :",
+                    "Applies to EVERY game vkSlang runs in (gamescope included). For one game, save a \
+                     profile and star it instead. File:",
+                ),
                 save::config_path().display()
             );
-            if ui.button("Save for all games").on_hover_text(global).clicked() {
+            if ui.button(l.t("Enregistrer pour tous les jeux", "Save for all games")).on_hover_text(global).clicked() {
                 match save::save_config(&state) {
-                    Ok(path) => self.info(format!("updated {}", path.display())),
-                    Err(e) => self.error(format!("save failed: {e}")),
+                    Ok(path) => self.info(format!("{} {}", l.t("mis à jour :", "updated"), path.display())),
+                    Err(e) => self.error(format!("{} {e}", l.t("échec de l'enregistrement :", "save failed:"))),
                 }
             }
         });
@@ -1236,6 +1289,7 @@ fn draw_tree(
     running: &[String],
     clicked: &mut Option<PathBuf>,
     chain: &mut Vec<ChainEntry>,
+    l: i18n::Lang,
 ) {
     let searching = !words.is_empty();
     for (name, folder) in &tree.folders {
@@ -1246,7 +1300,7 @@ fn draw_tree(
             .id_salt(name)
             .default_open(searching)
             .open(searching.then_some(true))
-            .show(ui, |ui| draw_tree(ui, folder, words, root, running, clicked, chain));
+            .show(ui, |ui| draw_tree(ui, folder, words, root, running, clicked, chain, l));
     }
     for (name, rel) in &tree.presets {
         if searching {
@@ -1260,7 +1314,7 @@ fn draw_tree(
         ui.horizontal(|ui| {
             // Ticking several presets chains them, in ticking order.
             let mut ticked = chain.iter().any(|e| e.path == abs);
-            if ui.checkbox(&mut ticked, "").on_hover_text("Add to the chain").changed() {
+            if ui.checkbox(&mut ticked, "").on_hover_text(l.t("Ajouter à la chaîne", "Add to the chain")).changed() {
                 if ticked {
                     chain.push(ChainEntry { path: abs.clone(), enabled: true });
                 } else {
@@ -1275,338 +1329,107 @@ fn draw_tree(
 }
 
 impl App {
-    /// Assistant: overlay a grid on a capture of the game to read off its
-    /// pixel size, and turn that into a source resolution.
-    fn pixel_grid_window(&mut self, ctx: &egui::Context) {
-        if !self.grid_open {
-            return;
-        }
-        // Pick up a new capture as soon as the layer publishes one.
-        if let Some(capture) = self.state.as_ref().and_then(|s| s.capture.clone()) {
-            if self.grid_texture.as_ref().is_none_or(|g| g.id != capture.id) {
-                if let Some((image, size)) = load_capture(Path::new(&capture.path)) {
-                    let texture = ctx.load_texture("vkslang-capture", image, egui::TextureOptions::NEAREST);
-                    // The frame starts on the current picture area, in
-                    // captured-image coordinates.
-                    let scale = size[0] as f32 / capture.base[0] as f32;
-                    let [ax, ay, aw, ah] = capture.area.map(|v| v as f32 * scale);
-                    self.frame_rect = egui::Rect::from_min_size(egui::pos2(ax, ay), egui::vec2(aw, ah));
-                    self.grid_texture =
-                        Some(GridImage { id: capture.id, texture, size, base: capture.base, area: capture.area });
-                }
-            }
-        }
+    /// Shown until a game is connected.
+    fn welcome(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        ui.add_space(24.0);
+        ui.heading(l.t("Aucun jeu connecté", "No game connected"));
+        ui.add_space(8.0);
+        ui.label(l.t(
+            "Lance un jeu avec vkSlang, il apparaîtra ici tout seul :",
+            "Start a game with vkSlang, it shows up here by itself:",
+        ));
+        ui.code("ENABLE_VKSLANG=1 VKSLANG_PRESET=/…/crt-easymode.slangp %command%");
+        ui.add_space(8.0);
+        ui.label(l.t(
+            "Avec gamescope (jeux 32 bits, OpenGL, SDL…), le shader s'applique à sa sortie :",
+            "With gamescope (32-bit, OpenGL, SDL games…), the shader applies to its output:",
+        ));
+        ui.code("ENABLE_VKSLANG=1 VKSLANG_PROCESS=gamescope gamescope --backend sdl -f -- %command%");
+        ui.add_space(8.0);
+        ui.weak(l.t(
+            "Il faut un preset au lancement : dans la commande, dans vkSlang.conf, ou par un profil ★.",
+            "A preset is needed at startup: in the command, in vkSlang.conf, or through a ★ profile.",
+        ));
+        ui.weak(format!("{}: {}", l.t("Sockets", "Sockets"), vkslang_ipc::socket_dir().display()));
+    }
 
-        // Nothing to show yet: ask for a picture, retrying at most every
-        // two seconds.
-        let mut open = self.grid_open;
-        let stale = self.grid_requested.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
-        let mut request_capture = self.grid_texture.is_none() && stale;
-        let mut apply: Option<SourceSize> = None;
-        let mut apply_rect: Option<String> = None;
-        let mut apply_final: Option<([u32; 2], [u32; 2], String)> = None;
-        egui::Window::new("Pixel grid").open(&mut open).default_size([760.0, 560.0]).show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                request_capture |= ui.button("Capture the picture").clicked();
-                ui.add(egui::Slider::new(&mut self.grid_zoom, 1.0..=8.0).text("zoom"));
-                ui.separator();
-                ui.selectable_value(&mut self.frame_mode, false, "measure");
-                ui.selectable_value(&mut self.frame_mode, true, "frame the picture");
-            });
-            if self.frame_mode {
-                ui.weak("Drag the frame to enclose the picture: inside to move it, near an edge to resize.");
-            } else {
-                ui.weak("Align the grid with the game's pixels: drag the image to shift it, adjust the size until the lines follow the blocks.");
-            }
-
-            let Some(grid) = self.grid_texture.as_ref() else {
-                ui.label("No capture yet.");
-                return;
-            };
-            // What one captured pixel is worth on the real output.
-            let scale = egui::vec2(
-                grid.base[0] as f32 / grid.size[0] as f32,
-                grid.base[1] as f32 / grid.size[1] as f32,
-            );
-            let cell_output = self.grid_cell * scale;
-
-            // Measured inside the picture area, not the whole image.
-            let area = egui::vec2(grid.area[2] as f32, grid.area[3] as f32);
-            let native = [
-                (area.x / cell_output.x).round().max(1.0),
-                (area.y / cell_output.y).round().max(1.0),
-            ];
-
-            if !self.frame_mode {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Pixel");
-                    let before = self.grid_cell;
-                    ui.add(egui::Slider::new(&mut self.grid_cell.x, 1.0..=64.0).step_by(0.05).text("↔"));
-                    ui.add(egui::Slider::new(&mut self.grid_cell.y, 1.0..=64.0).step_by(0.05).text("↕"));
-                    if self.grid_lock && before != self.grid_cell {
-                        // Keep the ratio they had, whichever one moved.
-                        if before.x != self.grid_cell.x {
-                            self.grid_cell.y = (before.y * self.grid_cell.x / before.x).clamp(1.0, 64.0);
-                        } else {
-                            self.grid_cell.x = (before.x * self.grid_cell.y / before.y).clamp(1.0, 64.0);
-                        }
-                    }
-                    ui.checkbox(&mut self.grid_lock, "lock").on_hover_text("Keep the current ratio between width and height");
-                    if ui.small_button("square").clicked() {
-                        self.grid_cell.y = self.grid_cell.x;
-                    }
+    /// One line on what reaches the screen.
+    fn status_line(&self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        let Some(state) = &self.state else { return };
+        ui.horizontal_wrapped(|ui| {
+            let running = state
+                .presets
+                .iter()
+                .map(|p| Path::new(p).file_stem().map_or(p.clone(), |s| s.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            ui.strong(if running.is_empty() { l.t("(aucun preset)", "(no preset)").to_string() } else { running });
+            if let Some(o) = state.outputs.first() {
+                let [w, h] = o.size;
+                let [iw, ih] = o.input;
+                ui.weak(match l {
+                    i18n::Lang::Fr => format!("· écran {w}×{h} · le shader reçoit {iw}×{ih}"),
+                    i18n::Lang::En => format!("· screen {w}×{h} · the shader gets {iw}×{ih}"),
                 });
             }
-            let measured = [native[0] as u32, native[1] as u32];
-            let [dx, dy] = self.grid_dup;
-            let shape = final_shape(measured, self.grid_dup);
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("{} × {}", measured[0], measured[1]));
-                ui.weak(format!(
-                    "game pixels of {:.2}×{:.2} output pixels, picture {}×{}",
-                    cell_output.x, cell_output.y, grid.area[2], grid.area[3]
-                ));
-                if self.frame_mode {
-                    let area = frame_to_area(self.frame_rect, grid.size, grid.base);
-                    ui.strong(area.clone());
-                    if ui.button("Use as picture area").clicked() {
-                        apply_rect = Some(area);
-                    }
-                    if ui.button("Whole image").clicked() {
-                        self.frame_rect = egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(grid.size[0] as f32, grid.size[1] as f32),
-                        );
-                        apply_rect = Some("full".into());
-                    }
-                    return;
-                }
-                if (cell_output.x - cell_output.y).abs() < 0.01
-                    && ui
-                        .add(egui::Button::new(format!("Use as ÷{:.2}", cell_output.x)))
-                        .on_hover_text("Resolution only; keeps the ratio if the output resolution changes")
-                        .clicked()
-                {
-                    apply = Some(SourceSize::Divide { by: cell_output.x });
-                }
-                if ui.button("Use as fixed resolution").on_hover_text("Resolution only, areas untouched").clicked() {
-                    apply = Some(SourceSize::Fixed { size: measured });
-                }
-            });
-            if !self.frame_mode {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Duplicate").on_hover_text(
-                        "Repeat each game pixel: ↕ 2 turns every line into two, so the picture really gets \
-                         twice as tall, and the preset gets the repeated lines",
-                    );
-                    ui.add(egui::DragValue::new(&mut self.grid_dup[0]).range(1..=8).prefix("↔"));
-                    ui.add(egui::DragValue::new(&mut self.grid_dup[1]).range(1..=8).prefix("↕"));
-                    ui.separator();
-                    ui.strong(format!("→ {}×{}, drawn {shape}", measured[0] * dx, measured[1] * dy));
-                    if ui
-                        .button("Apply")
-                        .on_hover_text(format!(
-                            "Source {}×{}, duplicated {dx}×{dy}, display area {shape}: what the preview shows",
-                            measured[0], measured[1]
-                        ))
-                        .clicked()
-                    {
-                        apply_final = Some((measured, self.grid_dup, shape.clone()));
-                    }
-                });
-                // The final shape, exactly as it will be drawn.
-                let [ax, ay, aw, ah] = grid.area.map(|v| v.max(0) as f32);
-                let uv = egui::Rect::from_min_max(
-                    egui::pos2(ax / grid.base[0] as f32, ay / grid.base[1] as f32),
-                    egui::pos2((ax + aw) / grid.base[0] as f32, (ay + ah) / grid.base[1] as f32),
-                );
-                let ratio = (measured[0] * dx) as f32 / (measured[1] * dy).max(1) as f32;
-                let height = 180.0;
-                ui.horizontal(|ui| {
-                    ui.weak("result");
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(height * ratio, height), egui::Sense::hover());
-                    ui.painter().image(grid.texture.id(), rect, uv, egui::Color32::WHITE);
-                });
-            }
-
-            egui::ScrollArea::both().show(ui, |ui| {
-                let zoom = self.grid_zoom;
-                let size = egui::vec2(grid.size[0] as f32 * zoom, grid.size[1] as f32 * zoom);
-                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
-                if response.dragged() {
-                    self.grid_offset += response.drag_delta() / zoom;
-                }
-                let painter = ui.painter_at(rect);
-                painter.image(
-                    grid.texture.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-                if self.frame_mode {
-                    // Frame in screen coordinates.
-                    let to_screen = |p: egui::Pos2| rect.min + p.to_vec2() * zoom;
-                    let frame = egui::Rect::from_min_max(
-                        to_screen(self.frame_rect.min),
-                        to_screen(self.frame_rect.max),
-                    );
-                    // Everything outside the frame is dimmed.
-                    let shade = egui::Color32::from_black_alpha(140);
-                    for outside in [
-                        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), frame.top())),
-                        egui::Rect::from_min_max(egui::pos2(rect.left(), frame.bottom()), rect.max),
-                        egui::Rect::from_min_max(
-                            egui::pos2(rect.left(), frame.top()),
-                            egui::pos2(frame.left(), frame.bottom()),
-                        ),
-                        egui::Rect::from_min_max(
-                            egui::pos2(frame.right(), frame.top()),
-                            egui::pos2(rect.right(), frame.bottom()),
-                        ),
-                    ] {
-                        painter.rect_filled(outside, 0.0, shade);
-                    }
-                    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 170, 60));
-                    painter.rect_stroke(frame, 0.0, stroke, egui::StrokeKind::Middle);
-                    for corner in
-                        [frame.left_top(), frame.right_top(), frame.left_bottom(), frame.right_bottom()]
-                    {
-                        painter.circle_filled(corner, 4.0, stroke.color);
-                    }
-
-                    // Edges under the pointer decide what a drag resizes.
-                    let margin = 10.0;
-                    if response.drag_started() {
-                        let p = response.interact_pointer_pos().unwrap_or(frame.center());
-                        self.frame_drag = Some([
-                            (p.x - frame.left()).abs() < margin,
-                            (p.y - frame.top()).abs() < margin,
-                            (p.x - frame.right()).abs() < margin,
-                            (p.y - frame.bottom()).abs() < margin,
-                        ]);
-                    }
-                    if response.dragged() {
-                        let delta = response.drag_delta() / zoom;
-                        let edges = self.frame_drag.unwrap_or([false; 4]);
-                        let mut r = self.frame_rect;
-                        if edges == [false; 4] {
-                            r = r.translate(delta);
-                        } else {
-                            if edges[0] {
-                                r.min.x += delta.x;
-                            }
-                            if edges[1] {
-                                r.min.y += delta.y;
-                            }
-                            if edges[2] {
-                                r.max.x += delta.x;
-                            }
-                            if edges[3] {
-                                r.max.y += delta.y;
-                            }
-                        }
-                        // Keep it inside the image and never inside out.
-                        let (w, h) = (grid.size[0] as f32, grid.size[1] as f32);
-                        r.min.x = r.min.x.clamp(0.0, w - 8.0);
-                        r.min.y = r.min.y.clamp(0.0, h - 8.0);
-                        r.max.x = r.max.x.clamp(r.min.x + 8.0, w);
-                        r.max.y = r.max.y.clamp(r.min.y + 8.0, h);
-                        self.frame_rect = r;
-                    }
-                    if response.drag_stopped() {
-                        self.frame_drag = None;
-                    }
-                    return;
-                }
-
-                let step = self.grid_cell * zoom;
-                if step.min_elem() >= 2.0 {
-                    let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 80, 80, 180));
-                    let (ox, oy) = (
-                        self.grid_offset.x.rem_euclid(self.grid_cell.x) * zoom,
-                        self.grid_offset.y.rem_euclid(self.grid_cell.y) * zoom,
-                    );
-                    let mut x = rect.left() + ox;
-                    while x <= rect.right() {
-                        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
-                        x += step.x;
-                    }
-                    let mut y = rect.top() + oy;
-                    while y <= rect.bottom() {
-                        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
-                        y += step.y;
-                    }
-                }
+            ui.weak(match l {
+                i18n::Lang::Fr => format!("· {:.0} i/s", state.source_fps),
+                i18n::Lang::En => format!("· {:.0} fps", state.source_fps),
             });
         });
-        self.grid_open = open;
-        if request_capture {
-            self.grid_requested = Some(Instant::now());
-            self.send(Request::Capture { max_width: 1280 });
-        }
-        if let Some(res) = apply {
-            if let Some(edit) = self.source.as_mut() {
-                edit.mode = res;
-                let source = edit.to_settings();
-                self.send(Request::SetSource { source });
-            }
-        }
-        if let Some((size, dup, shape)) = apply_final {
-            if let Some(edit) = self.source.as_mut() {
-                edit.mode = SourceSize::Fixed { size };
-                (edit.width, edit.height) = (size[0], size[1]);
-                edit.duplicate = dup;
-                edit.display = shape;
-                let source = edit.to_settings();
-                self.send(Request::SetSource { source });
-            }
-        }
-        if let Some(rect) = apply_rect {
-            if let Some(edit) = self.source.as_mut() {
-                edit.rect = rect;
-                let source = edit.to_settings();
-                self.send(Request::SetSource { source });
-            }
-            // Take a new capture so the frame follows the new area.
-            self.grid_requested = None;
-        }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.tick();
+        let ctx = ui.ctx().clone();
+        self.poll_capture(&ctx);
+        let l = self.lang;
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::left("presets").resizable(true).default_size(340.0).show(ui, |ui| self.preset_browser(ui));
-        // Profiles and saving stay pinned at the bottom: in the central panel
-        // a long profile list pushed the save buttons out of the window.
-        if self.client.is_some() {
-            egui::Panel::bottom("profiles").show(ui, |ui| {
-                self.profile_panel(ui);
-                self.save_panel(ui);
-            });
-        }
         egui::CentralPanel::default().show(ui, |ui| {
             if self.client.is_none() {
-                ui.heading("No process connected");
-                ui.label("Start a Vulkan game with ENABLE_VKSLANG=1 and a preset; it will show up here.");
-                ui.weak(format!("Sockets: {}", vkslang_ipc::socket_dir().display()));
+                self.welcome(ui);
                 return;
             }
-            let running: Vec<String> = self.state.as_ref().map(|s| s.presets.clone()).unwrap_or_default();
-            if !running.is_empty() {
-                ui.label(egui::RichText::new(running.join("  +  ")).monospace());
+            self.status_line(ui);
+            ui.horizontal(|ui| {
+                for (tab, label) in [
+                    (Tab::Image, l.t("🖼  Image", "🖼  Picture")),
+                    (Tab::Shader, "✨  Shader"),
+                    (Tab::Display, l.t("🖥  Affichage", "🖥  Display")),
+                    (Tab::Profiles, l.t("💾  Profils", "💾  Profiles")),
+                ] {
+                    if ui.selectable_label(self.tab == tab, egui::RichText::new(label).size(18.0)).clicked() {
+                        self.tab = tab;
+                    }
+                }
+            });
+            ui.separator();
+            match self.tab {
+                Tab::Image => self.image_tab(ui),
+                Tab::Shader => {
+                    egui::Panel::left("presets")
+                        .resizable(true)
+                        .default_size(340.0)
+                        .show(ui, |ui| self.preset_browser(ui));
+                    self.params_panel(ui);
+                }
+                Tab::Display => {
+                    self.hdr_panel(ui);
+                    ui.separator();
+                    self.presentation_panel(ui);
+                }
+                Tab::Profiles => {
+                    self.profile_panel(ui);
+                    self.save_panel(ui);
+                }
             }
-            self.source_panel(ui);
-            ui.separator();
-            self.hdr_panel(ui);
-            ui.separator();
-            self.presentation_panel(ui);
-            ui.separator();
-            self.params_panel(ui);
         });
-        self.pixel_grid_window(ui.ctx());
-        ui.ctx().request_repaint_after(POLL);
+        self.wizard_window(&ctx);
+        ctx.request_repaint_after(POLL);
     }
 }
 
@@ -1638,15 +1461,6 @@ mod tests {
     }
 
     #[test]
-    fn duplication_shapes_the_picture() {
-        assert_eq!(final_shape([320, 200], [1, 1]), "8:5");
-        // Doubled lines: twice as tall.
-        assert_eq!(final_shape([640, 200], [1, 2]), "8:5");
-        assert_eq!(final_shape([320, 200], [1, 2]), "4:5");
-        assert_eq!(final_shape([640, 480], [1, 1]), "4:3");
-    }
-
-    #[test]
     fn game_rect_is_where_gamescope_draws() {
         // 640×480 ×4 on a 4K screen: 2560×1920, centred.
         assert_eq!(game_rect([3840, 2160], [640, 480], true), [640, 120, 2560, 1920]);
@@ -1654,18 +1468,5 @@ mod tests {
         assert_eq!(game_rect([3840, 2160], [640, 480], false), [480, 0, 2880, 2160]);
         // Larger than the screen: clamped, never outside.
         assert_eq!(game_rect([1280, 720], [1920, 1080], true), [0, 0, 1280, 720]);
-    }
-
-    #[test]
-    fn frame_maps_to_output_pixels() {
-        // Capture 960 wide for a 3840 wide output: one captured pixel is four.
-        let frame = egui::Rect::from_min_size(egui::pos2(120.0, 0.0), egui::vec2(720.0, 540.0));
-        assert_eq!(frame_to_area(frame, [960, 540], [3840, 2160]), "480,0,2880x2160");
-    }
-
-    #[test]
-    fn frame_stays_inside_the_image() {
-        let frame = egui::Rect::from_min_size(egui::pos2(-10.0, 500.0), egui::vec2(2000.0, 2000.0));
-        assert_eq!(frame_to_area(frame, [960, 540], [3840, 2160]), "0,2000,3840x160");
     }
 }

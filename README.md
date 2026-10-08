@@ -128,17 +128,27 @@ ENABLE_VKSLANG=1 VKSLANG_PROCESS=gamescope gamescope --backend sdl -f -w 560 -h 
 
 ## The control panel: `vkslang-ui`
 
-An ordinary window (egui on OpenGL, so it never loads the layer itself) that connects to any running process with the layer, and lets you:
+An ordinary window (egui on OpenGL, so it never loads the layer itself) that finds running games by itself. It speaks French and English (FR/EN at the top right, French by default on a French system).
 
-- **switch presets** from a searchable folder tree; a plain click runs one, ticking several **chains** them in the order shown. Each entry of the chain can be switched off on its own, and parameter tweaks are kept when the chain changes;
-- **adjust parameters** live, in the preset's declaration order, with section headers and ↺ to restore a value;
-- set the **source resolution** (native, divided, fixed, with the divisor calculator), the **picture and display areas** and their scales, **pixel duplication**, the downscale **filter**;
-- measure a game's resolution with the **pixel grid**, and frame its picture with a rectangle on a capture;
-- set the **HDR** paper white and gamut, and the **presentations per frame** (subframes), with the measured source and presentation rates;
-- **save a profile**: the whole look under a name, in `~/.config/vkSlang/profiles/<name>.json` (chain, changed parameters, source and areas, HDR, subframes). One click applies it to a running game. The **☆** makes it load **automatically for that executable**, by writing `profile.<executable>` into `vkSlang.conf`;
-- export a RetroArch-compatible **`.slangp`** (`#reference` plus changed parameters, single preset only), or **save for all games** into `vkSlang.conf`. That last one applies to every process the layer runs in, gamescope included: for one game, prefer a starred profile.
+### Set up this game
 
-Processes that load the layer but present nothing (gamescope on its Wayland backend, launchers) are hidden behind "+N idle".
+**🎯 Set up this game** walks through a new game in six steps, every change applied to the game as you go:
+
+1. **Capture**: a full-resolution picture of the game as it draws it, before the shader.
+2. **Game zone**: where the game is on the screen. *Detect* removes the black bars; *Adjust by hand* drags the frame when the game has black borders of its own.
+3. **Pixels**: how many screen pixels one game pixel covers, per axis. *Detect* measures it on the capture, including pixels taller than wide, and lines the zone up on the grid; *Check with the grid* overlays it at ×4 so every cell holds one block of colour. Typing the game's resolution works too.
+4. **Shape and size**: *4:3 monitor of the time* (320×200 comes out with pixels 1.2 times taller, as on a VGA screen), *Square pixels* (duplicating lines makes the picture taller), or *As shown now*; *Whole multiple* gives every scanline the same thickness, *Fill the screen*, or *Where it is*. **Duplicate** repeats each game pixel: the shader works on the repeated lines. A miniature screen shows the result.
+5. **Shader**: search and click a preset.
+6. **Profile**: save it all under a name, loaded automatically next time this program starts.
+
+### Tabs
+
+- **Picture**: the same four questions at any time (capture, zone, pixels, shape and size, with the preview and the capture), and the raw settings under *Advanced settings*: source resolution with the divisor calculator, picture and display areas, scales, duplication, filter.
+- **Shader**: the preset tree (a plain click runs one, ticking several **chains** them, each entry switchable on its own, parameter tweaks kept when the chain changes) and the parameters, in the preset's order with ↺ to restore a value.
+- **Display**: HDR paper white and gamut, presentations per frame (subframes) with the measured rates.
+- **Profiles**: profiles (☆ loads one automatically for that executable, by writing `profile.<executable>` into `vkSlang.conf`), export to a RetroArch-compatible `.slangp`, or *Save for all games* into `vkSlang.conf`, which applies to every process the layer runs in.
+
+Programs that load the layer but show nothing (gamescope without `--backend sdl`, launchers) are hidden behind "+N idle".
 
 ## Configuration
 

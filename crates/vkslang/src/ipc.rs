@@ -113,7 +113,7 @@ pub fn handle(request: Request) -> Response {
             Err(message) => return Response::Error { message },
         },
         Request::SetHdr { hdr } => ctl.hdr = config::sanitize_hdr(hdr),
-        Request::Capture { max_width } => ctl.capture_request = Some(max_width.clamp(64, 3840)),
+        Request::Capture { max_width } => ctl.capture_request = Some(max_width.clamp(64, 8192)),
         Request::SetSubframes { subframes, black } => {
             ctl.subframes = subframes.clamp(1, 8);
             ctl.subframe_black = black;
