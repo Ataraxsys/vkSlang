@@ -486,12 +486,19 @@ struct SourceImage {
     /// stretched (square pixels rendered into a 4:3 area, for instance).
     display: vk::Rect2D,
     filter: vk::Filter,
+    /// Where the preset draws when that region is not the whole image: an
+    /// image of exactly its size, copied into place afterwards. librashader
+    /// takes OutputSize, FinalViewportSize and its viewport-scaled passes
+    /// from the size of the image it draws into, not from the viewport, so a
+    /// 4:3 region of a 16:9 image would be computed in 16:9 and squeezed.
+    target: Option<(vk::Image, vk::DeviceMemory)>,
 }
 
 impl SourceImage {
     unsafe fn new(
         dev: &DeviceData,
         format: vk::Format,
+        output_format: vk::Format,
         swapchain_extent: vk::Extent2D,
         source: &Source,
     ) -> Result<SourceImage, vk::Result> {
@@ -532,13 +539,40 @@ impl SourceImage {
             swapchain_extent.width,
             swapchain_extent.height
         );
-        Ok(SourceImage { image, memory, base, extent, view_format, rect, display, filter: source.filter })
+        let whole = display.offset == vk::Offset2D::default() && display.extent == swapchain_extent;
+        let target = if whole {
+            None
+        } else {
+            match create_image(
+                dev,
+                output_format,
+                display.extent,
+                vk::ImageCreateFlags::empty(),
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            ) {
+                Ok(target) => Some(target),
+                Err(e) => {
+                    dev.fns.destroy_image(image, None);
+                    dev.fns.free_memory(memory, None);
+                    if let Some((image, memory, _)) = base {
+                        dev.fns.destroy_image(image, None);
+                        dev.fns.free_memory(memory, None);
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        Ok(SourceImage { image, memory, base, extent, view_format, rect, display, filter: source.filter, target })
     }
 
     unsafe fn destroy(self, dev: &DeviceData) {
         dev.fns.destroy_image(self.image, None);
         dev.fns.free_memory(self.memory, None);
         if let Some((image, memory, _)) = self.base {
+            dev.fns.destroy_image(image, None);
+            dev.fns.free_memory(memory, None);
+        }
+        if let Some((image, memory)) = self.target {
             dev.fns.destroy_image(image, None);
             dev.fns.free_memory(memory, None);
         }
@@ -800,7 +834,7 @@ impl SwapchainState {
         if let Some(old) = self.source.take() {
             old.destroy(dev);
         }
-        match SourceImage::new(dev, self.source_format, self.extent, source) {
+        match SourceImage::new(dev, self.source_format, self.output_format, self.extent, source) {
             Ok(s) => self.source = Some(s),
             Err(e) => log_error!("cannot create source image: {e}"),
         }
@@ -1786,16 +1820,44 @@ impl Runtime {
             format: source.view_format,
         };
         let display = source.display;
-        let viewport = Viewport {
-            x: display.offset.x as f32,
-            y: display.offset.y as f32,
-            mvp: None,
-            output: VulkanImage {
-                image,
-                size: Size::new(state.extent.width, state.extent.height),
-                format: state.output_format,
+        let display_size = Size::new(display.extent.width, display.extent.height);
+        let viewport = match source.target {
+            // Drawn at the region's own size, copied into place below.
+            Some((target, _)) => {
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        target,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags::empty(),
+                        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    )],
+                );
+                Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    mvp: None,
+                    output: VulkanImage { image: target, size: display_size, format: state.output_format },
+                    size: display_size,
+                }
+            }
+            None => Viewport {
+                x: display.offset.x as f32,
+                y: display.offset.y as f32,
+                mvp: None,
+                output: VulkanImage {
+                    image,
+                    size: Size::new(state.extent.width, state.extent.height),
+                    format: state.output_format,
+                },
+                size: display_size,
             },
-            size: Size::new(display.extent.width, display.extent.height),
         };
         if active.hdr_pass {
             let enable = if state.color_space == ColorSpace::Hdr10 { 1.0 } else { 0.0 };
@@ -1806,11 +1868,9 @@ impl Runtime {
             *failed = true;
         }
 
-        // 5. Repaint the letterbox bars opaque black (the chain cleared them
-        //    to transparent black, which a compositor shows as garbage).
-        let bars = bar_rects(display, state.extent);
+        // 4b. The region drawn on its own: copied into place.
         let mut layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-        if let (false, Some(black)) = (bars.is_empty(), state.black.as_ref()) {
+        if let Some((target, _)) = source.target {
             d.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -1820,10 +1880,54 @@ impl Runtime {
                 &[],
                 &[
                     barrier(
+                        target,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                    ),
+                    barrier(
+                        image,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    ),
+                ],
+            );
+            d.cmd_copy_image(
+                cmd,
+                target,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageCopy::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .dst_offset(vk::Offset3D { x: display.offset.x, y: display.offset.y, z: 0 })
+                    .extent(vk::Extent3D { width: display.extent.width, height: display.extent.height, depth: 1 })],
+            );
+            layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+        }
+
+        // 5. Repaint the letterbox bars opaque black (the chain cleared them
+        //    to transparent black, which a compositor shows as garbage; drawn
+        //    on its own, the game's picture would still be there).
+        let bars = bar_rects(display, state.extent);
+        if let (false, Some(black)) = (bars.is_empty(), state.black.as_ref()) {
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[
+                    barrier(
                         image,
                         layout,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                         vk::AccessFlags::TRANSFER_WRITE,
                     ),
                     barrier(
