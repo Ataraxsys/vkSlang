@@ -125,6 +125,30 @@ pub fn pitch(p: &Pixels, region: [u32; 4], horizontal: bool) -> Option<Pitch> {
 const WIDTHS: [u32; 12] = [160, 256, 280, 288, 320, 352, 360, 384, 512, 560, 640, 720];
 const HEIGHTS: [u32; 14] = [144, 160, 192, 200, 224, 240, 256, 288, 350, 384, 400, 480, 576, 600];
 
+/// Whether `count` game pixels is a resolution of the time, or a few pixels
+/// short of one (a game's own black border is invisible against the bars).
+fn near_standard(count: f32, standard: &[u32]) -> bool {
+    standard.iter().any(|&t| {
+        let t = t as f32;
+        count <= t + 1.0 && t - count <= 3.0
+    })
+}
+
+/// A grid that explains every colour change also explains them at twice
+/// its size when the picture has few details: the IBM logo of a PCjr, all
+/// stripes, measures 320×50 with lines four times too tall. When the count
+/// is no resolution of the time, the pixel is divided until it is one.
+pub fn refine_to_standard(size: f32, length: u32, horizontal: bool) -> f32 {
+    let standard: &[u32] = if horizontal { &WIDTHS } else { &HEIGHTS };
+    if near_standard(length as f32 / size, standard) {
+        return size;
+    }
+    (2..=8)
+        .map(|k| size / k as f32)
+        .find(|&smaller| smaller >= 1.0 && near_standard(length as f32 / smaller, standard))
+        .unwrap_or(size)
+}
+
 /// Grows a zone found from lit pixels back to the game's full resolution.
 ///
 /// A game's own black border is invisible against the bars: King's Quest
@@ -240,6 +264,17 @@ mod tests {
         assert_eq!(grow_to_standard([0, 480, 3840, 1200], [12.0, 6.0], [3840, 2160]), [0, 480, 3840, 1200]);
         // Far from any standard size: untouched.
         assert_eq!(grow_to_standard([100, 100, 1000, 900], [10.0, 10.0], [3840, 2160]), [100, 100, 1000, 900]);
+    }
+
+    #[test]
+    fn a_grid_too_coarse_for_its_picture_is_divided() {
+        // The PCjr boot logo: lines measured 24 high where they are 6.
+        assert_eq!(refine_to_standard(24.0, 1194, false), 6.0);
+        // Already a resolution of the time: kept.
+        assert_eq!(refine_to_standard(6.0, 1194, false), 6.0);
+        assert_eq!(refine_to_standard(12.0, 3840, true), 12.0);
+        // Nothing standard at any division: kept as measured.
+        assert_eq!(refine_to_standard(7.0, 777, true), 7.0);
     }
 
     #[test]
