@@ -249,6 +249,16 @@ impl App {
         // A downscaled capture blends pixels: the grid cannot be read there.
         let grid =
             if full_size { detect::pitch(&pixels, lit, true).zip(detect::pitch(&pixels, lit, false)) } else { None };
+        // A coarse grid on a picture with few details is divided down to a
+        // resolution of the time; its lines are still on the game's grid.
+        let grid = grid.map(|(mut h, mut v)| {
+            for (pitch, length, horizontal) in [(&mut h, lit[2], true), (&mut v, lit[3], false)] {
+                let size = detect::refine_to_standard(pitch.size, length, horizontal);
+                pitch.offset = pitch.offset.rem_euclid(size);
+                pitch.size = size;
+            }
+            (h, v)
+        });
         let base = c.base;
         let previous = self.image.plan;
         let mut plan =
